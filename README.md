@@ -38,7 +38,7 @@ a popup will allow you to choose which workspaces you run this against. Select A
 - **Broken Visuals (with Page Links)** → See all broken visuals/filters and jump directly to the impacted report page.  
 - **Report-Level Measures Inventory** → Surface report-only measures with full DAX and usage details.
 - **New Report Layouts & Wireframe** → See where your visuals sit on the page with a wireframe layout - thanks to @stephbruno for this feature!
-- 
+  
  ---
 
 ## 🚀 Quick Start Instructions  

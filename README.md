@@ -1,7 +1,7 @@
 <p align="center">
 <img width="338" height="190" alt="impact iq 16x9" src="https://github.com/user-attachments/assets/436670cb-9aec-4ae9-8a5c-ace341ff9283" />
   <br/>
-<em><strong>Be smarter about every change </strong></em>
+<em><strong>Be smarter with every change </strong></em>
     <br/>
   <br/>
   <em>One-Click, Designed for Everyone</em>

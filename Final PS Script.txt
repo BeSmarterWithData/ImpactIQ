@@ -572,7 +572,7 @@ function Show-WorkspacePicker {
         # Filter and re-add items
         foreach ($item in $allWorkspaceItems) {
             if ([string]::IsNullOrWhiteSpace($searchText) -or 
-                $item.Display -match [regex]::Escape($searchText)) {
+                $item.Display -imatch [regex]::Escape($searchText)) {
                 $index = $clb.Items.Add($item)
                 # Restore checked state if it was previously checked
                 if ($checkedIds.ContainsKey($item.Id)) {

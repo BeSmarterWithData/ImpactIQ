@@ -512,7 +512,7 @@ function Show-WorkspacePicker {
     $form               = New-Object System.Windows.Forms.Form
     $form.Text          = "Select Workspaces"
     $form.StartPosition = 'CenterScreen'
-    $form.Size          = New-Object System.Drawing.Size(520,540)
+    $form.Size          = New-Object System.Drawing.Size(520,580)
     $form.TopMost       = $true
 
     # Instruction label
@@ -522,25 +522,73 @@ function Show-WorkspacePicker {
     $lbl.Location       = New-Object System.Drawing.Point(12,12)
     $form.Controls.Add($lbl)
 
+    # Search label
+    $lblSearch          = New-Object System.Windows.Forms.Label
+    $lblSearch.Text     = "Search:"
+    $lblSearch.AutoSize = $true
+    $lblSearch.Location = New-Object System.Drawing.Point(12,40)
+    $form.Controls.Add($lblSearch)
+
+    # Search TextBox
+    $txtSearch          = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Location = New-Object System.Drawing.Point(70,37)
+    $txtSearch.Size     = New-Object System.Drawing.Size(422,23)
+    $form.Controls.Add($txtSearch)
+
     # CheckedListBox
     $clb                = New-Object System.Windows.Forms.CheckedListBox
-    $clb.Location       = New-Object System.Drawing.Point(12,40)
+    $clb.Location       = New-Object System.Drawing.Point(12,70)
     $clb.Size           = New-Object System.Drawing.Size(480,380)
     $clb.CheckOnClick   = $true
     $clb.Sorted         = $true
 
+    # Store all workspace items for filtering
+    $allWorkspaceItems = @()
     foreach ($ws in $Workspaces) {
         $display = "{0} ({1})" -f $ws.name, $ws.id
-        [void]$clb.Items.Add([pscustomobject]@{ Display=$display; Id=$ws.id; Name=$ws.name })
+        $allWorkspaceItems += [pscustomobject]@{ Display=$display; Id=$ws.id; Name=$ws.name }
+    }
+
+    # Initial population
+    foreach ($item in $allWorkspaceItems) {
+        [void]$clb.Items.Add($item)
     }
     $clb.DisplayMember = 'Display'
     $form.Controls.Add($clb)
+
+    # Search filter logic
+    $txtSearch.Add_TextChanged({
+        $searchText = $txtSearch.Text
+        $clb.BeginUpdate()
+        
+        # Store checked states before clearing
+        $checkedIds = @{}
+        foreach ($item in $clb.CheckedItems) {
+            $checkedIds[$item.Id] = $true
+        }
+        
+        $clb.Items.Clear()
+        
+        # Filter and re-add items
+        foreach ($item in $allWorkspaceItems) {
+            if ([string]::IsNullOrWhiteSpace($searchText) -or 
+                $item.Display -match [regex]::Escape($searchText)) {
+                $index = $clb.Items.Add($item)
+                # Restore checked state if it was previously checked
+                if ($checkedIds.ContainsKey($item.Id)) {
+                    $clb.SetItemChecked($index, $true)
+                }
+            }
+        }
+        
+        $clb.EndUpdate()
+    })
 
     # "Select All" checkbox
     $chkAll            = New-Object System.Windows.Forms.CheckBox
     $chkAll.Text       = "Select All"
     $chkAll.AutoSize   = $true
-    $chkAll.Location   = New-Object System.Drawing.Point(12,430)
+    $chkAll.Location   = New-Object System.Drawing.Point(12,460)
     $chkAll.Add_CheckedChanged({
         for ($i=0; $i -lt $clb.Items.Count; $i++) {
             $clb.SetItemChecked($i, $chkAll.Checked)
@@ -552,7 +600,7 @@ function Show-WorkspacePicker {
     $chkMy             = New-Object System.Windows.Forms.CheckBox
     $chkMy.Text        = "Include 'My Workspace'"
     $chkMy.AutoSize    = $true
-    $chkMy.Location    = New-Object System.Drawing.Point(120,430)
+    $chkMy.Location    = New-Object System.Drawing.Point(120,460)
     $chkMy.Checked     = $false
     $form.Controls.Add($chkMy)
 
@@ -560,7 +608,7 @@ function Show-WorkspacePicker {
     $okBtn             = New-Object System.Windows.Forms.Button
     $okBtn.Text        = "OK"
     $okBtn.Width       = 100
-    $okBtn.Location    = New-Object System.Drawing.Point(286,470)
+    $okBtn.Location    = New-Object System.Drawing.Point(286,500)
     $okBtn.Add_Click({
         $form.Tag = 'OK'
         $form.Close()
@@ -571,7 +619,7 @@ function Show-WorkspacePicker {
     $cancelBtn         = New-Object System.Windows.Forms.Button
     $cancelBtn.Text    = "Cancel"
     $cancelBtn.Width   = 100
-    $cancelBtn.Location= New-Object System.Drawing.Point(392,470)
+    $cancelBtn.Location= New-Object System.Drawing.Point(392,500)
     $cancelBtn.Add_Click({
         $form.Tag = 'Cancel'
         $form.Close()

@@ -60,25 +60,35 @@ if (Test-Path $teZip) { Remove-Item $teZip -Force }
 Invoke-WebRequest -Uri $teDownloadUrl -OutFile $teZip -UseBasicParsing
 Write-Host "[INFO] Downloaded Tabular Editor 2 Portable to $teZip"
 
-# Define the folder path and zip pattern for PBI Tools
 $PBIToolsFolderPath = Join-Path -Path $baseFolderPath\Config -ChildPath "PBI Tools"
 $PBIToolsZipPattern = "PBI Tools*.zip"
 
-# Get the first matching zip file
 $zipFile = Get-ChildItem -Path $baseFolderPath\Config -Filter $PBIToolsZipPattern | Select-Object -First 1
 if ($zipFile) {
-    # Remove the folder if it already exists
-    if (Test-Path -Path $PBIToolsFolderPath) {
-        Remove-Item -Path $PBIToolsFolderPath -Recurse -Force
+
+    $tempExtractPath = Join-Path $env:TEMP ("PBITools_" + [guid]::NewGuid().ToString())
+
+    try {
+        # Extract to temp location first
+        New-Item -Path $tempExtractPath -ItemType Directory -Force | Out-Null
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $tempExtractPath)
+
+        # Ensure target folder exists
+        if (-not (Test-Path $PBIToolsFolderPath)) {
+            New-Item -Path $PBIToolsFolderPath -ItemType Directory -Force | Out-Null
+        }
+
+        # Overwrite files
+        Copy-Item -Path "$tempExtractPath\*" -Destination $PBIToolsFolderPath -Recurse -Force
+
+        Write-Output "Updated PBI Tools at $PBIToolsFolderPath"
     }
-
-    # Recreate the folder
-    New-Item -Path $PBIToolsFolderPath -ItemType Directory -Force | Out-Null
-
-    # Extract the zip file contents into the folder
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $PBIToolsFolderPath)
-    Write-Output "Extracted $($zipFile.Name) to $PBIToolsFolderPath"
+    finally {
+        if (Test-Path $tempExtractPath) {
+            Remove-Item $tempExtractPath -Recurse -Force
+        }
+    }
 }
 
 # Repeat for Tabular Editor
@@ -87,18 +97,28 @@ $TabularEditorZipPattern = "TabularEditor*.zip"
 
 $zipFile = Get-ChildItem -Path $baseFolderPath\Config -Filter $TabularEditorZipPattern | Select-Object -First 1
 if ($zipFile) {
-    if (Test-Path -Path $TabularEditorFolderPath) {
-        Remove-Item -Path $TabularEditorFolderPath -Recurse -Force
+
+    $tempExtractPath = Join-Path $env:TEMP ("TabularEditor_" + [guid]::NewGuid().ToString())
+
+    try {
+        New-Item -Path $tempExtractPath -ItemType Directory -Force | Out-Null
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $tempExtractPath)
+
+        if (-not (Test-Path $TabularEditorFolderPath)) {
+            New-Item -Path $TabularEditorFolderPath -ItemType Directory -Force | Out-Null
+        }
+
+        Copy-Item -Path "$tempExtractPath\*" -Destination $TabularEditorFolderPath -Recurse -Force
+
+        Write-Output "Updated Tabular Editor at $TabularEditorFolderPath"
     }
-
-    New-Item -Path $TabularEditorFolderPath -ItemType Directory -Force | Out-Null
-
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $TabularEditorFolderPath)
-    Write-Output "Extracted $($zipFile.Name) to $TabularEditorFolderPath"
-} else {
+    finally {
+        if (Test-Path $tempExtractPath) {
+            Remove-Item $tempExtractPath -Recurse -Force
+        }
+    }
 }
-
 
 $pbiToolsPath = Join-Path -Path $baseFolderPath -ChildPath "Config\PBI Tools\pbi-tools.exe"
 

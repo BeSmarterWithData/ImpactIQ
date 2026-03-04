@@ -9,6 +9,8 @@
 
 # Impact Analysis and Governance for Power BI + Fabric
 
+➡️ [**Download Impact IQ - One-Click Update & Run Tool**](https://github.com/BeSmarterWithData/ImpactIQ/releases/download/v2.0/ImpactIQ.bat)
+
 ### This all-in-one solution is designed to be ran by ANYONE. 
 - Everything within the script is limited to your access within the Power BI and/or Fabric environment.
 - All computer requirements are at the user level and do not require admin privileges.

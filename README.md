@@ -18,6 +18,9 @@
   
 *Have specific Reports and/or Models downloaded you want to analyze? Don't have direct access to the Workspace but have the PBIX? Check out Impact IQ's local edition here: https://github.com/BeSmarterWithData/ImpactIQ-Local*
 
+
+**Other Versons:** *[Tenant Admin Edition](https://github.com/BeSmarterWithData/ImpactIQ-TenantAdmin), [Semantic Link Labs Edition](https://github.com/BeSmarterWithData/ImpactIQ-SemanticLinkLabs), [Service Principal Edition](https://github.com/BeSmarterWithData/ImpactIQ-ServicePrincipal)*
+
 ## What It Does
 This provides a quick and automated way to identify where and how specific fields, measures, and tables are used across Power BI reports in all workspaces down to the visual level. It also backs up and breaks down the details of your models, reports, and dataflows for easy review, giving you an all-in-one **Power BI & Fabric Governance** solution.
 

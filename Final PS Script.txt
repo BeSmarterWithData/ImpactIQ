@@ -452,54 +452,51 @@ catch {
 }
 
 
-# Function to refresh the token in a background job
-# Start a background job that refreshes the token. Pass the environment so child job can reconnect correctly.
-function Start-TokenRefreshJob {
-    param(
-        [string]$Environment,
-        [string]$BaseFolderPath
-    )
+# Track when the token was last refreshed so we can refresh inline before expiry
+$global:lastTokenRefreshTime = Get-Date
 
-    $jobScript = {
-        param($EnvArg, $BaseFolderPathArg)
+# Function to refresh the token inline (runs in the main process so WAM/MSAL popups work)
+function Refresh-PowerBIToken {
+    Write-Host "[INFO] Refreshing Power BI access token..."
+    $refreshed = $false
 
-        $tokenDirectory = Join-Path -Path $BaseFolderPathArg -ChildPath 'Config'
-        if (-not (Test-Path -Path $tokenDirectory)) {
-            New-Item -Path $tokenDirectory -ItemType Directory -Force | Out-Null
+    # Attempt 1
+    try {
+        Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop
+        $refreshed = $true
+        Write-Host "[INFO] Token refreshed successfully."
+    }
+    catch {
+        Write-Host "[WARN] First token refresh attempt failed: $($_.Exception.Message)"
+    }
+
+    # Attempt 2 (retry) — first attempt may fail due to MSAL popup interaction
+    if (-not $refreshed) {
+        try {
+            Write-Host "[INFO] Retrying token refresh..."
+            Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop
+            $refreshed = $true
+            Write-Host "[INFO] Token refreshed successfully on retry."
         }
-        $tokenFilePath = Join-Path -Path $tokenDirectory -ChildPath 'PowerBI_TempAccessToken.txt'
-
-        function Connect-PowerBI {
-            param(
-                [string]$Environment,
-                [string]$TokenFilePath
-            )
-
-            if ($Environment) {
-                Connect-PowerBIServiceAccount -Environment $Environment | Out-Null
-            } else {
-                Connect-PowerBIServiceAccount | Out-Null
-            }
-            $global:accessTokenObject = Get-PowerBIAccessToken
-            $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
-            Set-Content -Path $TokenFilePath -Value $global:accessToken
-        }
-
-        while ($true) {
-            Start-Sleep -Seconds 3300  # Sleep for 55 minutes
-            Connect-PowerBI -Environment $EnvArg -TokenFilePath $tokenFilePath
+        catch {
+            Write-Host "[ERROR] Second token refresh attempt also failed: $($_.Exception.Message)"
         }
     }
 
-    # Start the job and pass the environment as an argument
-    Start-Job -ScriptBlock $jobScript -Name "TokenRefreshJob" -ArgumentList $Environment, $BaseFolderPath | Out-Null
+    if ($refreshed) {
+        $global:lastTokenRefreshTime = Get-Date
+    }
+
+    return $refreshed
 }
 
-# Start the background job to refresh the token
-Start-TokenRefreshJob -Environment $LoginEnvironment -BaseFolderPath $global:BaseFolderPath
-
-# Function to get the current access token
+# Function to get the current access token — automatically refreshes if older than 55 minutes
 function Get-CurrentAccessToken {
+    $elapsed = (Get-Date) - $global:lastTokenRefreshTime
+    if ($elapsed.TotalMinutes -ge 55) {
+        Write-Host "[INFO] Token is $([math]::Floor($elapsed.TotalMinutes)) minutes old. Refreshing..."
+        Refresh-PowerBIToken | Out-Null
+    }
     $global:accessToken = Get-Content -Path $global:TokenFilePath
     return $global:accessToken
 }
@@ -2773,10 +2770,7 @@ if (Test-Path -Path $sourceFilePath) {
 Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
 
 
-# Stop the background job after script completion
-Stop-Job -Name "TokenRefreshJob"
-Remove-Job -Name "TokenRefreshJob"
-
+# Clean up token file after script completion
 if (Test-Path -Path $global:TokenFilePath) {
     Remove-Item -Path $global:TokenFilePath -Force
 }

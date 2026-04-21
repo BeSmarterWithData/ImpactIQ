@@ -21,7 +21,7 @@ if (-not (Test-Path $configFolder)) {
     New-Item -Path $configFolder -ItemType Directory -Force | Out-Null
 }
 
-$global:TokenFilePath = Join-Path $configFolder "PowerBI_TempAccessToken.txt"
+# Token is now managed via MSAL session (Get-PowerBIAccessToken) — no file needed
 
 $ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
 
@@ -433,10 +433,6 @@ function Connect-PowerBI {
     } else {
         Connect-PowerBIServiceAccount | Out-Null
     }
-
-    $global:accessTokenObject = Get-PowerBIAccessToken
-    $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
-    Set-Content -Path $global:TokenFilePath -Value $global:accessToken
 }
 
 # Track script start time
@@ -452,53 +448,23 @@ catch {
 }
 
 
-# Track when the token was last refreshed so we can refresh inline before expiry
-$global:lastTokenRefreshTime = Get-Date
-
-# Function to refresh the token inline (runs in the main process so WAM/MSAL popups work)
-function Refresh-PowerBIToken {
-    Write-Host "[INFO] Refreshing Power BI access token..."
-    $refreshed = $false
-
-    # Attempt 1
+# Function to get the current access token — MSAL auto-refreshes silently via the session cache
+function Get-CurrentAccessToken {
     try {
-        Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop
-        $refreshed = $true
-        Write-Host "[INFO] Token refreshed successfully."
+        return (Get-PowerBIAccessToken).Authorization -replace 'Bearer ', ''
     }
     catch {
-        Write-Host "[WARN] First token refresh attempt failed: $($_.Exception.Message)"
-    }
-
-    # Attempt 2 (retry) — first attempt may fail due to MSAL popup interaction
-    if (-not $refreshed) {
+        # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
+        Write-Host "[WARN] Token fetch failed, re-connecting..."
         try {
-            Write-Host "[INFO] Retrying token refresh..."
-            Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop
-            $refreshed = $true
-            Write-Host "[INFO] Token refreshed successfully on retry."
+            Connect-PowerBIServiceAccount | Out-Null
+            return (Get-PowerBIAccessToken).Authorization -replace 'Bearer ', ''
         }
         catch {
-            Write-Host "[ERROR] Second token refresh attempt also failed: $($_.Exception.Message)"
+            Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
+            throw "Cannot obtain Power BI access token."
         }
     }
-
-    if ($refreshed) {
-        $global:lastTokenRefreshTime = Get-Date
-    }
-
-    return $refreshed
-}
-
-# Function to get the current access token — automatically refreshes if older than 55 minutes
-function Get-CurrentAccessToken {
-    $elapsed = (Get-Date) - $global:lastTokenRefreshTime
-    if ($elapsed.TotalMinutes -ge 55) {
-        Write-Host "[INFO] Token is $([math]::Floor($elapsed.TotalMinutes)) minutes old. Refreshing..."
-        Refresh-PowerBIToken | Out-Null
-    }
-    $global:accessToken = Get-Content -Path $global:TokenFilePath
-    return $global:accessToken
 }
 
 # Create a variable date
@@ -2769,11 +2735,6 @@ if (Test-Path -Path $sourceFilePath) {
 
 Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
 
-
-# Clean up token file after script completion
-if (Test-Path -Path $global:TokenFilePath) {
-    Remove-Item -Path $global:TokenFilePath -Force
-}
 
 Write-Output "All Excel files processed and combined successfully."
 

@@ -735,7 +735,10 @@ function Show-WorkspacePicker {
     # Gather selections from persistent store (to include items not currently visible due to search)
     $selectedIds = @($persistentCheckedIds.Keys)
 
-    if ($form.Tag -eq 'Cancel') {
+    # Treat the Cancel button AND closing the window (the X) as a cancel so the
+    # caller returns to the run-mode menu. Only an explicit OK proceeds, and the
+    # timer still auto-continues on Timeout.
+    if ($form.Tag -ne 'OK' -and $form.Tag -ne 'Timeout') {
         throw "User cancelled workspace selection."
     }
 

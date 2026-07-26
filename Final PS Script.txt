@@ -2129,6 +2129,13 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow Refresh History e
 Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow Refresh History extraction process completed."
 }
 
+# Track which reports have a sensitivity label applied. This detail is ONLY exposed by
+# the Fabric List Items API (not the Power BI reports API): a labelled report includes a
+# "sensitivityLabel" object, an unlabelled one omits it entirely. When a report is
+# labelled, the Report Backup step prefers getDefinition over LiveConnect. We only record
+# presence here - the specific sensitivity and id itself is not needed.
+$global:ReportsWithSensitivityLabel = @{}
+
 # Loop through all workspaces to fetch Fabric Items (excluding Reports and Semantic Models)
 foreach ($workspace in $workspacesInfo) {
 
@@ -2141,6 +2148,12 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extra
     try {
         $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
 
+        # Record reports that carry a sensitivity label (presence only - the id is not needed).
+        foreach ($fabricItem in $fabricItemsResponse.value) {
+            if ($fabricItem.type -eq 'Report' -and $fabricItem.sensitivityLabel) {
+                $global:ReportsWithSensitivityLabel[$fabricItem.id] = $true
+            }
+        }
 
         $filteredItems = $fabricItemsResponse.value | Where-Object {
             $_.type -ne 'Report' -and $_.type -ne 'SemanticModel'
@@ -2731,15 +2744,31 @@ function Export-ReportDefinitionAsPbix {
 	                Export-ReportDefinitionAsPbix -WorkspaceId $workspaceId -ReportId $reportId -OutFilePath $filepath | Out-Null
 	            }
 	        } elseif ($fileExtension -eq 'pbix') {
-	            # Non-Pro PBIX report (Premium / Fabric / etc.) → LiveConnect by default.
-	            # Only if LiveConnect fails do we fall back to the getDefinition export
-	            # (a zipped PBIR definition renamed to .pbix - intentional).
-	            $liveExported = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
-	            if (-not $liveExported) {
-	                Write-Warning "LiveConnect export failed for $cleanWorkspaceName ~ $cleanReportName; falling back to getDefinition."
+	            # Non-Pro PBIX report (Premium / Fabric / etc.).
+	            # If the report carries a sensitivity label (only visible via the Fabric
+	            # List Items API), prefer getDefinition FIRST so the protected definition is
+	            # captured directly, falling back to LiveConnect only if that fails.
+	            # Otherwise keep the default LiveConnect-first behaviour with getDefinition as
+	            # the fallback (a zipped PBIR definition renamed to .pbix - intentional).
+	            if ($global:ReportsWithSensitivityLabel -and $global:ReportsWithSensitivityLabel.ContainsKey($reportId)) {
+	                Write-Host "$cleanWorkspaceName ~ $cleanReportName has a sensitivity label - using getDefinition first."
 	                $defExported = Export-ReportDefinitionAsPbix -WorkspaceId $workspaceId -ReportId $reportId -OutFilePath $filepath
 	                if (-not $defExported) {
-	                    Write-Warning "getDefinition export also failed for $cleanWorkspaceName ~ $cleanReportName."
+	                    Write-Warning "getDefinition export failed for $cleanWorkspaceName ~ $cleanReportName; falling back to LiveConnect."
+	                    $liveExported = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	                    if (-not $liveExported) {
+	                        Write-Warning "LiveConnect export also failed for $cleanWorkspaceName ~ $cleanReportName."
+	                    }
+	                }
+	            } else {
+	                # No sensitivity label → LiveConnect first, getDefinition fallback.
+	                $liveExported = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	                if (-not $liveExported) {
+	                    Write-Warning "LiveConnect export failed for $cleanWorkspaceName ~ $cleanReportName; falling back to getDefinition."
+	                    $defExported = Export-ReportDefinitionAsPbix -WorkspaceId $workspaceId -ReportId $reportId -OutFilePath $filepath
+	                    if (-not $defExported) {
+	                        Write-Warning "getDefinition export also failed for $cleanWorkspaceName ~ $cleanReportName."
+	                    }
 	                }
 	            }
 	        } else {

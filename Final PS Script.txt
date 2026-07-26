@@ -2751,7 +2751,6 @@ function Export-ReportDefinitionAsPbix {
 	            # Otherwise keep the default LiveConnect-first behaviour with getDefinition as
 	            # the fallback (a zipped PBIR definition renamed to .pbix - intentional).
 	            if ($global:ReportsWithSensitivityLabel -and $global:ReportsWithSensitivityLabel.ContainsKey($reportId)) {
-	                Write-Host "$cleanWorkspaceName ~ $cleanReportName has a sensitivity label - using getDefinition first."
 	                $defExported = Export-ReportDefinitionAsPbix -WorkspaceId $workspaceId -ReportId $reportId -OutFilePath $filepath
 	                if (-not $defExported) {
 	                    Write-Warning "getDefinition export failed for $cleanWorkspaceName ~ $cleanReportName; falling back to LiveConnect."

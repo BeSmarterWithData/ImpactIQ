@@ -312,6 +312,36 @@ foreach (var p in Model.AllPartitions)
     ));
 }
 
+// Process RLS Filters
+foreach (var role in Model.Roles)
+{
+    foreach (var permission in role.TablePermissions)
+    {
+        sb.AppendLine(string.Join(",",
+            FormatField("RLSFilter"),
+            FormatField(permission.Table.Name),
+            FormatField(role.Name),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(permission.FilterExpression),
+            FormatField(currentDateStr),
+            FormatField(modelName),
+            FormatField(modelID),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField(""),
+            FormatField("")
+        ));
+    }
+}
+
 // Process Relationships
 foreach (var r in Model.Relationships)
 {

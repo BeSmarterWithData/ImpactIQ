@@ -86,6 +86,29 @@ foreach (var table in Model.Tables)
     }
 }
 
+// ===============================
+//   CALCULATION ITEMS
+// ===============================
+foreach (var calcGroup in Model.CalculationGroups)
+{
+    foreach (var calcItem in calcGroup.CalculationItems)
+    {
+        var dependencies = calcItem.DependsOn;
+
+        foreach (var dependency in dependencies)
+        {
+            sb.AppendLine(String.Format(
+                "\"{0}\",\"CalculationItem\",\"{1}\",\"{2}\",\"{3}\",\"{4}\",\"{5}\"",
+                calcItem.Name,
+                dependency.Key.DaxObjectFullName,
+                dependency.Key.ObjectType,
+                currentDateStr,
+                modelName,
+                modelID));
+        }
+    }
+}
+
 // Write the file
 var filePath = System.IO.Path.Combine(dateFolderPath, modelName + "_MD.csv");
 System.IO.File.WriteAllText(filePath, sb.ToString());

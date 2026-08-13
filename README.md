@@ -36,7 +36,7 @@ This provides a quick and automated way to identify where and how specific field
 #### ✨ Recently Added Features
 
 - **Run Against Specific Models** → Instead of scanning full workspaces, you can now select individual Models to run against. A popup lets you choose exactly which reports to process - **Connected reports across all workspaces you have access to are included automatically.**
-- **Run Against Specific Reports** → Instead of scanning full workspaces, you can now select individual reports to run against. A popup lets you choose exactly which reports to process - connected models are included automatically. Cancelling returns you to the mode selector.
+- **Run Against Specific Reports** → You can now select individual reports to run against. A popup lets you choose exactly which reports to process - connected models are included automatically.
 - **Sovereign Cloud Support** → Now supports Power BI in Government and International clouds! Choose from Public (default), Germany, USGov, China, USGovHigh, or USGovMil environments at script start.
 - **Workspace Selector** → Only want to run this against 1, 2, 10 workspaces? Now a popup will allow you to choose which workspaces you run this against. Select All will still run against eveyrthing and a built-in timer ensures no selection will run against everything.
 - **Unused Model Objects** → Identify model fields/measures not used in any visuals, measures, calculated columns, or relationships.  

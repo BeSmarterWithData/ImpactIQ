@@ -169,7 +169,7 @@ if ($psGetVer -lt [version]'2.0.0') {
 }
 
 # Ensure required modules are installed, and imports them. If import fails, error and exit early
-$requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt' )
+$requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt', 'Az.Accounts' )
 foreach ($module in $requiredModules) {
     if (-not (Import-Module $module -PassThru -EA Ignore)) {
         Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck
@@ -469,13 +469,13 @@ function Connect-PowerBI {
                 Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints" -ForegroundColor Cyan
 
                 if ($Environment) {
-                    Connect-PowerBIServiceAccount -Environment $Environment -ErrorAction Stop | Out-Null
+                    Connect-PowerBIServiceAccount -Environment $Environment -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
                 }
                 else {
-                    Connect-PowerBIServiceAccount -ErrorAction Stop | Out-Null
+                    Connect-PowerBIServiceAccount -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
                 }
 
-                $token = Get-PowerBIAccessToken -ErrorAction Stop
+                $token = Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null
                 if ($token -and $token.Authorization) {
                     Write-Host "[INFO] Connected to Power BI." -ForegroundColor Green
                     return
@@ -510,20 +510,98 @@ Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
 # Function to get the current access token — MSAL auto-refreshes silently via the session cache
 function Get-CurrentAccessToken {
     try {
-        return (Get-PowerBIAccessToken -ErrorAction Stop).Authorization -replace 'Bearer ', ''
+        return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
     }
     catch {
         # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
         Write-Host "[WARN] Token fetch failed, re-connecting..."
         try {
             Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
-            return (Get-PowerBIAccessToken -ErrorAction Stop).Authorization -replace 'Bearer ', ''
+            return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
         }
         catch {
             Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
             throw "Cannot obtain Power BI access token."
         }
     }
+}
+
+function Get-FabricAccessToken {
+    param(
+        [switch]$ForceLogin
+    )
+
+    $azEnvironment = switch ($EnvironmentForEndpoints) {
+        'China' { 'AzureChinaCloud' }
+        'USGov' { 'AzureUSGovernment' }
+        'USGovHigh' { 'AzureUSGovernment' }
+        'USGovMil' { 'AzureUSGovernment' }
+        default { 'AzureCloud' }
+    }
+
+    $azContext = Get-AzContext -ErrorAction SilentlyContinue
+    if ($ForceLogin -or -not $azContext -or $azContext.Environment.Name -ne $azEnvironment) {
+        Write-Host "[INFO] Connecting to Microsoft Fabric..." -ForegroundColor Cyan
+        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+    }
+
+    try {
+        $tokenValue = (Get-AzAccessToken -ResourceUrl $global:PowerBIEndpoints.FabricApiPrefix -ErrorAction Stop).Token
+    }
+    catch {
+        if ($ForceLogin) {
+            throw
+        }
+
+        return Get-FabricAccessToken -ForceLogin
+    }
+
+    if ($tokenValue -is [System.Security.SecureString]) {
+        $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenValue)
+    } else {
+        return [string]$tokenValue
+    }
+
+    try {
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
+    }
+    finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
+    }
+}
+
+function Invoke-FabricPagedGet {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+        [string]$AccessToken
+    )
+
+    $results = @()
+    $nextUrl = $Url
+
+    while ($nextUrl) {
+        if (-not $AccessToken) {
+            $AccessToken = Get-CurrentAccessToken
+        }
+        $headers = @{
+            Authorization = "Bearer $AccessToken"
+            'Content-Type' = 'application/json'
+        }
+        $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET -ErrorAction Stop
+
+        if ($response.value) {
+            $results += @($response.value)
+        }
+
+        $nextUrl = if ($response.continuationUri) {
+            $response.continuationUri
+        } else {
+            $null
+        }
+    }
+
+    return $results
 }
 
 # Create a variable date
@@ -1770,6 +1848,9 @@ if ($runMode -eq 'Reports') {
 
 # Initialize collections for all necessary information
 $fabricItemsInfo = @()
+$connectionsInfo = @()
+$gatewaysInfo = @()
+$itemConnectionsInfo = @()
 $datasetsInfo = @()
 $datasetSourcesInfo = @()
 $dataflowsInfo = @()
@@ -1784,6 +1865,72 @@ $dataflowNameLookup = @{}
 $datasetRefreshHistory = @()
 $datasetRefreshSchedule = @()
 $dataflowRefreshHistory = @()
+
+try {
+    Write-Output "Fabric connection metadata extraction process started."
+    $connectionsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/connections"
+    $fabricAccessToken = Get-FabricAccessToken
+
+    foreach ($connection in (Invoke-FabricPagedGet -Url $connectionsUrl -AccessToken $fabricAccessToken)) {
+        $connectionsInfo += [PSCustomObject]@{
+            ConnectionId                   = $connection.id
+            ConnectionName                 = $connection.displayName
+            GatewayId                      = $connection.gatewayId
+            ConnectivityType               = $connection.connectivityType
+            ConnectionType                 = $connection.connectionDetails.type
+            ConnectionPath                 = $connection.connectionDetails.path
+            PrivacyLevel                   = $connection.privacyLevel
+            CredentialType                 = $connection.credentialDetails.credentialType
+            SingleSignOnType               = $connection.credentialDetails.singleSignOnType
+            ConnectionEncryption           = $connection.credentialDetails.connectionEncryption
+            SkipTestConnection             = $connection.credentialDetails.skipTestConnection
+            AllowConnectionUsageInGateway  = $connection.allowConnectionUsageInGateway
+            AllowUsageInUserControlledCode = $connection.allowUsageInUserControlledCode
+            CreatedDateTime                = $connection.connectionRecency.createdDateTime
+            LastBoundDateTime              = $connection.connectionRecency.lastBoundDateTime
+            LastCredentialUsedDateTime     = $connection.connectionRecency.lastCredentialUsedDateTime
+            MyLastBoundDateTime            = $connection.connectionRecency.myLastBoundDateTime
+            MyLastCredentialUsedDateTime   = $connection.connectionRecency.myLastCredentialUsedDateTime
+        }
+    }
+    Write-Output "Fabric connection metadata extraction process completed. Found $($connectionsInfo.Count) connection(s)."
+} catch {
+    $connectionError = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+    Write-Host "[WARN] Fabric List Connections failed: $connectionError" -ForegroundColor Yellow
+}
+
+try {
+    Write-Output "Fabric gateway metadata extraction process started."
+    $gatewaysUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/gateways"
+    if (-not $fabricAccessToken) {
+        $fabricAccessToken = Get-FabricAccessToken
+    }
+
+    foreach ($gateway in (Invoke-FabricPagedGet -Url $gatewaysUrl -AccessToken $fabricAccessToken)) {
+        $gatewaysInfo += [PSCustomObject]@{
+            GatewayId                   = $gateway.id
+            GatewayName                 = $gateway.displayName
+            GatewayType                 = $gateway.type
+            GatewayVersion              = $gateway.version
+            CapacityId                  = $gateway.capacityId
+            NumberOfMemberGateways      = $gateway.numberOfMemberGateways
+            MinMemberGatewayCount       = $gateway.minMemberGatewayCount
+            MaxMemberGatewayCount       = $gateway.maxMemberGatewayCount
+            LoadBalancingSetting        = $gateway.loadBalancingSetting
+            AllowCloudConnectionRefresh = $gateway.allowCloudConnectionRefresh
+            AllowCustomConnectors       = $gateway.allowCustomConnectors
+            InactivityMinutesBeforeSleep = $gateway.inactivityMinutesBeforeSleep
+            SubscriptionId              = $gateway.virtualNetworkAzureResource.subscriptionId
+            ResourceGroupName           = $gateway.virtualNetworkAzureResource.resourceGroupName
+            VirtualNetworkName          = $gateway.virtualNetworkAzureResource.virtualNetworkName
+            SubnetName                  = $gateway.virtualNetworkAzureResource.subnetName
+        }
+    }
+    Write-Output "Fabric gateway metadata extraction process completed. Found $($gatewaysInfo.Count) gateway(s)."
+} catch {
+    $gatewayError = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+    Write-Host "[WARN] Fabric List Gateways failed: $gatewayError" -ForegroundColor Yellow
+}
 
 
 # Loop through filtered workspaces
@@ -2146,16 +2293,38 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extra
     $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items"
 
     try {
-        $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
+        if (-not $fabricAccessToken) { $fabricAccessToken = Get-FabricAccessToken }
+        $fabricItems = @(Invoke-FabricPagedGet -Url $fabricItemsUrl -AccessToken $fabricAccessToken)
 
         # Record reports that carry a sensitivity label (presence only - the id is not needed).
-        foreach ($fabricItem in $fabricItemsResponse.value) {
+        foreach ($fabricItem in $fabricItems) {
             if ($fabricItem.type -eq 'Report' -and $fabricItem.sensitivityLabel) {
                 $global:ReportsWithSensitivityLabel[$fabricItem.id] = $true
             }
+
+            $itemConnectionsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items/$($fabricItem.id)/connections"
+            try {
+                foreach ($connection in (Invoke-FabricPagedGet -Url $itemConnectionsUrl -AccessToken $fabricAccessToken)) {
+                    $itemConnectionsInfo += [PSCustomObject]@{
+                        WorkspaceId      = $workspaceId
+                        WorkspaceName    = $workspaceName
+                        FabricItemId     = $fabricItem.id
+                        FabricItemName   = $fabricItem.displayName
+                        FabricItemType   = $fabricItem.type
+                        ConnectionId     = $connection.id
+                        ConnectionName   = $connection.displayName
+                        GatewayId        = $connection.gatewayId
+                        ConnectivityType = $connection.connectivityType
+                        ConnectionType   = $connection.connectionDetails.type
+                        ConnectionPath   = $connection.connectionDetails.path
+                    }
+                }
+            } catch {
+                Write-Warning "Failed to fetch connections for Fabric item $($fabricItem.id) in workspace $workspaceId. $($_.Exception.Message)"
+            }
         }
 
-        $filteredItems = $fabricItemsResponse.value | Where-Object {
+        $filteredItems = $fabricItems | Where-Object {
             $_.type -ne 'Report' -and $_.type -ne 'SemanticModel'
         }
 
@@ -2346,6 +2515,9 @@ if (Test-Path $excelFile) {
 
 $workspacesInfo | Export-Excel -Path $excelFile -WorksheetName "Workspaces" -AutoSize
 $fabricItemsInfo | Export-Excel -Path $excelFile -WorksheetName "FabricItems" -AutoSize -Append
+$connectionsInfo | Export-Excel -Path $excelFile -WorksheetName "Connections" -AutoSize -Append
+$gatewaysInfo | Export-Excel -Path $excelFile -WorksheetName "Gateways" -AutoSize -Append
+$itemConnectionsInfo | Export-Excel -Path $excelFile -WorksheetName "ItemConnections" -AutoSize -Append
 $datasetsInfo | Export-Excel -Path $excelFile -WorksheetName "Datasets" -AutoSize -Append
 $datasetSourcesInfo | Export-Excel -Path $excelFile -WorksheetName "DatasetSourcesInfo" -AutoSize -Append
 $datasetRefreshHistory | Export-Excel -Path $excelFile -WorksheetName "DatasetRefreshHistory" -AutoSize -Append

@@ -501,31 +501,6 @@ function Connect-PowerBI {
     }
 }
 
-# Track script start time
-$scriptStartTime = Get-Date
-
-Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
-
-
-# Function to get the current access token — MSAL auto-refreshes silently via the session cache
-function Get-CurrentAccessToken {
-    try {
-        return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
-    }
-    catch {
-        # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
-        Write-Host "[WARN] Token fetch failed, re-connecting..."
-        try {
-            Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
-            return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
-        }
-        catch {
-            Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
-            throw "Cannot obtain Power BI access token."
-        }
-    }
-}
-
 function Get-FabricAccessToken {
     param(
         [switch]$ForceLogin
@@ -542,6 +517,9 @@ function Get-FabricAccessToken {
     $azContext = Get-AzContext -ErrorAction SilentlyContinue
     if ($ForceLogin -or -not $azContext -or $azContext.Environment.Name -ne $azEnvironment) {
         Write-Host "[INFO] Connecting to Microsoft Fabric..." -ForegroundColor Cyan
+        if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
+            Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction SilentlyContinue | Out-Null
+        }
         Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
     }
 
@@ -567,6 +545,33 @@ function Get-FabricAccessToken {
     }
     finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
+    }
+}
+
+# Track script start time
+$scriptStartTime = Get-Date
+
+Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
+$fabricAccessToken = Get-FabricAccessToken
+Write-Host "[INFO] Connected to Microsoft Fabric." -ForegroundColor Green
+
+
+# Function to get the current access token — MSAL auto-refreshes silently via the session cache
+function Get-CurrentAccessToken {
+    try {
+        return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
+    }
+    catch {
+        # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
+        Write-Host "[WARN] Token fetch failed, re-connecting..."
+        try {
+            Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
+            return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
+        }
+        catch {
+            Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
+            throw "Cannot obtain Power BI access token."
+        }
     }
 }
 

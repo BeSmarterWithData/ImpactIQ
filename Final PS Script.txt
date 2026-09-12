@@ -451,11 +451,193 @@ function Get-PowerBIEndpoints {
 $EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { 'Public' }
 $global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
 
+function Get-AzEnvironmentName {
+    switch ($EnvironmentForEndpoints) {
+        'China' { return 'AzureChinaCloud' }
+        'USGov' { return 'AzureUSGovernment' }
+        'USGovHigh' { return 'AzureUSGovernment' }
+        'USGovMil' { return 'AzureUSGovernment' }
+        default { return 'AzureCloud' }
+    }
+}
+
+function Show-TenantSelectionDialog {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Tenants,
+        [int]$TimeoutSeconds = 60
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Select Microsoft Tenant'
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(620, 405)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = 'Select the tenant to use for all Power BI and Fabric API calls (Current/Default is preselected):'
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $label.Font = New-Object System.Drawing.Font($label.Font.FontFamily, 10)
+    $form.Controls.Add($label)
+
+    $listBox = New-Object System.Windows.Forms.ListBox
+    $listBox.Location = New-Object System.Drawing.Point(20, 50)
+    $listBox.Size = New-Object System.Drawing.Size(565, 200)
+    $listBox.SelectionMode = 'One'
+    $listBox.DisplayMember = 'DisplayName'
+    $listBox.Font = New-Object System.Drawing.Font($listBox.Font.FontFamily, 10)
+    foreach ($tenant in $Tenants) {
+        [void]$listBox.Items.Add($tenant)
+    }
+    $listBox.SelectedIndex = 0
+    $form.Controls.Add($listBox)
+
+    $helpLabel = New-Object System.Windows.Forms.Label
+    $helpLabel.Text = 'Not Sure? Use the Default'
+    $helpLabel.AutoSize = $true
+    $helpLabel.Location = New-Object System.Drawing.Point(20, 262)
+    $helpLabel.Font = New-Object System.Drawing.Font($helpLabel.Font.FontFamily, 10)
+    $form.Controls.Add($helpLabel)
+
+    $timeoutLabel = New-Object System.Windows.Forms.Label
+    $timeoutLabel.Text = "Current/Default will be selected automatically in $TimeoutSeconds seconds."
+    $timeoutLabel.AutoSize = $true
+    $timeoutLabel.Location = New-Object System.Drawing.Point(20, 287)
+    $timeoutLabel.Font = New-Object System.Drawing.Font($timeoutLabel.Font.FontFamily, 10)
+    $timeoutLabel.ForeColor = [System.Drawing.Color]::DimGray
+    $form.Controls.Add($timeoutLabel)
+
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = 'OK'
+    $okButton.Size = New-Object System.Drawing.Size(85, 30)
+    $okButton.Location = New-Object System.Drawing.Point(405, 320)
+    $okButton.Add_Click({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+    $form.Controls.Add($okButton)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'Cancel'
+    $cancelButton.Size = New-Object System.Drawing.Size(85, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(500, 320)
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancelled'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    $listBox.Add_DoubleClick({
+        if ($listBox.SelectedItem) {
+            $form.Tag = $listBox.SelectedItem
+            $form.Close()
+        }
+    })
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 1000
+    $timer.Tag = $TimeoutSeconds
+    $timer.Add_Tick({
+        $timer.Tag = [int]$timer.Tag - 1
+        $timeoutLabel.Text = "Current/Default will be selected automatically in $($timer.Tag) seconds."
+        if ([int]$timer.Tag -le 0) {
+            $form.Tag = 'Timeout'
+            $form.Close()
+        }
+    })
+
+    $form.Add_FormClosing({
+        $timer.Stop()
+        $timer.Dispose()
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancelled'
+        }
+    })
+
+    $form.AcceptButton = $okButton
+    $form.CancelButton = $cancelButton
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+function Select-PowerBITenant {
+    $azEnvironment = Get-AzEnvironmentName
+    $azContext = Get-AzContext -ErrorAction SilentlyContinue
+
+    if (-not $azContext -or $azContext.Environment.Name -ne $azEnvironment) {
+        Write-Host '[INFO] Sign in to discover your available Microsoft tenants...' -ForegroundColor Cyan
+        if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
+            Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction SilentlyContinue | Out-Null
+        }
+        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+        $azContext = Get-AzContext -ErrorAction Stop
+    }
+
+    $defaultTenantId = [string]$azContext.Tenant.Id
+    $tenants = @(Get-AzTenant -ErrorAction Stop | ForEach-Object {
+        $tenantId = if ($_.Id) { $_.Id } else { $_.TenantId }
+        $tenantName = if ($_.Name) { $_.Name } elseif ($_.Domains) { $_.Domains[0] } else { 'Unnamed tenant' }
+        $isDefault = [string]$tenantId -eq $defaultTenantId
+        $defaultLabel = if ($isDefault) { ' - Current/Default' } else { '' }
+        [PSCustomObject]@{
+            Id = [string]$tenantId
+            DisplayName = "${tenantName} (${tenantId})${defaultLabel}"
+            IsDefault = $isDefault
+        }
+    } | Where-Object { $_.Id } | Sort-Object @{ Expression = 'IsDefault'; Descending = $true }, DisplayName)
+
+    if ($tenants.Count -eq 0) {
+        throw 'No Microsoft tenants were returned for the signed-in account.'
+    }
+
+    if ($tenants.Count -eq 1) {
+        $selectedTenant = $tenants[0]
+    }
+    else {
+        $defaultTenant = @($tenants | Where-Object { $_.IsDefault })[0]
+        if (-not $defaultTenant) { $defaultTenant = $tenants[0] }
+
+        $selectionDeadline = (Get-Date).AddSeconds(60)
+        do {
+            $remainingSeconds = [int][Math]::Ceiling(($selectionDeadline - (Get-Date)).TotalSeconds)
+            if ($remainingSeconds -le 0) {
+                $selectedTenant = $defaultTenant
+                break
+            }
+
+            $dialogResult = Show-TenantSelectionDialog -Tenants $tenants -TimeoutSeconds $remainingSeconds
+            if ($dialogResult -eq 'Timeout') {
+                $selectedTenant = $defaultTenant
+                break
+            }
+            if ($dialogResult -eq 'Cancelled') {
+                continue
+            }
+
+            $selectedTenant = $dialogResult
+        } while (-not $selectedTenant)
+    }
+
+    Set-AzContext -Tenant $selectedTenant.Id -Scope Process -ErrorAction Stop | Out-Null
+    Write-Host "[INFO] Selected tenant: $($selectedTenant.DisplayName)" -ForegroundColor Green
+    return $selectedTenant.Id
+}
+
 # Connect to the Power BI Service
 function Connect-PowerBI {
     [CmdletBinding()]
     param(
         [string]$Environment,
+        [string]$TenantId,
         [int]$MaxAttempts = 2
     )
 
@@ -468,12 +650,13 @@ function Connect-PowerBI {
             try {
                 Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints" -ForegroundColor Cyan
 
-                if ($Environment) {
-                    Connect-PowerBIServiceAccount -Environment $Environment -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+                $connectParameters = @{
+                    ErrorAction = 'Stop'
+                    WarningAction = 'SilentlyContinue'
                 }
-                else {
-                    Connect-PowerBIServiceAccount -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
-                }
+                if ($Environment) { $connectParameters.Environment = $Environment }
+                if ($TenantId) { $connectParameters.Tenant = $TenantId }
+                Connect-PowerBIServiceAccount @connectParameters 3>$null | Out-Null
 
                 $token = Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null
                 if ($token -and $token.Authorization) {
@@ -506,21 +689,15 @@ function Get-FabricAccessToken {
         [switch]$ForceLogin
     )
 
-    $azEnvironment = switch ($EnvironmentForEndpoints) {
-        'China' { 'AzureChinaCloud' }
-        'USGov' { 'AzureUSGovernment' }
-        'USGovHigh' { 'AzureUSGovernment' }
-        'USGovMil' { 'AzureUSGovernment' }
-        default { 'AzureCloud' }
-    }
+    $azEnvironment = Get-AzEnvironmentName
 
     $azContext = Get-AzContext -ErrorAction SilentlyContinue
-    if ($ForceLogin -or -not $azContext -or $azContext.Environment.Name -ne $azEnvironment) {
+    if ($ForceLogin -or -not $azContext -or $azContext.Environment.Name -ne $azEnvironment -or $azContext.Tenant.Id -ne $global:SelectedTenantId) {
         Write-Host "[INFO] Connecting to Microsoft Fabric..." -ForegroundColor Cyan
         if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
             Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction SilentlyContinue | Out-Null
         }
-        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+        Connect-AzAccount -Environment $azEnvironment -Tenant $global:SelectedTenantId -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
     }
 
     try {
@@ -551,7 +728,8 @@ function Get-FabricAccessToken {
 # Track script start time
 $scriptStartTime = Get-Date
 
-Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
+$global:SelectedTenantId = Select-PowerBITenant
+Connect-PowerBI -Environment $LoginEnvironment -TenantId $global:SelectedTenantId -MaxAttempts 2 -ErrorAction Stop
 $fabricAccessToken = Get-FabricAccessToken
 Write-Host "[INFO] Connected to Microsoft Fabric." -ForegroundColor Green
 
@@ -565,7 +743,7 @@ function Get-CurrentAccessToken {
         # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
         Write-Host "[WARN] Token fetch failed, re-connecting..."
         try {
-            Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
+            Connect-PowerBI -Environment $LoginEnvironment -TenantId $global:SelectedTenantId -MaxAttempts 2 -ErrorAction Stop
             return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
         }
         catch {

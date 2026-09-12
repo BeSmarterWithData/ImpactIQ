@@ -620,7 +620,7 @@ function Select-PowerBITenant {
                 break
             }
             if ($dialogResult -eq 'Cancelled') {
-                continue
+                throw 'Tenant selection was cancelled. No API calls were made.'
             }
 
             $selectedTenant = $dialogResult

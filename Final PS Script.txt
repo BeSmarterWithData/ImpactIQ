@@ -168,13 +168,13 @@ if ($psGetVer -lt [version]'2.0.0') {
     Import-Module PowerShellGet -Force
 }
 
-# Ensure required modules are installed, and imports them. If import fails, error and exit early
+# Ensure required modules are installed and attempt to import them without terminating the script
 $requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt', 'Az.Accounts' )
 foreach ($module in $requiredModules) {
     if (-not (Import-Module $module -PassThru -EA Ignore)) {
         Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck
     }
-    Import-Module $module -ErrorAction 'Stop'
+    Import-Module $module -ErrorAction 'Continue'
 }
 
 
@@ -1533,8 +1533,9 @@ while ($reportPickerCancelled) {
     $runMode = Show-RunModeDialog
 
 if ($runMode -eq 'Cancel') {
-    Write-Host "[INFO] Run cancelled by user." -ForegroundColor Yellow
-    exit
+    Write-Host "[INFO] Run mode selection cancelled. Returning to run mode selection..." -ForegroundColor Yellow
+    $reportPickerCancelled = $true
+    continue
 }
 
 if ($runMode -eq 'Reports') {
@@ -3484,15 +3485,12 @@ $latestDataflowDateFolder = Get-ChildItem -Path $dataflowBackupsPath -Directory 
     Sort-Object { [datetime]::Parse($_.Name) } -Descending | # Sort by date, descending
     Select-Object -First 1
 
-if ($latestDataflowDateFolder) {
+if (-not $latestDataflowDateFolder) {
+    Write-Warning "No valid dated folders found in 'Dataflow Backups'. Skipping Dataflow backup and detail extraction."
+} else {
     # Override $baseOutputFilePath with the latest-dated folder
     $folderPath = $latestDataflowDateFolder.FullName
     Write-Host "Using the latest dated folder: $baseOutputFilePath"
-} else {
-    # Throw an error if no valid dated folders are found
-    Write-Error "No valid dated folders found in 'Dataflow Backups'."
-    exit
-}
 
 # Set the combined Excel output path
 $combinedExcelOutputPath = Join-Path -Path $dataflow_new_date_folder -ChildPath "Dataflow Detail.xlsx"
@@ -3731,6 +3729,7 @@ if (Test-Path -Path $sourceFilePath) {
 }
 
 Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
+}
 
 
 Write-Output "All Excel files processed and combined successfully."
@@ -3738,3 +3737,4 @@ Write-Output "All Excel files processed and combined successfully."
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
+ 

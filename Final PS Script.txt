@@ -1533,9 +1533,8 @@ while ($reportPickerCancelled) {
     $runMode = Show-RunModeDialog
 
 if ($runMode -eq 'Cancel') {
-    Write-Host "[INFO] Run mode selection cancelled. Returning to run mode selection..." -ForegroundColor Yellow
-    $reportPickerCancelled = $true
-    continue
+    Write-Host "[INFO] Run mode selection cancelled. Exiting script." -ForegroundColor Yellow
+    return
 }
 
 if ($runMode -eq 'Reports') {

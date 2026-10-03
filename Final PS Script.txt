@@ -3945,6 +3945,295 @@ function Get-FabricAppDaxSource {
         $query.line = $line
         $query.column = $query.start - $lineStart + 1
     }
+
+    $configuredAliases = @($mappings | Select-Object -ExpandProperty connectionAlias -Unique)
+    $aliasVariables = @{}
+    for ($tokenIndex = 0; $tokenIndex -lt $tokens.Count - 2; $tokenIndex++) {
+        if ($tokens[$tokenIndex].Kind -ne 'word' -or
+            $tokens[$tokenIndex + 1].Value -ne '=' -or
+            $tokens[$tokenIndex + 2].Kind -ne 'string' -or
+            $tokens[$tokenIndex + 2].Value -notmatch '^[a-zA-Z_$][\w$]*$') {
+            continue
+        }
+        $aliasVariables[$tokens[$tokenIndex].Value] = $tokens[$tokenIndex + 2].Value
+    }
+
+    $functionRanges = [Collections.Generic.List[object]]::new()
+    for ($tokenIndex = 0; $tokenIndex -lt $tokens.Count - 4; $tokenIndex++) {
+        if ($tokens[$tokenIndex].Value -ne 'function' -or $tokens[$tokenIndex + 1].Kind -ne 'word') { continue }
+        $openParenthesis = $tokenIndex + 2
+        while ($openParenthesis -lt $tokens.Count -and $tokens[$openParenthesis].Value -ne '(') { $openParenthesis++ }
+        if ($openParenthesis -ge $tokens.Count) { continue }
+        $parenthesisDepth = 0
+        $closeParenthesis = -1
+        for ($index = $openParenthesis; $index -lt $tokens.Count; $index++) {
+            if ($tokens[$index].Value -eq '(') { $parenthesisDepth++ }
+            elseif ($tokens[$index].Value -eq ')') {
+                $parenthesisDepth--
+                if ($parenthesisDepth -eq 0) { $closeParenthesis = $index; break }
+            }
+        }
+        if ($closeParenthesis -lt 0) { continue }
+        $openBrace = $closeParenthesis + 1
+        while ($openBrace -lt $tokens.Count -and $tokens[$openBrace].Value -ne '{') { $openBrace++ }
+        if ($openBrace -ge $tokens.Count) { continue }
+        $braceDepth = 0
+        $closeBrace = -1
+        for ($index = $openBrace; $index -lt $tokens.Count; $index++) {
+            if ($tokens[$index].Value -eq '{') { $braceDepth++ }
+            elseif ($tokens[$index].Value -eq '}') {
+                $braceDepth--
+                if ($braceDepth -eq 0) { $closeBrace = $index; break }
+            }
+        }
+        if ($closeBrace -lt 0) { continue }
+        $parameters = [Collections.Generic.List[string]]::new()
+        for ($index = $openParenthesis + 1; $index -lt $closeParenthesis; $index++) {
+            if ($tokens[$index].Kind -eq 'word') { $parameters.Add($tokens[$index].Value) }
+        }
+        $functionRanges.Add([PSCustomObject]@{
+            Name = $tokens[$tokenIndex + 1].Value
+            Start = $tokens[$tokenIndex].Start
+            End = $tokens[$closeBrace].End
+            OpenIndex = $openBrace
+            CloseIndex = $closeBrace
+            Parameters = $parameters.ToArray()
+        })
+    }
+
+    function Get-AppDaxFunctionAt([int]$Position) {
+        $match = $null
+        foreach ($range in $functionRanges) {
+            if ($range.Start -le $Position -and $range.End -ge $Position -and
+                ($null -eq $match -or ($range.End - $range.Start) -lt ($match.End - $match.Start))) {
+                $match = $range
+            }
+        }
+        $match
+    }
+
+    function Resolve-AppDaxAlias($Token) {
+        if ($null -eq $Token) { return $null }
+        if ($Token.Kind -eq 'string' -and $Token.Value -match '^[a-zA-Z_$][\w$]*$') { return $Token.Value }
+        if ($Token.Kind -eq 'word' -and $aliasVariables.ContainsKey($Token.Value)) { return $aliasVariables[$Token.Value] }
+        $null
+    }
+
+    $dependenciesByFunction = @{}
+    function Get-AppDaxDependencies($Range) {
+        if ($null -eq $Range) { return @{} }
+        $key = [string]$Range.Start
+        if ($dependenciesByFunction.ContainsKey($key)) { return $dependenciesByFunction[$key] }
+        $dependencies = @{}
+        for ($index = $Range.OpenIndex + 1; $index -lt $Range.CloseIndex - 2; $index++) {
+            if ($tokens[$index].Value -notin @('const', 'let', 'var')) { continue }
+            $cursor = $index + 1
+            while ($cursor -lt $Range.CloseIndex) {
+                if ($tokens[$cursor].Kind -ne 'word' -or $tokens[$cursor + 1].Value -ne '=') { break }
+                $name = $tokens[$cursor].Value
+                $expressionStart = $cursor + 2
+                $roundDepth = $squareDepth = $curlyDepth = 0
+                $expressionEnd = $expressionStart
+                while ($expressionEnd -lt $Range.CloseIndex) {
+                    $value = $tokens[$expressionEnd].Value
+                    if ($value -eq '(') { $roundDepth++ }
+                    elseif ($value -eq ')') { $roundDepth-- }
+                    elseif ($value -eq '[') { $squareDepth++ }
+                    elseif ($value -eq ']') { $squareDepth-- }
+                    elseif ($value -eq '{') { $curlyDepth++ }
+                    elseif ($value -eq '}') { $curlyDepth-- }
+                    if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0 -and $value -in @(',', ';')) { break }
+                    $expressionEnd++
+                }
+                $identifiers = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                for ($dependencyIndex = $expressionStart; $dependencyIndex -lt $expressionEnd; $dependencyIndex++) {
+                    if ($tokens[$dependencyIndex].Kind -eq 'word') { $null = $identifiers.Add($tokens[$dependencyIndex].Value) }
+                }
+                $dependencies[$name] = @($identifiers)
+                if ($expressionEnd -ge $Range.CloseIndex -or $tokens[$expressionEnd].Value -eq ';') {
+                    $index = $expressionEnd
+                    break
+                }
+                $cursor = $expressionEnd + 1
+            }
+        }
+        $dependenciesByFunction[$key] = $dependencies
+        $dependencies
+    }
+
+    $queryOwners = @{}
+    $queryOwnerByStart = @{}
+    $queryAliases = @{}
+    foreach ($query in $orderedQueries) {
+        $ownerFunction = Get-AppDaxFunctionAt $query.start
+        $owner = if ($ownerFunction) { $ownerFunction.Name } else { $query.symbol }
+        if (-not $ownerFunction) {
+            for ($tokenIndex = 2; $tokenIndex -lt $tokens.Count; $tokenIndex++) {
+                if ($tokens[$tokenIndex].Start -ne $query.start -or $tokens[$tokenIndex].Kind -notin @('string', 'template')) { continue }
+                if ($tokens[$tokenIndex - 1].Value -eq '=' -and $tokens[$tokenIndex - 2].Kind -eq 'word') {
+                    $owner = $tokens[$tokenIndex - 2].Value
+                }
+                break
+            }
+            if ($owner -like 'query_*') {
+                $declarationStart = [Math]::Max(0, $query.start - 500)
+                $declarationPrefix = $Source.Substring($declarationStart, $query.start - $declarationStart)
+                $declarationMatch = [regex]::Match($declarationPrefix, '(?:(?:const|let|var)\s+|,)\s*(?<name>[a-zA-Z_$][\w$]*)\s*=\s*$')
+                if ($declarationMatch.Success) { $owner = $declarationMatch.Groups['name'].Value }
+            }
+            if ($owner -like 'query_*') {
+                $prefixStart = [Math]::Max(0, $query.start - 20000)
+                $prefix = $Source.Substring($prefixStart, $query.start - $prefixStart)
+                $functionMatches = [regex]::Matches($prefix, 'function\s+(?<name>[a-zA-Z_$][\w$]*)\s*\(')
+                if ($functionMatches.Count -gt 0) {
+                    $owner = $functionMatches[$functionMatches.Count - 1].Groups['name'].Value
+                }
+            }
+        }
+        if (-not $queryOwners.ContainsKey($owner)) { $queryOwners[$owner] = [Collections.Generic.List[object]]::new() }
+        $queryOwners[$owner].Add($query)
+        $queryOwnerByStart[[string]$query.start] = $owner
+        $queryAliases[[string]$query.start] = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    }
+
+    function Add-AppDaxExpressionRoute([string]$Alias, [int]$StartIndex, [int]$EndIndex, $Range) {
+        if (-not $Alias -or $StartIndex -ge $EndIndex) { return }
+        $dependencies = Get-AppDaxDependencies $Range
+        $pendingSymbols = [Collections.Generic.Stack[string]]::new()
+        $seenSymbols = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        for ($index = $StartIndex; $index -lt $EndIndex; $index++) {
+            if ($tokens[$index].Kind -eq 'word') { $pendingSymbols.Push($tokens[$index].Value) }
+            foreach ($query in $orderedQueries) {
+                if ($query.start -ge $tokens[$index].Start -and $query.end -le $tokens[$index].End) {
+                    $null = $queryAliases[[string]$query.start].Add($Alias)
+                }
+            }
+        }
+        while ($pendingSymbols.Count -gt 0) {
+            $symbol = $pendingSymbols.Pop()
+            if (-not $seenSymbols.Add($symbol)) { continue }
+            if ($queryOwners.ContainsKey($symbol)) {
+                foreach ($query in $queryOwners[$symbol]) { $null = $queryAliases[[string]$query.start].Add($Alias) }
+            }
+            if ($dependencies.ContainsKey($symbol)) {
+                foreach ($dependency in $dependencies[$symbol]) { $pendingSymbols.Push($dependency) }
+            }
+        }
+    }
+
+    $wrapperParameterRoutes = @{}
+    foreach ($range in $functionRanges) {
+        $dependencies = Get-AppDaxDependencies $range
+        for ($index = $range.OpenIndex + 1; $index -lt $range.CloseIndex - 5; $index++) {
+            $alias = $null
+            $queryStart = $queryEnd = -1
+            if ($tokens[$index].Value -eq 'connection' -and $tokens[$index + 1].Value -eq ':') {
+                $alias = Resolve-AppDaxAlias $tokens[$index + 2]
+                if ($alias) {
+                    for ($propertyIndex = $index + 3; $propertyIndex -lt [Math]::Min($range.CloseIndex, $index + 40); $propertyIndex++) {
+                        if ($tokens[$propertyIndex].Value -eq 'query' -and $tokens[$propertyIndex + 1].Value -eq ':') {
+                            $queryStart = $propertyIndex + 2
+                            break
+                        }
+                    }
+                }
+            }
+            elseif ($tokens[$index].Value -eq 'semanticModel' -and $tokens[$index + 1].Value -eq '(') {
+                $alias = Resolve-AppDaxAlias $tokens[$index + 2]
+                if ($alias -and $tokens[$index + 3].Value -eq ')' -and $tokens[$index + 4].Value -eq '.' -and
+                    $tokens[$index + 5].Value -eq 'query' -and $tokens[$index + 6].Value -eq '(') {
+                    $queryStart = $index + 7
+                }
+            }
+            if (-not $alias -or $queryStart -lt 0) { continue }
+            $roundDepth = $squareDepth = $curlyDepth = 0
+            $queryEnd = $queryStart
+            while ($queryEnd -lt $range.CloseIndex) {
+                $value = $tokens[$queryEnd].Value
+                if ($value -eq '(') { $roundDepth++ }
+                elseif ($value -eq ')') {
+                    if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0) { break }
+                    $roundDepth--
+                }
+                elseif ($value -eq '[') { $squareDepth++ }
+                elseif ($value -eq ']') { $squareDepth-- }
+                elseif ($value -eq '{') { $curlyDepth++ }
+                elseif ($value -eq '}') {
+                    if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0) { break }
+                    $curlyDepth--
+                }
+                if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0 -and $value -eq ',') { break }
+                $queryEnd++
+            }
+            Add-AppDaxExpressionRoute $alias $queryStart $queryEnd $range
+            if ($queryEnd -eq $queryStart + 1 -and $tokens[$queryStart].Kind -eq 'word') {
+                $parameterIndex = [Array]::IndexOf([string[]]$range.Parameters, [string]$tokens[$queryStart].Value)
+                if ($parameterIndex -ge 0) {
+                    if (-not $wrapperParameterRoutes.ContainsKey($range.Name)) { $wrapperParameterRoutes[$range.Name] = @{} }
+                    $wrapperParameterRoutes[$range.Name][$parameterIndex] = $alias
+                }
+            }
+        }
+    }
+
+    foreach ($wrapperName in $wrapperParameterRoutes.Keys) {
+        for ($index = 0; $index -lt $tokens.Count - 2; $index++) {
+            if ($tokens[$index].Value -ne $wrapperName -or $tokens[$index + 1].Value -ne '(' -or
+                ($index -gt 0 -and $tokens[$index - 1].Value -eq 'function')) {
+                continue
+            }
+            $range = Get-AppDaxFunctionAt $tokens[$index].Start
+            $argumentIndex = 0
+            $argumentStart = $index + 2
+            $roundDepth = $squareDepth = $curlyDepth = 0
+            for ($cursor = $argumentStart; $cursor -lt $tokens.Count; $cursor++) {
+                $value = $tokens[$cursor].Value
+                if ($value -eq '(') { $roundDepth++ }
+                elseif ($value -eq ')') {
+                    if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0) {
+                        if ($wrapperParameterRoutes[$wrapperName].ContainsKey($argumentIndex)) {
+                            Add-AppDaxExpressionRoute $wrapperParameterRoutes[$wrapperName][$argumentIndex] $argumentStart $cursor $range
+                        }
+                        break
+                    }
+                    $roundDepth--
+                }
+                elseif ($value -eq '[') { $squareDepth++ }
+                elseif ($value -eq ']') { $squareDepth-- }
+                elseif ($value -eq '{') { $curlyDepth++ }
+                elseif ($value -eq '}') { $curlyDepth-- }
+                elseif ($value -eq ',' -and $roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0) {
+                    if ($wrapperParameterRoutes[$wrapperName].ContainsKey($argumentIndex)) {
+                        Add-AppDaxExpressionRoute $wrapperParameterRoutes[$wrapperName][$argumentIndex] $argumentStart $cursor $range
+                    }
+                    $argumentIndex++
+                    $argumentStart = $cursor + 1
+                }
+            }
+        }
+    }
+
+    foreach ($query in $orderedQueries) {
+        if ($queryAliases[[string]$query.start].Count -eq 0) {
+            $owner = $queryOwnerByStart[[string]$query.start]
+            if ($owner -and $owner -notlike 'query_*') {
+                $ownerPattern = '(?<![\w$])' + [regex]::Escape($owner) + '(?![\w$])'
+                foreach ($ownerMatch in [regex]::Matches($Source, $ownerPattern)) {
+                    $contextStart = [Math]::Max(0, $ownerMatch.Index - 700)
+                    $contextLength = [Math]::Min($Source.Length - $contextStart, 1400)
+                    $context = $Source.Substring($contextStart, $contextLength)
+                    foreach ($routeMatch in [regex]::Matches($context, '(?:connection\s*:\s*|semanticModel\s*\(\s*)(?<route>["'']?[a-zA-Z_$][\w$]*["'']?)')) {
+                        $route = $routeMatch.Groups['route'].Value.Trim("'", '"')
+                        if ($aliasVariables.ContainsKey($route)) { $route = $aliasVariables[$route] }
+                        if ($route -match '^[a-zA-Z_$][\w$]*$') { $null = $queryAliases[[string]$query.start].Add($route) }
+                    }
+                }
+            }
+        }
+        $aliases = @($queryAliases[[string]$query.start] | Sort-Object)
+        $query | Add-Member -NotePropertyName connectionAliases -NotePropertyValue $aliases
+        if ($aliases.Count -gt 1) { $null = $warnings.Add("Query '$($query.symbol)' has multiple static connection candidates.") }
+    }
     [PSCustomObject]@{
         queries = $orderedQueries
         helpers = @()
@@ -3952,7 +4241,7 @@ function Get-FabricAppDaxSource {
         modelMappings = @($mappings.ToArray())
         parser = 'PowerShellScanner'
         warnings = @($warnings)
-        coverage = 'Heuristic lexical scan; JavaScript syntax, query routing, builder functions and helper dependencies are not resolved.'
+        coverage = 'Heuristic lexical scan with conservative static connection routing; full JavaScript syntax, runtime routing and helper dependencies are not resolved.'
     }
 }
 
@@ -4181,6 +4470,16 @@ function Assert-FabricAppDaxUri {
     }
 }
 
+function Assert-FabricAppDaxHostingUri {
+    param([Parameter(Mandatory)][uri]$Uri)
+
+    Assert-FabricAppDaxUri $Uri '.fabricapps.net'
+    $label = '[a-z0-9](?:[a-z0-9-]*[a-z0-9])?'
+    if ($Uri.DnsSafeHost -notmatch "^$label\.webapp(?:\.$label)*\.fabricapps\.net$") {
+        throw 'Unexpected Fabric hosting URL.'
+    }
+}
+
 function Get-FabricAppDaxToken {
     param([Parameter(Mandatory)][string]$ResourceUrl)
     try {
@@ -4242,33 +4541,28 @@ function Get-FabricAppDaxCapture {
     $ErrorActionPreference = 'Stop'
     $queries = [Collections.Generic.List[object]]::new()
     $modelMappings = [Collections.Generic.List[object]]::new()
+    $resolvedDatasets = [Collections.Generic.List[object]]::new()
     $parserEngine = if ($ParserRuntime.Engine -eq 'Acorn') { 'Acorn' } else { 'PowerShell' }
     $configurationIncomplete = $false
     $parserWarnings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $temporaryFolder = $null
+    $assetCount = 0
+    $failedAssets = 0
+    $captureError = ''
     $capture = [PSCustomObject][ordered]@{
         WorkspaceId = $WorkspaceId.ToString()
         WorkspaceName = $WorkspaceName
         AppId = $AppId.ToString()
         AppName = $AppName
-        Status = 'Failed'
-        QueryCount = 0
-        AssetCount = 0
-        FailedAssets = 0
-        CapturedAtUtc = [DateTime]::UtcNow.ToString('o')
-        Detail = ''
-        ParserWarnings = ''
-        Parser = $parserEngine
     }
     $stage = 'Discovery'
     $fabricToken = $powerBiToken = $mwc = $handoff = $session = $headers = $null
     $previousNodePath = $env:NODE_PATH
+    if ($Environment -ne 'Public') {
+        Write-Host "[ERROR] App query extraction failed for $WorkspaceName ~ $AppName`: the preview hosting flow has only been verified in the Public cloud." -ForegroundColor Red
+        return [PSCustomObject]@{ Queries = @(); Models = @(); Capture = $capture }
+    }
     try {
-        if ($Environment -ne 'Public') {
-            $capture.Status = 'UnsupportedEnvironment'
-            $capture.Detail = 'The preview hosting flow has only been verified in the Public cloud.'
-            return [PSCustomObject]@{ Queries = @(); Capture = $capture }
-        }
         if ($parserEngine -eq 'Acorn') {
             $parserPath = $ParserRuntime.ParserPath
             if (-not (Test-Path -LiteralPath $parserPath)) { throw 'JavaScript parser script is missing.' }
@@ -4281,7 +4575,7 @@ function Get-FabricAppDaxCapture {
         $extended = (Invoke-FabricAppDaxRequest -Uri "$itemEndpoint/__private/extended-properties" -Headers $headers).Content | ConvertFrom-Json
         $hosting = [uri]$deployment.hostingUrl
         $workload = [uri]$extended.extendedProperties.BaaSEndpoint
-        Assert-FabricAppDaxUri $hosting '.webapp.fabricapps.net'
+        Assert-FabricAppDaxHostingUri $hosting
         Assert-FabricAppDaxUri $workload '.pbidedicated.windows.net'
         if ($hosting.AbsolutePath -ne '/' -or -not $workload.AbsolutePath.TrimEnd('/').EndsWith("/workspaces/$WorkspaceId/appbackends/$AppId", [StringComparison]::OrdinalIgnoreCase)) {
             throw 'Deployment URLs do not match the requested app.'
@@ -4335,18 +4629,18 @@ function Get-FabricAppDaxCapture {
                 $asset = [uri]::new([uri]("$origin/"), [Net.WebUtility]::HtmlDecode($source.Groups['url'].Value))
                 $pending.Enqueue($asset)
             }
-            elseif ($script.Groups['body'].Value.Trim()) { $capture.FailedAssets++ }
+            elseif ($script.Groups['body'].Value.Trim()) { $failedAssets++ }
         }
-        if ($scripts.Count -eq 0) { $capture.FailedAssets++ }
-        if ($html -match '(?i)<base\b') { $capture.FailedAssets++ }
-        while ($pending.Count -gt 0 -and $capture.AssetCount -lt $MaxAssets) {
+        if ($scripts.Count -eq 0) { $failedAssets++ }
+        if ($html -match '(?i)<base\b') { $failedAssets++ }
+        while ($pending.Count -gt 0 -and $assetCount -lt $MaxAssets) {
             $asset = $pending.Dequeue()
             if (-not $seen.Add($asset.AbsoluteUri)) { continue }
             if ($asset.GetLeftPart([UriPartial]::Authority) -ne $origin -or $asset.UserInfo -or $asset.Query -or $asset.Fragment) {
-                $capture.FailedAssets++
+                $failedAssets++
                 continue
             }
-            $capture.AssetCount++
+            $assetCount++
             try {
                 $response = Invoke-FabricAppDaxRequest -Uri $asset -Session $session
                 if ($response.Headers['Content-Type'] -match 'text/html') { throw 'Expected JavaScript, not HTML.' }
@@ -4365,7 +4659,7 @@ function Get-FabricAppDaxCapture {
                     if (-not $temporaryFolder) {
                         $temporaryFolder = Join-Path ([IO.Path]::GetTempPath()) ('ImpactIQ-AppDax-' + [guid]::NewGuid().ToString('N'))
                     }
-                    $assetFolder = Join-Path $temporaryFolder ("asset-{0:D3}" -f $capture.AssetCount)
+                    $assetFolder = Join-Path $temporaryFolder ("asset-{0:D3}" -f $assetCount)
                     $null = New-Item -ItemType Directory -Path $assetFolder -Force
                     $bundlePath = Join-Path $assetFolder 'bundle.js'
                     [IO.File]::WriteAllText($bundlePath, $content, [Text.UTF8Encoding]::new($false))
@@ -4379,29 +4673,37 @@ function Get-FabricAppDaxCapture {
                 }
                 foreach ($reference in $catalog.scriptReferences) { $pending.Enqueue([uri]::new($asset, $reference)) }
             }
-            catch { $capture.FailedAssets++ }
+            catch { $failedAssets++ }
         }
-        $capture.QueryCount = $queries.Count
-        if ($capture.FailedAssets -gt 0 -or $pending.Count -gt 0) {
-            $capture.Status = 'Partial'
-            $capture.Detail = 'Some scripts were skipped or unavailable, or the asset limit was reached. Inline scripts and base URLs need manual review.'
+        $headers = @{ Authorization = ("Bearer " + $fabricToken) }
+        foreach ($mapping in @($modelMappings |
+                Where-Object { $_.modelId -and $_.modelWorkspaceId } |
+                Select-Object modelId, modelWorkspaceId -Unique)) {
+            $knownModels = @($Datasets | Where-Object {
+                    $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId
+                })
+            if ($knownModels.Count -gt 0) { continue }
+            try {
+                $modelItem = (Invoke-FabricAppDaxRequest -Uri "https://api.fabric.microsoft.com/v1/workspaces/$($mapping.modelWorkspaceId)/items/$($mapping.modelId)" -Headers $headers).Content | ConvertFrom-Json
+                $resolvedDatasets.Add([PSCustomObject]@{
+                    WorkspaceId = $mapping.modelWorkspaceId
+                    DatasetId = $mapping.modelId
+                    DatasetName = $modelItem.displayName
+                })
+            }
+            catch {
+                $null = $parserWarnings.Add("Could not resolve semantic model metadata for $($mapping.modelWorkspaceId)/$($mapping.modelId).")
+            }
         }
-        elseif ($parserEngine -eq 'PowerShell') {
-            $capture.Status = 'Partial'
-            $capture.Detail = 'PowerShell heuristic scan; full JavaScript syntax, query routing and helper dependencies are not resolved. Inspect ParserWarnings.'
+        if ($failedAssets -gt 0 -or $pending.Count -gt 0) {
+            $captureError = 'Some scripts were skipped or unavailable, or the asset limit was reached. Inline scripts and base URLs need manual review.'
         }
         elseif ($queries.Count -eq 0) {
-            $capture.Status = 'NoQueriesFound'
-            $capture.Detail = 'No DAX literals found in inspected scripts; this does not prove absence of queries.'
-        }
-        else {
-            $capture.Status = 'Captured'
-            $capture.Detail = 'Frontend query candidates captured. Runtime and server-side coverage remain unknown.'
+            $captureError = 'No DAX literals were found in inspected scripts; this does not prove absence of queries.'
         }
     }
     catch {
-        $capture.Status = 'Failed'
-        $capture.Detail = "$stage failed. Check sign-in, app permissions, prerequisites, and preview API availability."
+        $captureError = "$stage failed. Check sign-in, app permissions, prerequisites, and preview API availability."
     }
     finally {
         $env:NODE_PATH = $previousNodePath
@@ -4409,20 +4711,48 @@ function Get-FabricAppDaxCapture {
         if ($temporaryFolder -and (Test-Path -LiteralPath $temporaryFolder)) {
             try { Remove-Item -LiteralPath $temporaryFolder -Recurse -Force -ErrorAction Stop }
             catch {
-                $capture.Status = 'Failed'
-                $capture.Detail = 'Temporary app data could not be removed. Remove the temporary directory reported in the console.'
+                $captureError = 'Temporary app data could not be removed. Remove the temporary directory reported in the console.'
                 Write-Warning "Temporary app data cleanup failed: $temporaryFolder" -WarningAction Continue
             }
         }
     }
-    $capture.QueryCount = $queries.Count
-    $capture.ParserWarnings = (@($parserWarnings) -join '; ')
-    Set-FabricAppQueryModelMapping -Queries $queries.ToArray() -Mappings $modelMappings.ToArray() -Datasets $Datasets -Workspaces $Workspaces
+    $allDatasets = @($Datasets) + @($resolvedDatasets)
+    Set-FabricAppQueryModelMapping -Queries $queries.ToArray() -Mappings $modelMappings.ToArray() -Datasets $allDatasets -Workspaces $Workspaces
     if ($configurationIncomplete) {
         Set-FabricAppQueryModelMapping -Queries $queries.ToArray()
-        foreach ($query in $queries) { $query.ModelMappingEvidence = 'ConfigurationIncomplete; inspect FabricApps.ParserWarnings' }
     }
-    [PSCustomObject]@{ Queries = $queries.ToArray(); Capture = $capture }
+    $models = @($modelMappings |
+        Where-Object { $_.connectionAlias -and $_.modelId -and $_.modelWorkspaceId } |
+        Select-Object connectionAlias, modelId, modelWorkspaceId, evidence -Unique |
+        ForEach-Object {
+            $mapping = $_
+            $modelNames = @($allDatasets | Where-Object {
+                    $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId
+                } | Select-Object -ExpandProperty DatasetName -Unique)
+            $workspaceNames = @($Workspaces | Where-Object {
+                    $_.WorkspaceId -eq $mapping.modelWorkspaceId
+                } | Select-Object -ExpandProperty WorkspaceName -Unique)
+            [PSCustomObject][ordered]@{
+                AppWorkspaceId = $WorkspaceId.ToString()
+                AppWorkspaceName = $WorkspaceName
+                AppId = $AppId.ToString()
+                AppName = $AppName
+                ConnectionAlias = $mapping.connectionAlias
+                ModelWorkspaceId = $mapping.modelWorkspaceId
+                ModelWorkspaceName = $(if ($workspaceNames.Count -eq 1) { $workspaceNames[0] } else { '' })
+                ModelId = $mapping.modelId
+                ModelName = $(if ($modelNames.Count -eq 1) { $modelNames[0] } else { '' })
+                Evidence = $mapping.evidence
+            }
+        })
+    if ($queries.Count -gt 0 -or $models.Count -eq 0) { $captureError = '' }
+    if ($captureError) {
+        Write-Host "[ERROR] App query extraction was incomplete for $WorkspaceName ~ $AppName`: $captureError" -ForegroundColor Red
+    }
+    else {
+        Write-Host "App query extraction completed for $WorkspaceName ~ $AppName"
+    }
+    [PSCustomObject]@{ Queries = $queries.ToArray(); Models = $models; Capture = $capture }
 }
 
 function Set-FabricAppQueryModelMapping {
@@ -4436,28 +4766,34 @@ function Set-FabricAppQueryModelMapping {
 
     $configuredModels = @($Mappings | Where-Object { $_.connectionAlias -and $_.modelId -and $_.modelWorkspaceId } |
         Select-Object connectionAlias, modelId, modelWorkspaceId -Unique)
-    $mapping = $null
-    $modelName = ''
-    $modelWorkspaceName = ''
-    $evidence = 'ConfigurationNotFound'
-    if ($configuredModels.Count -eq 1) {
-        $mapping = $configuredModels[0]
-        $evidence = 'SingleConfiguredModel; query routing not verified'
-        $modelNames = @($Datasets | Where-Object { $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId } |
-            Select-Object -ExpandProperty DatasetName -Unique)
-        $workspaceNames = @($Workspaces | Where-Object { $_.WorkspaceId -eq $mapping.modelWorkspaceId } |
-            Select-Object -ExpandProperty WorkspaceName -Unique)
-        if ($modelNames.Count -eq 1) { $modelName = $modelNames[0] }
-        if ($workspaceNames.Count -eq 1) { $modelWorkspaceName = $workspaceNames[0] }
-    }
-    elseif ($configuredModels.Count -gt 1) { $evidence = 'MultipleConfiguredModels; query routing unresolved' }
     foreach ($query in $Queries) {
-        $query.ConnectionAlias = if ($mapping) { $mapping.connectionAlias } else { '' }
+        $mapping = $null
+        if ($query.ConnectionAlias) {
+            $matches = @($configuredModels | Where-Object { $_.connectionAlias -ceq $query.ConnectionAlias })
+            if ($matches.Count -eq 1) {
+                $mapping = $matches[0]
+            }
+        }
+        elseif ($configuredModels.Count -eq 1) {
+            $mapping = $configuredModels[0]
+        }
+        $modelNames = @()
+        $workspaceNames = @()
+        if ($mapping) {
+            $modelNames = @($Datasets | Where-Object {
+                    $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId
+                } | Select-Object -ExpandProperty DatasetName -Unique)
+            $workspaceNames = @($Workspaces | Where-Object {
+                    $_.WorkspaceId -eq $mapping.modelWorkspaceId
+                } | Select-Object -ExpandProperty WorkspaceName -Unique)
+        }
+        $modelName = if ($modelNames.Count -eq 1) { $modelNames[0] } else { '' }
+        $modelWorkspaceName = if ($workspaceNames.Count -eq 1) { $workspaceNames[0] } else { '' }
+        $query.ConnectionAlias = if ($mapping) { $mapping.connectionAlias } else { $query.ConnectionAlias }
         $query.ModelId = if ($mapping) { $mapping.modelId } else { '' }
         $query.ModelName = $modelName
         $query.ModelWorkspaceId = if ($mapping) { $mapping.modelWorkspaceId } else { '' }
         $query.ModelWorkspaceName = $modelWorkspaceName
-        $query.ModelMappingEvidence = $evidence
     }
 }
 
@@ -4474,6 +4810,7 @@ function ConvertTo-FabricAppQueryRows {
     )
 
     foreach ($query in $Catalog.queries) {
+        $connectionAliases = @($query.connectionAliases | Where-Object { $_ } | Select-Object -Unique)
         $record = [ordered]@{
             WorkspaceId = $WorkspaceId
             WorkspaceName = $WorkspaceName
@@ -4482,21 +4819,12 @@ function ConvertTo-FabricAppQueryRows {
             QuerySymbol = $query.symbol
             Evidence = $query.evidence
             QueryText = ''
-            QueryCharacters = ([string]$query.text).Length
             SourceUrl = $SourceUrl
-            SourceSHA256 = $Catalog.sha256
-            SourceLine = $query.line
-            SourceColumn = $query.column
-            CapturedAtUtc = $Catalog.extractedAtUtc
-            ParserWarnings = (@($Catalog.warnings) -join '; ')
-            Coverage = $(if ($Catalog.coverage) { $Catalog.coverage } else { 'Frontend source only; runtime and server-side coverage unknown.' })
-            ConnectionAlias = ''
+            ConnectionAlias = $(if ($connectionAliases.Count -eq 1) { $connectionAliases[0] } else { '' })
             ModelId = ''
             ModelName = ''
             ModelWorkspaceId = ''
             ModelWorkspaceName = ''
-            ModelMappingEvidence = 'ConfigurationNotFound'
-            Parser = $(if ($Catalog.parser) { $Catalog.parser } else { 'Acorn' })
         }
         $text = [string]$query.text
         $offset = 0
@@ -4518,15 +4846,40 @@ function Export-FabricAppQueryWorkbook {
     param(
         [Parameter(Mandatory)][string]$Path,
         [AllowEmptyCollection()][object[]]$Queries = @(),
+        [AllowEmptyCollection()][object[]]$Models = @(),
         [AllowEmptyCollection()][object[]]$Captures = @()
     )
 
     Import-Module ImportExcel -ErrorAction Stop
+    $appRows = @($Captures | ForEach-Object {
+        [PSCustomObject][ordered]@{
+            WorkspaceId = $_.WorkspaceId
+            WorkspaceName = $_.WorkspaceName
+            AppId = $_.AppId
+            AppName = $_.AppName
+        }
+    })
     $package = Open-ExcelPackage -Path $Path -Create -ErrorAction Stop
     try {
         foreach ($definition in @(
-            @{ Name = 'FabricAppQueries'; Rows = $Queries; Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'QueryCharacters', 'SourceUrl', 'SourceSHA256', 'SourceLine', 'SourceColumn', 'CapturedAtUtc', 'ParserWarnings', 'Coverage', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelMappingEvidence', 'Parser') },
-            @{ Name = 'FabricApps'; Rows = $Captures; Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'Status', 'QueryCount', 'AssetCount', 'FailedAssets', 'CapturedAtUtc', 'Detail', 'ParserWarnings', 'Parser') }
+            @{
+                Name = 'FabricAppQueries'
+                Rows = $Queries
+                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName')
+                Exclude = @('QueryCharacters', 'SourceSHA256', 'SourceLine', 'SourceColumn', 'CapturedAtUtc', 'ParserWarnings', 'Coverage', 'ModelMappingEvidence', 'Parser')
+            },
+            @{
+                Name = 'FabricAppModels'
+                Rows = $Models
+                Headers = @('AppWorkspaceId', 'AppWorkspaceName', 'AppId', 'AppName', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelId', 'ModelName', 'Evidence')
+                Exclude = @()
+            },
+            @{
+                Name = 'FabricApps'
+                Rows = $appRows
+                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName')
+                Exclude = @()
+            }
         )) {
             if ($definition.Rows.Count -gt 1048575) { throw 'App query export exceeds the Excel row limit.' }
             $sheet = $package.Workbook.Worksheets[$definition.Name]
@@ -4536,7 +4889,7 @@ function Export-FabricAppQueryWorkbook {
             foreach ($header in $definition.Headers) { $headers.Add($header) }
             foreach ($record in $definition.Rows) {
                 foreach ($property in $record.PSObject.Properties.Name) {
-                    if ($property -in @('CatalogPath', 'OutputFolder')) { continue }
+                    if ($property -in (@('CatalogPath', 'OutputFolder') + @($definition.Exclude))) { continue }
                     if (-not $headers.Contains($property)) { $headers.Add($property) }
                 }
             }
@@ -4590,6 +4943,7 @@ function Export-FabricAppDaxEnvironment {
     }
     $appItems = @($Items | Where-Object { $_.FabricItemType -eq 'AppBackend' })
     $appQueryRows = @()
+    $appModelRows = @()
     $appQueryCaptures = @()
     $appDaxRuntime = @{}
     $appDaxReady = $true
@@ -4600,7 +4954,7 @@ function Export-FabricAppDaxEnvironment {
         try { $appDaxRuntime = Initialize-FabricAppDaxParser -Engine $ParserEngine -ErrorAction Stop }
         catch {
             $appDaxReady = $false
-            Write-Host "[WARN] App query parser initialization failed ($ParserEngine). Only Acorn mode requires Node.js/npm. See FabricApps." -ForegroundColor Yellow
+            Write-Host "[WARN] App query parser initialization failed ($ParserEngine). Only Acorn mode requires Node.js/npm." -ForegroundColor Yellow
         }
     }
     foreach ($appItem in $appItems) {
@@ -4610,28 +4964,18 @@ function Export-FabricAppDaxEnvironment {
                 WorkspaceName = $appItem.WorkspaceName
                 AppId = $appItem.FabricItemID
                 AppName = $appItem.FabricItemName
-                Status = 'PrerequisiteFailed'
-                QueryCount = 0
-                AssetCount = 0
-                FailedAssets = 0
-                CapturedAtUtc = [DateTime]::UtcNow.ToString('o')
-                Detail = "Parser initialization failed ($ParserEngine). Only Acorn mode requires Node.js/npm."
-                ParserWarnings = ''
-                Parser = $ParserEngine
             }
+            Write-Host "[ERROR] App query extraction failed for $($appItem.WorkspaceName) ~ $($appItem.FabricItemName): parser initialization failed ($ParserEngine)." -ForegroundColor Red
             continue
         }
         Write-Host "[INFO] Extracting Fabric app queries: $($appItem.WorkspaceName) ~ $($appItem.FabricItemName)"
         $appCapture = Get-FabricAppDaxCapture -WorkspaceId $appItem.WorkspaceId -WorkspaceName $appItem.WorkspaceName -AppId $appItem.FabricItemID -AppName $appItem.FabricItemName -ParserRuntime $appDaxRuntime -Environment $Environment -Datasets $Datasets -Workspaces $Workspaces
         $appQueryRows += @($appCapture.Queries)
+        $appModelRows += @($appCapture.Models)
         $appQueryCaptures += $appCapture.Capture
-        Write-Host "[INFO] App query capture: $($appCapture.Capture.Status); $($appCapture.Capture.QueryCount) query candidates."
     }
-    Export-FabricAppQueryWorkbook -Path $environmentWorkbook -Queries $appQueryRows -Captures $appQueryCaptures -ErrorAction Stop
-    Write-Host "[INFO] Exported $($appQueryRows.Count) queries to $environmentWorkbook -> FabricAppQueries -> QueryText (column G). App status is in FabricApps; no app-query backups are created."
-    if ($appQueryRows.Count -eq 0 -or @($appQueryCaptures | Where-Object { $_.Status -ne 'Captured' }).Count -gt 0) {
-        Write-Host '[WARN] Review FabricApps for missing queries, partial coverage, or failed captures.' -ForegroundColor Yellow
-    }
+    Export-FabricAppQueryWorkbook -Path $environmentWorkbook -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ErrorAction Stop
+    Write-Host "[INFO] Exported $($appQueryRows.Count) queries and $($appModelRows.Count) configured models to $environmentWorkbook. Query text is in FabricAppQueries; model configuration is in FabricAppModels."
 }
 
 $EnableFabricAppDax = $true
@@ -4653,3 +4997,4 @@ Write-Output "All Excel files processed and combined successfully."
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
+

@@ -168,13 +168,13 @@ if ($psGetVer -lt [version]'2.0.0') {
     Import-Module PowerShellGet -Force
 }
 
-# Ensure required modules are installed and attempt to import them without terminating the script
+# Ensure required modules are installed, and imports them. If import fails, error and exit early
 $requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt', 'Az.Accounts' )
 foreach ($module in $requiredModules) {
     if (-not (Import-Module $module -PassThru -EA Ignore)) {
         Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck
     }
-    Import-Module $module -ErrorAction 'Continue'
+    Import-Module $module -ErrorAction 'Stop'
 }
 
 
@@ -1533,8 +1533,8 @@ while ($reportPickerCancelled) {
     $runMode = Show-RunModeDialog
 
 if ($runMode -eq 'Cancel') {
-    Write-Host "[INFO] Run mode selection cancelled. Exiting script." -ForegroundColor Yellow
-    return
+    Write-Host "[INFO] Run cancelled by user." -ForegroundColor Yellow
+    exit
 }
 
 if ($runMode -eq 'Reports') {
@@ -2512,7 +2512,6 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
     
 Write-Output "My Workspace Metadata Extract Process Completed"
 
-
 # Export all collections to Excel
 if (Test-Path $excelFile) {
     Remove-Item $excelFile -Force
@@ -3484,12 +3483,15 @@ $latestDataflowDateFolder = Get-ChildItem -Path $dataflowBackupsPath -Directory 
     Sort-Object { [datetime]::Parse($_.Name) } -Descending | # Sort by date, descending
     Select-Object -First 1
 
-if (-not $latestDataflowDateFolder) {
-    Write-Warning "No valid dated folders found in 'Dataflow Backups'. Skipping Dataflow backup and detail extraction."
-} else {
+if ($latestDataflowDateFolder) {
     # Override $baseOutputFilePath with the latest-dated folder
     $folderPath = $latestDataflowDateFolder.FullName
     Write-Host "Using the latest dated folder: $baseOutputFilePath"
+} else {
+    # Throw an error if no valid dated folders are found
+    Write-Error "No valid dated folders found in 'Dataflow Backups'."
+    exit
+}
 
 # Set the combined Excel output path
 $combinedExcelOutputPath = Join-Path -Path $dataflow_new_date_folder -ChildPath "Dataflow Detail.xlsx"
@@ -3728,12 +3730,926 @@ if (Test-Path -Path $sourceFilePath) {
 }
 
 Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
+
+function Get-FabricAppDaxSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Source)
+
+    $ErrorActionPreference = 'Stop'
+    $tokens = [Collections.Generic.List[object]]::new()
+    $queries = [Collections.Generic.List[object]]::new()
+    $references = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $warnings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $state = @{ Position = 0; Depth = 0 }
+    $lex = [regex]::new('\G(?:(?<space>\s+)|(?<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|(?<string>"(?:\\[\s\S]|[^"\\\r\n])*"|''(?:\\[\s\S]|[^''\\\r\n])*'')|(?<word>[a-zA-Z_$][\w$]*)|(?<number>\d+(?:\.\d+)?)|(?<punct>=>|\+\+|--|&&|\|\||\?\?|[^\s]))', 'Compiled')
+    $regexLiteral = [regex]::new('\G/(?:\\[^\r\n]|\[(?:\\[^\r\n]|[^\]\\\r\n])*\]|[^/\\\[\r\n])+/[a-z]*', 'Compiled')
+    $templateChunk = [regex]::new('\G(?:[^`\\$]+|\\(?:\r\n|[\s\S])|\$(?!\{))+', 'Compiled')
+    $escapePattern = [regex]::new('\\(?:\r\n|[\s\S])', 'Compiled')
+
+    function ConvertFrom-AppJsString([string]$Text) {
+        $builder = [Text.StringBuilder]::new()
+        $offset = 0
+        foreach ($escape in $escapePattern.Matches($Text)) {
+            if ($escape.Index -lt $offset) { continue }
+            $null = $builder.Append($Text.Substring($offset, $escape.Index - $offset))
+            $code = $escape.Value.Substring(1)
+            $offset = $escape.Index + $escape.Length
+            switch -CaseSensitive ($code) {
+                'n' { $null = $builder.Append("`n") }
+                'r' { $null = $builder.Append("`r") }
+                't' { $null = $builder.Append("`t") }
+                'b' { $null = $builder.Append([char]8) }
+                'f' { $null = $builder.Append([char]12) }
+                'v' { $null = $builder.Append([char]11) }
+                '0' {
+                    if ($offset -lt $Text.Length -and [char]::IsDigit($Text[$offset])) { throw 'Legacy octal escapes are unsupported.' }
+                    $null = $builder.Append([char]0)
+                }
+                { $_ -in @("`n", "`r", "`r`n") } { }
+                { $_ -in @('x', 'u') } {
+                    $width = if ($code -eq 'x') { 2 } else { 4 }
+                    if ($code -eq 'u' -and $offset -lt $Text.Length -and $Text[$offset] -eq '{') {
+                        $end = $Text.IndexOf('}', $offset)
+                        if ($end -lt 0) { throw 'Invalid Unicode escape.' }
+                        $hex = $Text.Substring($offset + 1, $end - $offset - 1)
+                        if ($hex -notmatch '^[0-9a-fA-F]{1,6}$') { throw 'Invalid Unicode escape.' }
+                        $value = [Convert]::ToInt32($hex, 16)
+                        if ($value -le 65535) { $null = $builder.Append([char]$value) }
+                        else { $null = $builder.Append([char]::ConvertFromUtf32($value)) }
+                        $offset = $end + 1
+                    }
+                    else {
+                        if ($offset + $width -gt $Text.Length) { throw 'Incomplete hexadecimal escape.' }
+                        $hex = $Text.Substring($offset, $width)
+                        if ($hex -notmatch '^[0-9a-fA-F]+$') { throw 'Invalid hexadecimal escape.' }
+                        $null = $builder.Append([char][Convert]::ToInt32($hex, 16))
+                        $offset += $width
+                    }
+                }
+                { $_ -match '^[1-9]$' } { throw 'Legacy numeric escapes are unsupported.' }
+                default { $null = $builder.Append($code) }
+            }
+        }
+        $null = $builder.Append($Text.Substring($offset))
+        $builder.ToString()
+    }
+
+    function Add-AppJsLiteral([int]$Start, [int]$End, [string]$Text, [string[]]$Expressions) {
+        if ($Text -match '^\s*(?:EVALUATE|DEFINE)\b') {
+            $prefixStart = [Math]::Max(0, $Start - 300)
+            $prefix = $Source.Substring($prefixStart, $Start - $prefixStart)
+            $owner = [regex]::Match($prefix, '(?:function\s+(?<name>[\w$]+)\([^{}]*\)\s*\{\s*return\s*|(?:const|let|var)\s+(?<name>[\w$]+)\s*=\s*)$')
+            $symbol = if ($owner.Success) { $owner.Groups['name'].Value } else { 'query_' + ($queries.Count + 1) }
+            $queries.Add([PSCustomObject]@{
+                symbol = $symbol
+                evidence = $(if ($Expressions.Count) { 'DynamicTemplate' } else { 'StaticCandidate' })
+                text = $Text.Trim()
+                expressions = @($Expressions)
+                start = $Start
+                end = $End
+                line = 0
+                column = 0
+                literalSource = $Source.Substring($Start, $End - $Start)
+                builderSource = $null
+                enclosingExpression = $null
+            })
+        }
+        if (-not $Expressions.Count -and $Text -match '^(?:\.{0,2}/|https://)[^\s]+\.m?js(?:\?[^\s]*)?$') { $null = $references.Add($Text) }
+    }
+
+    function Read-AppJsCode([bool]$UntilBrace = $false) {
+        $state.Depth++
+        if ($state.Depth -gt 128) { throw 'JavaScript nesting limit exceeded.' }
+        $braceDepth = 0
+        $regexAllowed = $true
+        try {
+            while ($state.Position -lt $Source.Length) {
+                $start = $state.Position
+                $match = $lex.Match($Source, $start)
+                if (-not $match.Success) { throw 'Could not scan JavaScript token.' }
+                $value = $match.Value
+                $state.Position += $match.Length
+                if ($match.Groups['space'].Success -or $match.Groups['comment'].Success) { continue }
+                if ($value -eq '}' -and $UntilBrace -and $braceDepth -eq 0) { return }
+                if ($value -eq '{') { $braceDepth++ }
+                if ($value -eq '}') { $braceDepth-- }
+                if ($match.Groups['string'].Success) {
+                    $text = ConvertFrom-AppJsString $value.Substring(1, $value.Length - 2)
+                    $tokens.Add([PSCustomObject]@{ Kind = 'string'; Value = $text; Start = $start; End = $state.Position })
+                    Add-AppJsLiteral $start $state.Position $text @()
+                    $regexAllowed = $false
+                    continue
+                }
+                if ($value -eq '"' -or $value -eq "'") { throw 'Unterminated JavaScript string.' }
+                if ($value -eq '`') {
+                    $builder = [Text.StringBuilder]::new()
+                    $expressions = [Collections.Generic.List[string]]::new()
+                    $closed = $false
+                    while ($state.Position -lt $Source.Length) {
+                        $chunk = $templateChunk.Match($Source, $state.Position)
+                        if ($chunk.Success) {
+                            $normalized = $chunk.Value.Replace("`r`n", "`n").Replace("`r", "`n")
+                            $null = $builder.Append((ConvertFrom-AppJsString $normalized))
+                            $state.Position += $chunk.Length
+                        }
+                        elseif ($Source[$state.Position] -eq '`') { $state.Position++; $closed = $true; break }
+                        elseif ($Source.Substring($state.Position).StartsWith('${')) {
+                            $state.Position += 2
+                            $expressionStart = $state.Position
+                            Read-AppJsCode $true
+                            $expression = $Source.Substring($expressionStart, $state.Position - $expressionStart - 1)
+                            $expressions.Add($expression)
+                            $null = $builder.Append('${' + $expression + '}')
+                        }
+                        else { throw 'Unsupported JavaScript template.' }
+                    }
+                    if (-not $closed) { throw 'Unterminated JavaScript template.' }
+                    $text = $builder.ToString()
+                    $tokens.Add([PSCustomObject]@{ Kind = 'template'; Value = $text; Start = $start; End = $state.Position })
+                    Add-AppJsLiteral $start $state.Position $text $expressions.ToArray()
+                    $regexAllowed = $false
+                    continue
+                }
+                if ($value -eq '/' -and $regexAllowed) {
+                    $literal = $regexLiteral.Match($Source, $start)
+                    if (-not $literal.Success) { throw 'Unterminated or unsupported JavaScript regular expression.' }
+                    $state.Position = $start + $literal.Length
+                    $tokens.Add([PSCustomObject]@{ Kind = 'regex'; Value = ''; Start = $start; End = $state.Position })
+                    $regexAllowed = $false
+                    continue
+                }
+                $kind = if ($match.Groups['word'].Success) { 'word' } else { 'punct' }
+                $tokens.Add([PSCustomObject]@{ Kind = $kind; Value = $value; Start = $start; End = $state.Position })
+                $regexAllowed = $value -in @('(', '[', '{', ',', ':', ';', '=', '=>', '!', '?', '&&', '||', '??', '+', '-', '*', '/', '%', '&', '|', '^', '~', '<', '>', 'return', 'throw', 'case', 'typeof', 'void', 'delete', 'yield')
+            }
+            if ($UntilBrace) { throw 'Unterminated JavaScript template expression.' }
+        }
+        finally { $state.Depth-- }
+    }
+
+    function Read-AppJsObject([ref]$Index, [int]$Depth = 0) {
+        if ($Depth -gt 8 -or $Index.Value -ge $tokens.Count -or $tokens[$Index.Value].Value -ne '{') { throw 'Unsupported model configuration.' }
+        $Index.Value++
+        $result = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        while ($Index.Value -lt $tokens.Count -and $tokens[$Index.Value].Value -ne '}') {
+            $key = $tokens[$Index.Value]
+            if ($key.Kind -notin @('word', 'string') -or $result.ContainsKey($key.Value)) { throw 'Nonliteral or duplicate configuration property.' }
+            $Index.Value++
+            if ($Index.Value -ge $tokens.Count -or $tokens[$Index.Value].Value -ne ':') { throw 'Unsupported configuration property.' }
+            $Index.Value++
+            if ($Index.Value -ge $tokens.Count) { throw 'Incomplete configuration.' }
+            if ($tokens[$Index.Value].Kind -eq 'string') { $result[$key.Value] = $tokens[$Index.Value].Value; $Index.Value++ }
+            elseif ($tokens[$Index.Value].Value -eq '{') { $result[$key.Value] = Read-AppJsObject $Index ($Depth + 1) }
+            else { throw 'Nonliteral model configuration.' }
+            if ($Index.Value -lt $tokens.Count -and $tokens[$Index.Value].Value -eq ',') { $Index.Value++ }
+            elseif ($Index.Value -ge $tokens.Count -or $tokens[$Index.Value].Value -ne '}') { throw 'Unsupported configuration expression.' }
+        }
+        if ($Index.Value -ge $tokens.Count) { throw 'Unterminated configuration object.' }
+        $Index.Value++
+        return ,$result
+    }
+
+    Read-AppJsCode
+    $mappings = [Collections.Generic.List[object]]::new()
+    $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    for ($tokenIndex = 0; $tokenIndex -lt $tokens.Count - 2; $tokenIndex++) {
+        if ($tokens[$tokenIndex].Value -ne 'semanticModels' -or $tokens[$tokenIndex + 1].Value -ne ':') { continue }
+        if ($tokens[$tokenIndex + 2].Value -ne '{') { $null = $warnings.Add('Nonliteral semanticModels configuration was not resolved.'); continue }
+        $objectIndex = $tokenIndex + 2
+        try {
+            $configuration = Read-AppJsObject ([ref]$objectIndex)
+            foreach ($alias in $configuration.Keys) {
+                $model = $configuration[$alias]
+                if ($model -isnot [Collections.Generic.Dictionary[string,object]] -or
+                    $model['workspaceId'] -notmatch $guidPattern -or $model['itemId'] -notmatch $guidPattern) {
+                    $null = $warnings.Add('A model mapping did not contain literal workspace and model GUIDs.')
+                    continue
+                }
+                $mappings.Add([PSCustomObject]@{ connectionAlias = $alias; modelWorkspaceId = $model['workspaceId']; modelId = $model['itemId']; evidence = 'StaticConfiguration' })
+            }
+        }
+        catch { $null = $warnings.Add('Unsupported semanticModels configuration was not resolved.') }
+    }
+    $orderedQueries = @($queries | Sort-Object start)
+    $line = 1
+    $lineStart = 0
+    $scanOffset = 0
+    foreach ($query in $orderedQueries) {
+        while ($scanOffset -lt $query.start) {
+            $newline = $Source.IndexOf("`n", $scanOffset)
+            if ($newline -lt 0 -or $newline -ge $query.start) { break }
+            $line++
+            $lineStart = $newline + 1
+            $scanOffset = $lineStart
+        }
+        $query.line = $line
+        $query.column = $query.start - $lineStart + 1
+    }
+    [PSCustomObject]@{
+        queries = $orderedQueries
+        helpers = @()
+        scriptReferences = @($references)
+        modelMappings = @($mappings.ToArray())
+        parser = 'PowerShellScanner'
+        warnings = @($warnings)
+        coverage = 'Heuristic lexical scan; JavaScript syntax, query routing, builder functions and helper dependencies are not resolved.'
+    }
 }
 
+function Export-FabricAppDaxSource {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$InputPath, [Parameter(Mandatory)][string]$OutputPath)
+
+    $ErrorActionPreference = 'Stop'
+    $source = [IO.File]::ReadAllText($InputPath, [Text.Encoding]::UTF8)
+    $catalog = Get-FabricAppDaxSource -Source $source
+    $catalog | Add-Member -NotePropertyName sourceFile -NotePropertyValue ([IO.Path]::GetFileName($InputPath))
+    $catalog | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-FileHash -LiteralPath $InputPath -Algorithm SHA256).Hash.ToLowerInvariant())
+    $catalog | Add-Member -NotePropertyName extractedAtUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
+    $null = New-Item -ItemType Directory -Path $OutputPath -Force
+    [IO.File]::WriteAllText((Join-Path $OutputPath 'queries.json'), ($catalog | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+    $sections = [Collections.Generic.List[string]]::new()
+    $sections.Add('# Fabric App DAX (PowerShell Scanner)')
+    $sections.Add($catalog.coverage)
+    $queryIndex = 0
+    foreach ($query in $catalog.queries) {
+        $queryIndex++
+        $extension = if ($query.evidence -eq 'DynamicTemplate') { '.dax-template.txt' } else { '.dax' }
+        $name = ('{0:D2}-{1}' -f $queryIndex, ($query.symbol -replace '[^a-zA-Z0-9_-]', '_')) + $extension
+        [IO.File]::WriteAllText((Join-Path $OutputPath $name), $query.text + "`n", [Text.UTF8Encoding]::new($false))
+        $sections.Add("## $queryIndex. $($query.symbol) ($($query.evidence))")
+        $sections.Add('```dax' + "`n" + $query.text + "`n" + '```')
+    }
+    [IO.File]::WriteAllText((Join-Path $OutputPath 'queries.md'), ($sections -join "`n`n"), [Text.UTF8Encoding]::new($false))
+    $catalog
+}
+
+function Initialize-FabricAppDaxParser {
+    [CmdletBinding()]
+    param(
+        [string]$RuntimePath = (Join-Path $env:LOCALAPPDATA 'ImpactIQ/AppDaxParser'),
+        [ValidateSet('PowerShell', 'Acorn')][string]$Engine = 'PowerShell'
+    )
+
+    $ErrorActionPreference = 'Stop'
+    if ($Engine -eq 'PowerShell') { return [PSCustomObject]@{ Engine = 'PowerShell' } }
+    $node = Get-Command node -ErrorAction Stop
+    $nodeVersion = & $node.Source --version
+    if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.' -or [int]$Matches[1] -lt 18) {
+        throw 'Fabric app query extraction requires Node.js 18 or newer.'
+    }
+    $modulePath = Join-Path $RuntimePath 'node_modules'
+    $metadataPath = Join-Path $modulePath 'acorn/package.json'
+    $installedVersion = if (Test-Path -LiteralPath $metadataPath) {
+        (Get-Content -LiteralPath $metadataPath -Raw -ErrorAction Stop | ConvertFrom-Json).version
+    }
+    if ($installedVersion -ne '8.15.0') {
+        $npm = Get-Command npm.cmd -ErrorAction Stop
+        & $npm.Source install --prefix $RuntimePath --ignore-scripts --no-audit --no-fund --package-lock=false acorn@8.15.0 | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'Could not install the pinned Acorn parser.' }
+    }
+    $parserSource = @'
+const fs = require('node:fs');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
+const { parse } = require('acorn');
+
+function extractDax(source) {
+    const tree = parse(source, { ecmaVersion: 'latest', sourceType: 'module', locations: true });
+    const queries = [];
+    const functions = new Map();
+    const scriptReferences = new Set();
+    const modelMappings = [];
+    const propertyName = property => property.type === 'Property' && !property.computed
+        ? (property.key.name ?? property.key.value) : undefined;
+    const literalProperty = (object, name) => {
+        const properties = object.properties.filter(property => propertyName(property) === name);
+        return properties.length === 1 && properties[0].value.type === 'Literal'
+            && typeof properties[0].value.value === 'string' ? properties[0].value.value : undefined;
+    };
+    const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+    function visit(node, ancestors = []) {
+        if (!node || typeof node.type !== 'string') return;
+        if (propertyName(node) === 'semanticModels' && node.value.type === 'ObjectExpression') {
+            for (const connection of node.value.properties) {
+                const alias = propertyName(connection);
+                if (typeof alias !== 'string' || connection.value.type !== 'ObjectExpression') continue;
+                const workspaceId = literalProperty(connection.value, 'workspaceId');
+                const modelId = literalProperty(connection.value, 'itemId');
+                if (!guid.test(workspaceId) || !guid.test(modelId)) continue;
+                modelMappings.push({ connectionAlias: alias, modelWorkspaceId: workspaceId, modelId,
+                    evidence: 'StaticConfiguration', line: connection.loc.start.line, column: connection.loc.start.column + 1 });
+            }
+        }
+        if (node.type === 'FunctionDeclaration' && node.id) {
+            const declarations = functions.get(node.id.name) || [];
+            declarations.push(node);
+            functions.set(node.id.name, declarations);
+        }
+        let text;
+        let expressions = [];
+        if (node.type === 'Literal' && typeof node.value === 'string') {
+            text = node.value;
+            if (/^(?:\.{0,2}\/|https:\/\/)[^\s]+\.m?js(?:\?[^\s]*)?$/i.test(text)) {
+                scriptReferences.add(text);
+            }
+        } else if (node.type === 'TemplateLiteral') {
+            expressions = node.expressions.map(expression => source.slice(expression.start, expression.end));
+            text = node.quasis.map((part, index) =>
+                (part.value.cooked ?? part.value.raw) +
+                (index < expressions.length ? '${' + expressions[index] + '}' : '')
+            ).join('');
+        }
+        if (text && /^\s*(?:EVALUATE|DEFINE)\b/i.test(text)) {
+            const owner = [...ancestors].reverse().find(parent =>
+                parent.type === 'FunctionDeclaration' || parent.type === 'VariableDeclarator'
+            );
+            const builder = [...ancestors].reverse().find(parent =>
+                ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(parent.type)
+            );
+            queries.push({
+                symbol: owner?.id?.name || `query_${queries.length + 1}`,
+                evidence: expressions.length ? 'DynamicTemplate' : 'StaticCandidate',
+                text: text.trim(),
+                expressions,
+                line: node.loc.start.line,
+                column: node.loc.start.column + 1,
+                start: node.start,
+                end: node.end,
+                literalSource: source.slice(node.start, node.end),
+                builderSource: builder ? source.slice(builder.start, builder.end) : null,
+                enclosingExpression: source.slice((builder || owner || node).start, (builder || owner || node).end)
+            });
+        }
+        for (const value of Object.values(node)) {
+            if (Array.isArray(value)) {
+                for (const child of value) visit(child, [...ancestors, node]);
+            } else if (value && typeof value.type === 'string') {
+                visit(value, [...ancestors, node]);
+            }
+        }
+    }
+
+    visit(tree);
+    const helpers = [];
+    const included = new Set();
+    const pending = queries.flatMap(query => query.expressions);
+    while (pending.length) {
+        const expression = pending.pop();
+        const expressionTree = parse('(' + expression + ')', { ecmaVersion: 'latest' });
+        function findCalls(node) {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'CallExpression' && node.callee.type === 'Identifier') {
+                const symbol = node.callee.name;
+                const declarations = functions.get(symbol) || [];
+                if (!included.has(symbol) && declarations.length === 1) {
+                    included.add(symbol);
+                    const declaration = declarations[0];
+                    const helperSource = source.slice(declaration.start, declaration.end);
+                    helpers.push({ symbol, source: helperSource, line: declaration.loc.start.line });
+                    pending.push(helperSource);
+                }
+            }
+            for (const value of Object.values(node)) {
+                if (Array.isArray(value)) value.forEach(findCalls);
+                else if (value && typeof value.type === 'string') findCalls(value);
+            }
+        }
+        findCalls(expressionTree);
+    }
+    return { queries, helpers, scriptReferences: [...scriptReferences], modelMappings };
+}
+
+function exportDax(inputPath, outputPath) {
+    const bytes = fs.readFileSync(inputPath);
+    const result = extractDax(bytes.toString('utf8'));
+    const catalog = {
+        sourceFile: path.basename(inputPath),
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        extractedAtUtc: new Date().toISOString(),
+        coverage: 'Static inspection of the supplied JavaScript only; not proof of executed queries or complete app coverage.',
+        ...result
+    };
+    fs.mkdirSync(outputPath, { recursive: true });
+    fs.writeFileSync(path.join(outputPath, 'queries.json'), JSON.stringify(catalog, null, 2) + '\n');
+    const sections = [
+        '# Fabric App DAX',
+        '',
+        catalog.coverage,
+        '',
+        'Dynamic templates retain JavaScript ${...} expressions and are not executable DAX. Static candidates are literal bodies; surrounding JavaScript can still modify them.',
+        ''
+    ];
+    for (const [index, query] of result.queries.entries()) {
+        const stem = `${String(index + 1).padStart(2, '0')}-${query.symbol.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        const extension = query.evidence === 'DynamicTemplate' ? '.dax-template.txt' : '.dax';
+        fs.writeFileSync(path.join(outputPath, stem + extension), query.text + '\n');
+        sections.push(`## ${index + 1}. ${query.symbol} (${query.evidence})`, '', '```dax', query.text, '```', '');
+    }
+    if (result.helpers.length) {
+        sections.push('## Referenced JavaScript Helpers', '', '```javascript', ...result.helpers.map(helper => helper.source), '```', '');
+    }
+    fs.writeFileSync(path.join(outputPath, 'queries.md'), sections.join('\n'));
+    return catalog;
+}
+
+module.exports = { extractDax, exportDax };
+
+if (require.main === module) {
+    const [inputPath, outputPath] = process.argv.slice(2);
+    if (!inputPath || !outputPath) {
+        console.error('Usage: node "Extract Fabric App DAX.cjs" <bundle.js> <output-directory>');
+        process.exitCode = 1;
+    } else {
+        const catalog = exportDax(inputPath, outputPath);
+        console.log(JSON.stringify({ queries: catalog.queries.length, helpers: catalog.helpers.length, sha256: catalog.sha256 }));
+    }
+}
+'@
+    $null = New-Item -ItemType Directory -Path $RuntimePath -Force
+    $parserPath = Join-Path $RuntimePath 'Extract Fabric App DAX.cjs'
+    [IO.File]::WriteAllText($parserPath, $parserSource, [Text.UTF8Encoding]::new($false))
+    [PSCustomObject]@{ Engine = 'Acorn'; NodePath = $node.Source; ModulePath = $modulePath; ParserPath = $parserPath }
+}
+
+function Assert-FabricAppDaxUri {
+    param([Parameter(Mandatory)][uri]$Uri, [Parameter(Mandatory)][string]$Suffix)
+    if ($Uri.Scheme -ne 'https' -or $Uri.Port -ne 443 -or $Uri.UserInfo -or
+        $Uri.Query -or $Uri.Fragment -or -not $Uri.DnsSafeHost.EndsWith($Suffix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Unexpected Fabric discovery URL.'
+    }
+}
+
+function Get-FabricAppDaxToken {
+    param([Parameter(Mandatory)][string]$ResourceUrl)
+    try {
+        $token = (Get-AzAccessToken -ResourceUrl $ResourceUrl -ErrorAction Stop -WarningAction SilentlyContinue).Token
+        if ($token -is [Security.SecureString]) {
+            return [Net.NetworkCredential]::new('', $token).Password
+        }
+        return [string]$token
+    }
+    catch { throw 'Azure authentication unavailable. Run Connect-AzAccount for the app tenant and retry.' }
+}
+
+function Invoke-FabricAppDaxRequest {
+    param(
+        [Parameter(Mandatory)][uri]$Uri,
+        [string]$Method = 'GET',
+        [hashtable]$Headers = @{},
+        [string]$Body,
+        $Session
+    )
+    $parameters = @{
+        Uri = $Uri
+        Method = $Method
+        Headers = $Headers
+        UseBasicParsing = $true
+        MaximumRedirection = 0
+        TimeoutSec = 60
+        ErrorAction = 'Stop'
+    }
+    if ($Body) { $parameters.Body = $Body; $parameters.ContentType = 'application/json' }
+    if ($Session) { $parameters.WebSession = $Session }
+    try {
+        $response = Invoke-WebRequest @parameters
+        if ($response.StatusCode -ne 200) { throw 'Unexpected response status.' }
+        if ($response.RawContentLength -gt 20MB) { throw 'Response exceeds the 20 MB asset limit.' }
+        return $response
+    }
+    catch {
+        $status = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 'unavailable' }
+        throw "Request failed (HTTP $status). Redirects, oversized responses, and non-200 responses are not accepted."
+    }
+}
+
+function Get-FabricAppDaxCapture {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][guid]$WorkspaceId,
+        [string]$WorkspaceName,
+        [Parameter(Mandatory)][guid]$AppId,
+        [string]$AppName,
+        [string]$OutputRoot,
+        [Parameter(Mandatory)]$ParserRuntime,
+        [ValidateRange(1, 256)][int]$MaxAssets = 64,
+        [string]$Environment = 'Public',
+        [AllowEmptyCollection()][object[]]$Datasets = @(),
+        [AllowEmptyCollection()][object[]]$Workspaces = @()
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $queries = [Collections.Generic.List[object]]::new()
+    $modelMappings = [Collections.Generic.List[object]]::new()
+    $parserEngine = if ($ParserRuntime.Engine -eq 'Acorn') { 'Acorn' } else { 'PowerShell' }
+    $configurationIncomplete = $false
+    $parserWarnings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $temporaryFolder = $null
+    $capture = [PSCustomObject][ordered]@{
+        WorkspaceId = $WorkspaceId.ToString()
+        WorkspaceName = $WorkspaceName
+        AppId = $AppId.ToString()
+        AppName = $AppName
+        Status = 'Failed'
+        QueryCount = 0
+        AssetCount = 0
+        FailedAssets = 0
+        CapturedAtUtc = [DateTime]::UtcNow.ToString('o')
+        Detail = ''
+        ParserWarnings = ''
+        Parser = $parserEngine
+    }
+    $stage = 'Discovery'
+    $fabricToken = $powerBiToken = $mwc = $handoff = $session = $headers = $null
+    $previousNodePath = $env:NODE_PATH
+    try {
+        if ($Environment -ne 'Public') {
+            $capture.Status = 'UnsupportedEnvironment'
+            $capture.Detail = 'The preview hosting flow has only been verified in the Public cloud.'
+            return [PSCustomObject]@{ Queries = @(); Capture = $capture }
+        }
+        if ($parserEngine -eq 'Acorn') {
+            $parserPath = $ParserRuntime.ParserPath
+            if (-not (Test-Path -LiteralPath $parserPath)) { throw 'JavaScript parser script is missing.' }
+            $env:NODE_PATH = $ParserRuntime.ModulePath
+        }
+        $fabricToken = Get-FabricAppDaxToken 'https://api.fabric.microsoft.com'
+        $headers = @{ Authorization = "Bearer $fabricToken" }
+        $itemEndpoint = "https://api.fabric.microsoft.com/v1/workspaces/$WorkspaceId/appBackends/$AppId"
+        $deployment = (Invoke-FabricAppDaxRequest -Uri "$itemEndpoint/__private/deploy/status" -Headers $headers).Content | ConvertFrom-Json
+        $extended = (Invoke-FabricAppDaxRequest -Uri "$itemEndpoint/__private/extended-properties" -Headers $headers).Content | ConvertFrom-Json
+        $hosting = [uri]$deployment.hostingUrl
+        $workload = [uri]$extended.extendedProperties.BaaSEndpoint
+        Assert-FabricAppDaxUri $hosting '.webapp.fabricapps.net'
+        Assert-FabricAppDaxUri $workload '.pbidedicated.windows.net'
+        if ($hosting.AbsolutePath -ne '/' -or -not $workload.AbsolutePath.TrimEnd('/').EndsWith("/workspaces/$WorkspaceId/appbackends/$AppId", [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Deployment URLs do not match the requested app.'
+        }
+        $origin = $hosting.GetLeftPart([UriPartial]::Authority)
+
+        $stage = 'Workload authentication'
+        $powerBiToken = Get-FabricAppDaxToken 'https://analysis.windows.net/powerbi/api'
+        $headers = @{ Authorization = "Bearer $powerBiToken" }
+        $clusterInfo = (Invoke-FabricAppDaxRequest -Uri 'https://api.powerbi.com/metadata/cluster' -Headers $headers).Content | ConvertFrom-Json
+        $cluster = [uri]$clusterInfo.backendUrl
+        Assert-FabricAppDaxUri $cluster '.analysis.windows.net'
+        $headers['X-PowerBI-ResourceKey'] = $WorkspaceId.ToString()
+        $claims = @{
+            workspaceObjectId = $WorkspaceId.ToString()
+            workloadType = 'BaaS'
+            artifacts = @(@{ artifactType = 'AppBackend'; artifactObjectId = $AppId.ToString() })
+        } | ConvertTo-Json -Depth 4 -Compress
+        $mwc = (Invoke-FabricAppDaxRequest -Uri ($cluster.GetLeftPart([UriPartial]::Authority) + '/metadata/v201606/generatemwctokenv2') -Method POST -Headers $headers -Body $claims).Content | ConvertFrom-Json
+        if (-not $mwc.Token -or $mwc.TargetUriHost -ne $workload.DnsSafeHost) { throw 'Workload token target mismatch.' }
+
+        $stage = 'Hosting authentication'
+        $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = New-Object byte[] 32
+            $random.GetBytes($bytes)
+            $verifier = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            $challenge = [Convert]::ToBase64String($sha.ComputeHash([Text.Encoding]::ASCII.GetBytes($verifier))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+        }
+        finally { $random.Dispose(); $sha.Dispose() }
+        $state = [guid]::NewGuid().ToString('N')
+        $body = @{ returnOrigin = $origin; codeChallenge = $challenge; codeChallengeMethod = 'S256'; state = $state } | ConvertTo-Json -Compress
+        $headers = @{ Authorization = ('MwcToken ' + $mwc.Token); 'x-ms-workload-resource-moniker' = $AppId.ToString() }
+        $handoff = (Invoke-FabricAppDaxRequest -Uri ($workload.AbsoluteUri.TrimEnd('/') + '/api/auth/v1/brokered/authorize') -Method POST -Headers $headers -Body $body).Content | ConvertFrom-Json
+        if (-not $handoff.handoffCode -or $handoff.state -cne $state) { throw 'Hosting handoff state mismatch.' }
+        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        $headers = @{ Accept = 'application/json'; 'x-rayfin-sh-code-verifier' = $verifier; 'x-ms-workload-resource-moniker' = $AppId.ToString() }
+        $null = Invoke-FabricAppDaxRequest -Uri ($origin + '/?_hc=' + [uri]::EscapeDataString($handoff.handoffCode)) -Headers $headers -Session $session
+        $headers = @{ Accept = 'text/html' }
+
+        $stage = 'Asset discovery'
+        $html = (Invoke-FabricAppDaxRequest -Uri "$origin/" -Headers $headers -Session $session).Content
+        if ($html -match '<title>Sign in required</title>') { throw 'Hosting session did not serve the app.' }
+        $pending = [Collections.Generic.Queue[uri]]::new()
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $scripts = [regex]::Matches($html, '(?is)<script\b(?<attributes>[^>]*)>(?<body>.*?)</script\s*>')
+        foreach ($script in $scripts) {
+            $source = [regex]::Match($script.Groups['attributes'].Value, '\bsrc\s*=\s*["''](?<url>[^"'']+)["'']', 'IgnoreCase')
+            if ($source.Success) {
+                $asset = [uri]::new([uri]("$origin/"), [Net.WebUtility]::HtmlDecode($source.Groups['url'].Value))
+                $pending.Enqueue($asset)
+            }
+            elseif ($script.Groups['body'].Value.Trim()) { $capture.FailedAssets++ }
+        }
+        if ($scripts.Count -eq 0) { $capture.FailedAssets++ }
+        if ($html -match '(?i)<base\b') { $capture.FailedAssets++ }
+        while ($pending.Count -gt 0 -and $capture.AssetCount -lt $MaxAssets) {
+            $asset = $pending.Dequeue()
+            if (-not $seen.Add($asset.AbsoluteUri)) { continue }
+            if ($asset.GetLeftPart([UriPartial]::Authority) -ne $origin -or $asset.UserInfo -or $asset.Query -or $asset.Fragment) {
+                $capture.FailedAssets++
+                continue
+            }
+            $capture.AssetCount++
+            try {
+                $response = Invoke-FabricAppDaxRequest -Uri $asset -Session $session
+                if ($response.Headers['Content-Type'] -match 'text/html') { throw 'Expected JavaScript, not HTML.' }
+                $content = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
+                if ($parserEngine -eq 'PowerShell') {
+                    $catalog = Get-FabricAppDaxSource -Source $content
+                    $sha = [Security.Cryptography.SHA256]::Create()
+                    try { $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($content))).Replace('-', '').ToLowerInvariant() }
+                    finally { $sha.Dispose() }
+                    $catalog | Add-Member -NotePropertyName sha256 -NotePropertyValue $hash
+                    $catalog | Add-Member -NotePropertyName extractedAtUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
+                    if ($catalog.warnings.Count -gt 0) { $configurationIncomplete = $true }
+                    foreach ($warning in $catalog.warnings) { $null = $parserWarnings.Add([string]$warning) }
+                }
+                else {
+                    if (-not $temporaryFolder) {
+                        $temporaryFolder = Join-Path ([IO.Path]::GetTempPath()) ('ImpactIQ-AppDax-' + [guid]::NewGuid().ToString('N'))
+                    }
+                    $assetFolder = Join-Path $temporaryFolder ("asset-{0:D3}" -f $capture.AssetCount)
+                    $null = New-Item -ItemType Directory -Path $assetFolder -Force
+                    $bundlePath = Join-Path $assetFolder 'bundle.js'
+                    [IO.File]::WriteAllText($bundlePath, $content, [Text.UTF8Encoding]::new($false))
+                    $null = & $ParserRuntime.NodePath $parserPath $bundlePath $assetFolder 2>&1
+                    if ($LASTEXITCODE -ne 0) { throw 'JavaScript parsing failed.' }
+                    $catalog = Get-Content -LiteralPath (Join-Path $assetFolder 'queries.json') -Raw | ConvertFrom-Json
+                }
+                foreach ($mapping in $catalog.modelMappings) { $modelMappings.Add($mapping) }
+                foreach ($row in @(ConvertTo-FabricAppQueryRows -Catalog $catalog -WorkspaceId $WorkspaceId -WorkspaceName $WorkspaceName -AppId $AppId -AppName $AppName -SourceUrl $asset.AbsoluteUri)) {
+                    $queries.Add($row)
+                }
+                foreach ($reference in $catalog.scriptReferences) { $pending.Enqueue([uri]::new($asset, $reference)) }
+            }
+            catch { $capture.FailedAssets++ }
+        }
+        $capture.QueryCount = $queries.Count
+        if ($capture.FailedAssets -gt 0 -or $pending.Count -gt 0) {
+            $capture.Status = 'Partial'
+            $capture.Detail = 'Some scripts were skipped or unavailable, or the asset limit was reached. Inline scripts and base URLs need manual review.'
+        }
+        elseif ($parserEngine -eq 'PowerShell') {
+            $capture.Status = 'Partial'
+            $capture.Detail = 'PowerShell heuristic scan; full JavaScript syntax, query routing and helper dependencies are not resolved. Inspect ParserWarnings.'
+        }
+        elseif ($queries.Count -eq 0) {
+            $capture.Status = 'NoQueriesFound'
+            $capture.Detail = 'No DAX literals found in inspected scripts; this does not prove absence of queries.'
+        }
+        else {
+            $capture.Status = 'Captured'
+            $capture.Detail = 'Frontend query candidates captured. Runtime and server-side coverage remain unknown.'
+        }
+    }
+    catch {
+        $capture.Status = 'Failed'
+        $capture.Detail = "$stage failed. Check sign-in, app permissions, prerequisites, and preview API availability."
+    }
+    finally {
+        $env:NODE_PATH = $previousNodePath
+        $fabricToken = $powerBiToken = $mwc = $handoff = $session = $headers = $verifier = $null
+        if ($temporaryFolder -and (Test-Path -LiteralPath $temporaryFolder)) {
+            try { Remove-Item -LiteralPath $temporaryFolder -Recurse -Force -ErrorAction Stop }
+            catch {
+                $capture.Status = 'Failed'
+                $capture.Detail = 'Temporary app data could not be removed. Remove the temporary directory reported in the console.'
+                Write-Warning "Temporary app data cleanup failed: $temporaryFolder" -WarningAction Continue
+            }
+        }
+    }
+    $capture.QueryCount = $queries.Count
+    $capture.ParserWarnings = (@($parserWarnings) -join '; ')
+    Set-FabricAppQueryModelMapping -Queries $queries.ToArray() -Mappings $modelMappings.ToArray() -Datasets $Datasets -Workspaces $Workspaces
+    if ($configurationIncomplete) {
+        Set-FabricAppQueryModelMapping -Queries $queries.ToArray()
+        foreach ($query in $queries) { $query.ModelMappingEvidence = 'ConfigurationIncomplete; inspect FabricApps.ParserWarnings' }
+    }
+    [PSCustomObject]@{ Queries = $queries.ToArray(); Capture = $capture }
+}
+
+function Set-FabricAppQueryModelMapping {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Queries = @(),
+        [AllowEmptyCollection()][object[]]$Mappings = @(),
+        [AllowEmptyCollection()][object[]]$Datasets = @(),
+        [AllowEmptyCollection()][object[]]$Workspaces = @()
+    )
+
+    $configuredModels = @($Mappings | Where-Object { $_.connectionAlias -and $_.modelId -and $_.modelWorkspaceId } |
+        Select-Object connectionAlias, modelId, modelWorkspaceId -Unique)
+    $mapping = $null
+    $modelName = ''
+    $modelWorkspaceName = ''
+    $evidence = 'ConfigurationNotFound'
+    if ($configuredModels.Count -eq 1) {
+        $mapping = $configuredModels[0]
+        $evidence = 'SingleConfiguredModel; query routing not verified'
+        $modelNames = @($Datasets | Where-Object { $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId } |
+            Select-Object -ExpandProperty DatasetName -Unique)
+        $workspaceNames = @($Workspaces | Where-Object { $_.WorkspaceId -eq $mapping.modelWorkspaceId } |
+            Select-Object -ExpandProperty WorkspaceName -Unique)
+        if ($modelNames.Count -eq 1) { $modelName = $modelNames[0] }
+        if ($workspaceNames.Count -eq 1) { $modelWorkspaceName = $workspaceNames[0] }
+    }
+    elseif ($configuredModels.Count -gt 1) { $evidence = 'MultipleConfiguredModels; query routing unresolved' }
+    foreach ($query in $Queries) {
+        $query.ConnectionAlias = if ($mapping) { $mapping.connectionAlias } else { '' }
+        $query.ModelId = if ($mapping) { $mapping.modelId } else { '' }
+        $query.ModelName = $modelName
+        $query.ModelWorkspaceId = if ($mapping) { $mapping.modelWorkspaceId } else { '' }
+        $query.ModelWorkspaceName = $modelWorkspaceName
+        $query.ModelMappingEvidence = $evidence
+    }
+}
+
+function ConvertTo-FabricAppQueryRows {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Catalog,
+        [Parameter(Mandatory)][string]$WorkspaceId,
+        [string]$WorkspaceName,
+        [Parameter(Mandatory)][string]$AppId,
+        [string]$AppName,
+        [string]$SourceUrl,
+        [string]$CatalogPath
+    )
+
+    foreach ($query in $Catalog.queries) {
+        $record = [ordered]@{
+            WorkspaceId = $WorkspaceId
+            WorkspaceName = $WorkspaceName
+            AppId = $AppId
+            AppName = $AppName
+            QuerySymbol = $query.symbol
+            Evidence = $query.evidence
+            QueryText = ''
+            QueryCharacters = ([string]$query.text).Length
+            SourceUrl = $SourceUrl
+            SourceSHA256 = $Catalog.sha256
+            SourceLine = $query.line
+            SourceColumn = $query.column
+            CapturedAtUtc = $Catalog.extractedAtUtc
+            ParserWarnings = (@($Catalog.warnings) -join '; ')
+            Coverage = $(if ($Catalog.coverage) { $Catalog.coverage } else { 'Frontend source only; runtime and server-side coverage unknown.' })
+            ConnectionAlias = ''
+            ModelId = ''
+            ModelName = ''
+            ModelWorkspaceId = ''
+            ModelWorkspaceName = ''
+            ModelMappingEvidence = 'ConfigurationNotFound'
+            Parser = $(if ($Catalog.parser) { $Catalog.parser } else { 'Acorn' })
+        }
+        $text = [string]$query.text
+        $offset = 0
+        $part = 1
+        while ($offset -lt $text.Length) {
+            $length = [Math]::Min(32000, $text.Length - $offset)
+            if ([char]::IsHighSurrogate($text[$offset + $length - 1])) { $length-- }
+            $column = if ($part -eq 1) { 'QueryText' } else { "QueryText$part" }
+            $record[$column] = $text.Substring($offset, $length)
+            $offset += $length
+            $part++
+        }
+        [PSCustomObject]$record
+    }
+}
+
+function Export-FabricAppQueryWorkbook {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [AllowEmptyCollection()][object[]]$Queries = @(),
+        [AllowEmptyCollection()][object[]]$Captures = @()
+    )
+
+    Import-Module ImportExcel -ErrorAction Stop
+    $package = Open-ExcelPackage -Path $Path -Create -ErrorAction Stop
+    try {
+        foreach ($definition in @(
+            @{ Name = 'FabricAppQueries'; Rows = $Queries; Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'QueryCharacters', 'SourceUrl', 'SourceSHA256', 'SourceLine', 'SourceColumn', 'CapturedAtUtc', 'ParserWarnings', 'Coverage', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelMappingEvidence', 'Parser') },
+            @{ Name = 'FabricApps'; Rows = $Captures; Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'Status', 'QueryCount', 'AssetCount', 'FailedAssets', 'CapturedAtUtc', 'Detail', 'ParserWarnings', 'Parser') }
+        )) {
+            if ($definition.Rows.Count -gt 1048575) { throw 'App query export exceeds the Excel row limit.' }
+            $sheet = $package.Workbook.Worksheets[$definition.Name]
+            if ($sheet) { $package.Workbook.Worksheets.Delete($definition.Name) }
+            $sheet = $package.Workbook.Worksheets.Add($definition.Name)
+            $headers = [System.Collections.Generic.List[string]]::new()
+            foreach ($header in $definition.Headers) { $headers.Add($header) }
+            foreach ($record in $definition.Rows) {
+                foreach ($property in $record.PSObject.Properties.Name) {
+                    if ($property -in @('CatalogPath', 'OutputFolder')) { continue }
+                    if (-not $headers.Contains($property)) { $headers.Add($property) }
+                }
+            }
+            if ($headers.Count -gt 16384) { throw 'App query export exceeds the Excel column limit.' }
+            for ($column = 0; $column -lt $headers.Count; $column++) {
+                $sheet.Cells[1, ($column + 1)].Value = $headers[$column]
+                $sheet.Column($column + 1).Width = if ($headers[$column] -like 'QueryText*') { 85 } else { 25 }
+            }
+            $rowNumber = 2
+            foreach ($record in $definition.Rows) {
+                for ($column = 0; $column -lt $headers.Count; $column++) {
+                    $value = $record.($headers[$column])
+                    if ($value -is [string] -and $value.Length -gt 32767) {
+                        throw "Value in $($headers[$column]) exceeds Excel's cell limit."
+                    }
+                    $sheet.Cells[$rowNumber, ($column + 1)].Value = $value
+                }
+                $sheet.Row($rowNumber).Height = 60
+                $rowNumber++
+            }
+            $sheet.Cells[1, 1, 1, $headers.Count].Style.Font.Bold = $true
+            $sheet.Cells[1, 1, [Math]::Max(1, $rowNumber - 1), $headers.Count].AutoFilter = $true
+            $sheet.Cells.Style.WrapText = $true
+            $sheet.View.FreezePanes(2, 1)
+        }
+        foreach ($legacySheet in @('AppQueries', 'AppQueryCaptures')) {
+            if ($package.Workbook.Worksheets[$legacySheet]) { $package.Workbook.Worksheets.Delete($legacySheet) }
+        }
+        $package.Save()
+    }
+    finally {
+        $package.Dispose()
+    }
+}
+
+function Export-FabricAppDaxEnvironment {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Items = @(),
+        [Parameter(Mandatory)][string]$BaseFolderPath,
+        [string]$Environment = 'Public',
+        [AllowEmptyCollection()][object[]]$Datasets = @(),
+        [AllowEmptyCollection()][object[]]$Workspaces = @(),
+        [ValidateSet('PowerShell', 'Acorn')][string]$ParserEngine = 'PowerShell'
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $environmentWorkbook = Join-Path $BaseFolderPath 'Power BI Environment Detail.xlsx'
+    if (-not (Test-Path -LiteralPath $environmentWorkbook -PathType Leaf)) {
+        throw 'The environment workbook must exist before app queries can be appended.'
+    }
+    $appItems = @($Items | Where-Object { $_.FabricItemType -eq 'AppBackend' })
+    $appQueryRows = @()
+    $appQueryCaptures = @()
+    $appDaxRuntime = @{}
+    $appDaxReady = $true
+    if ($appItems.Count -eq 0) {
+        Write-Host '[WARN] No AppBackend items found in the selected workspaces. FabricAppQueries will contain headers only.' -ForegroundColor Yellow
+    }
+    if ($appItems.Count -gt 0 -and $Environment -eq 'Public') {
+        try { $appDaxRuntime = Initialize-FabricAppDaxParser -Engine $ParserEngine -ErrorAction Stop }
+        catch {
+            $appDaxReady = $false
+            Write-Host "[WARN] App query parser initialization failed ($ParserEngine). Only Acorn mode requires Node.js/npm. See FabricApps." -ForegroundColor Yellow
+        }
+    }
+    foreach ($appItem in $appItems) {
+        if (-not $appDaxReady) {
+            $appQueryCaptures += [PSCustomObject]@{
+                WorkspaceId = $appItem.WorkspaceId
+                WorkspaceName = $appItem.WorkspaceName
+                AppId = $appItem.FabricItemID
+                AppName = $appItem.FabricItemName
+                Status = 'PrerequisiteFailed'
+                QueryCount = 0
+                AssetCount = 0
+                FailedAssets = 0
+                CapturedAtUtc = [DateTime]::UtcNow.ToString('o')
+                Detail = "Parser initialization failed ($ParserEngine). Only Acorn mode requires Node.js/npm."
+                ParserWarnings = ''
+                Parser = $ParserEngine
+            }
+            continue
+        }
+        Write-Host "[INFO] Extracting Fabric app queries: $($appItem.WorkspaceName) ~ $($appItem.FabricItemName)"
+        $appCapture = Get-FabricAppDaxCapture -WorkspaceId $appItem.WorkspaceId -WorkspaceName $appItem.WorkspaceName -AppId $appItem.FabricItemID -AppName $appItem.FabricItemName -ParserRuntime $appDaxRuntime -Environment $Environment -Datasets $Datasets -Workspaces $Workspaces
+        $appQueryRows += @($appCapture.Queries)
+        $appQueryCaptures += $appCapture.Capture
+        Write-Host "[INFO] App query capture: $($appCapture.Capture.Status); $($appCapture.Capture.QueryCount) query candidates."
+    }
+    Export-FabricAppQueryWorkbook -Path $environmentWorkbook -Queries $appQueryRows -Captures $appQueryCaptures -ErrorAction Stop
+    Write-Host "[INFO] Exported $($appQueryRows.Count) queries to $environmentWorkbook -> FabricAppQueries -> QueryText (column G). App status is in FabricApps; no app-query backups are created."
+    if ($appQueryRows.Count -eq 0 -or @($appQueryCaptures | Where-Object { $_.Status -ne 'Captured' }).Count -gt 0) {
+        Write-Host '[WARN] Review FabricApps for missing queries, partial coverage, or failed captures.' -ForegroundColor Yellow
+    }
+}
+
+$EnableFabricAppDax = $true
+$FabricAppDaxParser = 'PowerShell'
+if ($EnableFabricAppDax) {
+    try {
+        Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ErrorAction Stop
+    }
+    catch {
+        Write-Host '[WARN] Final app query export failed. Check prerequisites and close Power BI Environment Detail.xlsx before rerunning. Earlier exports are retained; app queries are not backed up separately.' -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host '[INFO] App query export is disabled. Set $EnableFabricAppDax = $true in the final section to include FabricApps and FabricAppQueries.'
+}
 
 Write-Output "All Excel files processed and combined successfully."
 
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
- 

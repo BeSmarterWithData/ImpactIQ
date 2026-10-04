@@ -4510,20 +4510,15 @@ function Resolve-FabricAppModelNames {
                 evidence = $mapping.evidence
                 modelName = ''
                 modelWorkspaceName = ''
-                nameSource = 'Fabric REST API'
-                modelNameStatus = 'NotAttempted'
-                modelWorkspaceNameStatus = 'NotAttempted'
             }
             if ($Environment -ne 'Public' -or -not $validIds) {
-                $status = if ($Environment -ne 'Public') { 'UnsupportedEnvironment' } else { 'InvalidId' }
-                $result.modelNameStatus = $result.modelWorkspaceNameStatus = $status
                 [PSCustomObject]$result
                 continue
             }
             foreach ($kind in @('Workspace', 'Model')) {
                 $key = if ($kind -eq 'Workspace') { "Workspace/$workspaceGuid" } else { "Model/$workspaceGuid/$modelGuid" }
                 if (-not $Cache.ContainsKey($key)) {
-                    $entry = @{ Name = ''; Status = 'LookupFailed' }
+                    $entry = @{ Name = '' }
                     try {
                         if (-not $headers) {
                             $headers = @{ Authorization = ('Bearer ' + (Get-FabricAppDaxToken 'https://api.fabric.microsoft.com')) }
@@ -4532,24 +4527,21 @@ function Resolve-FabricAppModelNames {
                         $expectedId = $workspaceGuid
                         if ($kind -eq 'Model') { $uri += "/items/$modelGuid"; $expectedId = $modelGuid }
                         $metadata = (Invoke-FabricAppDaxRequest -Uri $uri -Headers $headers).Content | ConvertFrom-Json
-                        if ([string]$metadata.id -ne $expectedId.ToString() -or
-                            [string]::IsNullOrWhiteSpace([string]$metadata.displayName) -or
-                            ($kind -eq 'Model' -and $metadata.type -ne 'SemanticModel')) {
-                            $entry.Status = 'InvalidResponse'
+                        if ([string]$metadata.id -eq $expectedId.ToString() -and
+                            -not [string]::IsNullOrWhiteSpace([string]$metadata.displayName) -and
+                            ($kind -eq 'Workspace' -or $metadata.type -eq 'SemanticModel')) {
+                            $entry.Name = [string]$metadata.displayName
                         }
-                        else { $entry.Name = [string]$metadata.displayName; $entry.Status = 'Resolved' }
                     }
-                    catch { $entry.Status = 'LookupFailed' }
+                    catch {}
                     $Cache[$key] = $entry
                 }
                 $entry = $Cache[$key]
                 if ($kind -eq 'Workspace') {
                     $result.modelWorkspaceName = $entry.Name
-                    $result.modelWorkspaceNameStatus = $entry.Status
                 }
                 else {
                     $result.modelName = $entry.Name
-                    $result.modelNameStatus = $entry.Status
                 }
             }
             [PSCustomObject]$result
@@ -4770,9 +4762,6 @@ function Get-FabricAppDaxCapture {
                 ModelId = $mapping.modelId
                 ModelName = $mapping.modelName
                 Evidence = $mapping.evidence
-                ModelNameSource = $mapping.nameSource
-                ModelNameStatus = $mapping.modelNameStatus
-                ModelWorkspaceNameStatus = $mapping.modelWorkspaceNameStatus
             }
         })
     if (-not $captureError -and $models.Count -eq 0) {
@@ -4810,7 +4799,7 @@ function Set-FabricAppQueryModelMapping {
         }
         $modelName = ''
         $modelWorkspaceName = ''
-        if ($mapping -and $mapping.nameSource -eq 'Fabric REST API') {
+        if ($mapping) {
             $modelName = [string]$mapping.modelName
             $modelWorkspaceName = [string]$mapping.modelWorkspaceName
         }
@@ -4819,9 +4808,6 @@ function Set-FabricAppQueryModelMapping {
         $query.ModelName = $modelName
         $query.ModelWorkspaceId = if ($mapping) { $mapping.modelWorkspaceId } else { '' }
         $query.ModelWorkspaceName = $modelWorkspaceName
-        $query | Add-Member -NotePropertyName ModelNameSource -NotePropertyValue $(if ($mapping) { $mapping.nameSource } else { '' }) -Force
-        $query | Add-Member -NotePropertyName ModelNameStatus -NotePropertyValue $(if ($mapping) { $mapping.modelNameStatus } else { 'NotAttempted' }) -Force
-        $query | Add-Member -NotePropertyName ModelWorkspaceNameStatus -NotePropertyValue $(if ($mapping) { $mapping.modelWorkspaceNameStatus } else { 'NotAttempted' }) -Force
     }
 }
 
@@ -4898,12 +4884,12 @@ function Export-FabricAppQueryWorkbook {
             @{
                 Name = 'FabricAppQueries'
                 Rows = $Queries
-                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelNameSource', 'ModelNameStatus', 'ModelWorkspaceNameStatus')
+                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName')
             },
             @{
                 Name = 'FabricAppModels'
                 Rows = $Models
-                Headers = @('AppWorkspaceId', 'AppWorkspaceName', 'AppId', 'AppName', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelId', 'ModelName', 'Evidence', 'ModelNameSource', 'ModelNameStatus', 'ModelWorkspaceNameStatus')
+                Headers = @('AppWorkspaceId', 'AppWorkspaceName', 'AppId', 'AppName', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelId', 'ModelName', 'Evidence')
             },
             @{
                 Name = 'FabricApps'

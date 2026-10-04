@@ -3739,7 +3739,6 @@ function Get-FabricAppDaxSource {
     $tokens = [Collections.Generic.List[object]]::new()
     $queries = [Collections.Generic.List[object]]::new()
     $references = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $warnings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $state = @{ Position = 0; Depth = 0 }
     $lex = [regex]::new('\G(?:(?<space>\s+)|(?<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|(?<string>"(?:\\[\s\S]|[^"\\\r\n])*"|''(?:\\[\s\S]|[^''\\\r\n])*'')|(?<word>[a-zA-Z_$][\w$]*)|(?<number>\d+(?:\.\d+)?)|(?<punct>=>|\+\+|--|&&|\|\||\?\?|[^\s]))', 'Compiled')
     $regexLiteral = [regex]::new('\G/(?:\\[^\r\n]|\[(?:\\[^\r\n]|[^\]\\\r\n])*\]|[^/\\\[\r\n])+/[a-z]*', 'Compiled')
@@ -3914,7 +3913,7 @@ function Get-FabricAppDaxSource {
     $guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
     for ($tokenIndex = 0; $tokenIndex -lt $tokens.Count - 2; $tokenIndex++) {
         if ($tokens[$tokenIndex].Value -ne 'semanticModels' -or $tokens[$tokenIndex + 1].Value -ne ':') { continue }
-        if ($tokens[$tokenIndex + 2].Value -ne '{') { $null = $warnings.Add('Nonliteral semanticModels configuration was not resolved.'); continue }
+        if ($tokens[$tokenIndex + 2].Value -ne '{') { continue }
         $objectIndex = $tokenIndex + 2
         try {
             $configuration = Read-AppJsObject ([ref]$objectIndex)
@@ -3922,13 +3921,12 @@ function Get-FabricAppDaxSource {
                 $model = $configuration[$alias]
                 if ($model -isnot [Collections.Generic.Dictionary[string,object]] -or
                     $model['workspaceId'] -notmatch $guidPattern -or $model['itemId'] -notmatch $guidPattern) {
-                    $null = $warnings.Add('A model mapping did not contain literal workspace and model GUIDs.')
                     continue
                 }
                 $mappings.Add([PSCustomObject]@{ connectionAlias = $alias; modelWorkspaceId = $model['workspaceId']; modelId = $model['itemId']; evidence = 'StaticConfiguration' })
             }
         }
-        catch { $null = $warnings.Add('Unsupported semanticModels configuration was not resolved.') }
+        catch { }
     }
     $orderedQueries = @($queries | Sort-Object start)
     $line = 1
@@ -4232,45 +4230,12 @@ function Get-FabricAppDaxSource {
         }
         $aliases = @($queryAliases[[string]$query.start] | Sort-Object)
         $query | Add-Member -NotePropertyName connectionAliases -NotePropertyValue $aliases
-        if ($aliases.Count -gt 1) { $null = $warnings.Add("Query '$($query.symbol)' has multiple static connection candidates.") }
     }
     [PSCustomObject]@{
         queries = $orderedQueries
-        helpers = @()
         scriptReferences = @($references)
         modelMappings = @($mappings.ToArray())
-        parser = 'PowerShellScanner'
-        warnings = @($warnings)
-        coverage = 'Heuristic lexical scan with conservative static connection routing; full JavaScript syntax, runtime routing and helper dependencies are not resolved.'
     }
-}
-
-function Export-FabricAppDaxSource {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$InputPath, [Parameter(Mandatory)][string]$OutputPath)
-
-    $ErrorActionPreference = 'Stop'
-    $source = [IO.File]::ReadAllText($InputPath, [Text.Encoding]::UTF8)
-    $catalog = Get-FabricAppDaxSource -Source $source
-    $catalog | Add-Member -NotePropertyName sourceFile -NotePropertyValue ([IO.Path]::GetFileName($InputPath))
-    $catalog | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-FileHash -LiteralPath $InputPath -Algorithm SHA256).Hash.ToLowerInvariant())
-    $catalog | Add-Member -NotePropertyName extractedAtUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
-    $null = New-Item -ItemType Directory -Path $OutputPath -Force
-    [IO.File]::WriteAllText((Join-Path $OutputPath 'queries.json'), ($catalog | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-    $sections = [Collections.Generic.List[string]]::new()
-    $sections.Add('# Fabric App DAX (PowerShell Scanner)')
-    $sections.Add($catalog.coverage)
-    $queryIndex = 0
-    foreach ($query in $catalog.queries) {
-        $queryIndex++
-        $extension = if ($query.evidence -eq 'DynamicTemplate') { '.dax-template.txt' } else { '.dax' }
-        $name = ('{0:D2}-{1}' -f $queryIndex, ($query.symbol -replace '[^a-zA-Z0-9_-]', '_')) + $extension
-        [IO.File]::WriteAllText((Join-Path $OutputPath $name), $query.text + "`n", [Text.UTF8Encoding]::new($false))
-        $sections.Add("## $queryIndex. $($query.symbol) ($($query.evidence))")
-        $sections.Add('```dax' + "`n" + $query.text + "`n" + '```')
-    }
-    [IO.File]::WriteAllText((Join-Path $OutputPath 'queries.md'), ($sections -join "`n`n"), [Text.UTF8Encoding]::new($false))
-    $catalog
 }
 
 function Initialize-FabricAppDaxParser {
@@ -4523,6 +4488,76 @@ function Invoke-FabricAppDaxRequest {
     }
 }
 
+function Resolve-FabricAppModelNames {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Mappings = @(),
+        [hashtable]$Cache = @{},
+        [string]$Environment = 'Public'
+    )
+
+    $headers = $null
+    try {
+        foreach ($mapping in $Mappings) {
+            $modelGuid = [guid]::Empty
+            $workspaceGuid = [guid]::Empty
+            $validIds = [guid]::TryParse([string]$mapping.modelId, [ref]$modelGuid) -and
+                [guid]::TryParse([string]$mapping.modelWorkspaceId, [ref]$workspaceGuid)
+            $result = [ordered]@{
+                connectionAlias = $mapping.connectionAlias
+                modelId = $mapping.modelId
+                modelWorkspaceId = $mapping.modelWorkspaceId
+                evidence = $mapping.evidence
+                modelName = ''
+                modelWorkspaceName = ''
+                nameSource = 'Fabric REST API'
+                modelNameStatus = 'NotAttempted'
+                modelWorkspaceNameStatus = 'NotAttempted'
+            }
+            if ($Environment -ne 'Public' -or -not $validIds) {
+                $status = if ($Environment -ne 'Public') { 'UnsupportedEnvironment' } else { 'InvalidId' }
+                $result.modelNameStatus = $result.modelWorkspaceNameStatus = $status
+                [PSCustomObject]$result
+                continue
+            }
+            foreach ($kind in @('Workspace', 'Model')) {
+                $key = if ($kind -eq 'Workspace') { "Workspace/$workspaceGuid" } else { "Model/$workspaceGuid/$modelGuid" }
+                if (-not $Cache.ContainsKey($key)) {
+                    $entry = @{ Name = ''; Status = 'LookupFailed' }
+                    try {
+                        if (-not $headers) {
+                            $headers = @{ Authorization = ('Bearer ' + (Get-FabricAppDaxToken 'https://api.fabric.microsoft.com')) }
+                        }
+                        $uri = "https://api.fabric.microsoft.com/v1/workspaces/$workspaceGuid"
+                        $expectedId = $workspaceGuid
+                        if ($kind -eq 'Model') { $uri += "/items/$modelGuid"; $expectedId = $modelGuid }
+                        $metadata = (Invoke-FabricAppDaxRequest -Uri $uri -Headers $headers).Content | ConvertFrom-Json
+                        if ([string]$metadata.id -ne $expectedId.ToString() -or
+                            [string]::IsNullOrWhiteSpace([string]$metadata.displayName) -or
+                            ($kind -eq 'Model' -and $metadata.type -ne 'SemanticModel')) {
+                            $entry.Status = 'InvalidResponse'
+                        }
+                        else { $entry.Name = [string]$metadata.displayName; $entry.Status = 'Resolved' }
+                    }
+                    catch { $entry.Status = 'LookupFailed' }
+                    $Cache[$key] = $entry
+                }
+                $entry = $Cache[$key]
+                if ($kind -eq 'Workspace') {
+                    $result.modelWorkspaceName = $entry.Name
+                    $result.modelWorkspaceNameStatus = $entry.Status
+                }
+                else {
+                    $result.modelName = $entry.Name
+                    $result.modelNameStatus = $entry.Status
+                }
+            }
+            [PSCustomObject]$result
+        }
+    }
+    finally { $headers = $null }
+}
+
 function Get-FabricAppDaxCapture {
     [CmdletBinding()]
     param(
@@ -4530,21 +4565,18 @@ function Get-FabricAppDaxCapture {
         [string]$WorkspaceName,
         [Parameter(Mandatory)][guid]$AppId,
         [string]$AppName,
-        [string]$OutputRoot,
         [Parameter(Mandatory)]$ParserRuntime,
         [ValidateRange(1, 256)][int]$MaxAssets = 64,
         [string]$Environment = 'Public',
         [AllowEmptyCollection()][object[]]$Datasets = @(),
-        [AllowEmptyCollection()][object[]]$Workspaces = @()
+        [AllowEmptyCollection()][object[]]$Workspaces = @(),
+        [hashtable]$ModelNameCache = @{}
     )
 
     $ErrorActionPreference = 'Stop'
     $queries = [Collections.Generic.List[object]]::new()
     $modelMappings = [Collections.Generic.List[object]]::new()
-    $resolvedDatasets = [Collections.Generic.List[object]]::new()
     $parserEngine = if ($ParserRuntime.Engine -eq 'Acorn') { 'Acorn' } else { 'PowerShell' }
-    $configurationIncomplete = $false
-    $parserWarnings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $temporaryFolder = $null
     $assetCount = 0
     $failedAssets = 0
@@ -4647,13 +4679,6 @@ function Get-FabricAppDaxCapture {
                 $content = if ($response.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($response.Content) } else { [string]$response.Content }
                 if ($parserEngine -eq 'PowerShell') {
                     $catalog = Get-FabricAppDaxSource -Source $content
-                    $sha = [Security.Cryptography.SHA256]::Create()
-                    try { $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($content))).Replace('-', '').ToLowerInvariant() }
-                    finally { $sha.Dispose() }
-                    $catalog | Add-Member -NotePropertyName sha256 -NotePropertyValue $hash
-                    $catalog | Add-Member -NotePropertyName extractedAtUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'))
-                    if ($catalog.warnings.Count -gt 0) { $configurationIncomplete = $true }
-                    foreach ($warning in $catalog.warnings) { $null = $parserWarnings.Add([string]$warning) }
                 }
                 else {
                     if (-not $temporaryFolder) {
@@ -4674,26 +4699,6 @@ function Get-FabricAppDaxCapture {
                 foreach ($reference in $catalog.scriptReferences) { $pending.Enqueue([uri]::new($asset, $reference)) }
             }
             catch { $failedAssets++ }
-        }
-        $headers = @{ Authorization = ("Bearer " + $fabricToken) }
-        foreach ($mapping in @($modelMappings |
-                Where-Object { $_.modelId -and $_.modelWorkspaceId } |
-                Select-Object modelId, modelWorkspaceId -Unique)) {
-            $knownModels = @($Datasets | Where-Object {
-                    $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId
-                })
-            if ($knownModels.Count -gt 0) { continue }
-            try {
-                $modelItem = (Invoke-FabricAppDaxRequest -Uri "https://api.fabric.microsoft.com/v1/workspaces/$($mapping.modelWorkspaceId)/items/$($mapping.modelId)" -Headers $headers).Content | ConvertFrom-Json
-                $resolvedDatasets.Add([PSCustomObject]@{
-                    WorkspaceId = $mapping.modelWorkspaceId
-                    DatasetId = $mapping.modelId
-                    DatasetName = $modelItem.displayName
-                })
-            }
-            catch {
-                $null = $parserWarnings.Add("Could not resolve semantic model metadata for $($mapping.modelWorkspaceId)/$($mapping.modelId).")
-            }
         }
         if ($failedAssets -gt 0 -or $pending.Count -gt 0) {
             $captureError = 'Some scripts were skipped or unavailable, or the asset limit was reached. Inline scripts and base URLs need manual review.'
@@ -4716,22 +4721,14 @@ function Get-FabricAppDaxCapture {
             }
         }
     }
-    $allDatasets = @($Datasets) + @($resolvedDatasets)
-    Set-FabricAppQueryModelMapping -Queries $queries.ToArray() -Mappings $modelMappings.ToArray() -Datasets $allDatasets -Workspaces $Workspaces
-    if ($configurationIncomplete) {
-        Set-FabricAppQueryModelMapping -Queries $queries.ToArray()
-    }
-    $models = @($modelMappings |
+    $configuredModels = @($modelMappings |
         Where-Object { $_.connectionAlias -and $_.modelId -and $_.modelWorkspaceId } |
-        Select-Object connectionAlias, modelId, modelWorkspaceId, evidence -Unique |
+        Select-Object connectionAlias, modelId, modelWorkspaceId, evidence -Unique)
+    $configuredModels = @(Resolve-FabricAppModelNames -Mappings $configuredModels -Cache $ModelNameCache -Environment $Environment)
+    Set-FabricAppQueryModelMapping -Queries $queries.ToArray() -Mappings $configuredModels
+    $models = @($configuredModels |
         ForEach-Object {
             $mapping = $_
-            $modelNames = @($allDatasets | Where-Object {
-                    $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId
-                } | Select-Object -ExpandProperty DatasetName -Unique)
-            $workspaceNames = @($Workspaces | Where-Object {
-                    $_.WorkspaceId -eq $mapping.modelWorkspaceId
-                } | Select-Object -ExpandProperty WorkspaceName -Unique)
             [PSCustomObject][ordered]@{
                 AppWorkspaceId = $WorkspaceId.ToString()
                 AppWorkspaceName = $WorkspaceName
@@ -4739,15 +4736,17 @@ function Get-FabricAppDaxCapture {
                 AppName = $AppName
                 ConnectionAlias = $mapping.connectionAlias
                 ModelWorkspaceId = $mapping.modelWorkspaceId
-                ModelWorkspaceName = $(if ($workspaceNames.Count -eq 1) { $workspaceNames[0] } else { '' })
+                ModelWorkspaceName = $mapping.modelWorkspaceName
                 ModelId = $mapping.modelId
-                ModelName = $(if ($modelNames.Count -eq 1) { $modelNames[0] } else { '' })
+                ModelName = $mapping.modelName
                 Evidence = $mapping.evidence
+                ModelNameSource = $mapping.nameSource
+                ModelNameStatus = $mapping.modelNameStatus
+                ModelWorkspaceNameStatus = $mapping.modelWorkspaceNameStatus
             }
         })
     if ($queries.Count -gt 0 -or $models.Count -eq 0) { $captureError = '' }
     if ($captureError) {
-        Write-Host "[ERROR] App query extraction was incomplete for $WorkspaceName ~ $AppName`: $captureError" -ForegroundColor Red
     }
     else {
         Write-Host "App query extraction completed for $WorkspaceName ~ $AppName"
@@ -4765,7 +4764,7 @@ function Set-FabricAppQueryModelMapping {
     )
 
     $configuredModels = @($Mappings | Where-Object { $_.connectionAlias -and $_.modelId -and $_.modelWorkspaceId } |
-        Select-Object connectionAlias, modelId, modelWorkspaceId -Unique)
+        Sort-Object connectionAlias, modelId, modelWorkspaceId -Unique)
     foreach ($query in $Queries) {
         $mapping = $null
         if ($query.ConnectionAlias) {
@@ -4777,23 +4776,20 @@ function Set-FabricAppQueryModelMapping {
         elseif ($configuredModels.Count -eq 1) {
             $mapping = $configuredModels[0]
         }
-        $modelNames = @()
-        $workspaceNames = @()
-        if ($mapping) {
-            $modelNames = @($Datasets | Where-Object {
-                    $_.DatasetId -eq $mapping.modelId -and $_.WorkspaceId -eq $mapping.modelWorkspaceId
-                } | Select-Object -ExpandProperty DatasetName -Unique)
-            $workspaceNames = @($Workspaces | Where-Object {
-                    $_.WorkspaceId -eq $mapping.modelWorkspaceId
-                } | Select-Object -ExpandProperty WorkspaceName -Unique)
+        $modelName = ''
+        $modelWorkspaceName = ''
+        if ($mapping -and $mapping.nameSource -eq 'Fabric REST API') {
+            $modelName = [string]$mapping.modelName
+            $modelWorkspaceName = [string]$mapping.modelWorkspaceName
         }
-        $modelName = if ($modelNames.Count -eq 1) { $modelNames[0] } else { '' }
-        $modelWorkspaceName = if ($workspaceNames.Count -eq 1) { $workspaceNames[0] } else { '' }
         $query.ConnectionAlias = if ($mapping) { $mapping.connectionAlias } else { $query.ConnectionAlias }
         $query.ModelId = if ($mapping) { $mapping.modelId } else { '' }
         $query.ModelName = $modelName
         $query.ModelWorkspaceId = if ($mapping) { $mapping.modelWorkspaceId } else { '' }
         $query.ModelWorkspaceName = $modelWorkspaceName
+        $query | Add-Member -NotePropertyName ModelNameSource -NotePropertyValue $(if ($mapping) { $mapping.nameSource } else { '' }) -Force
+        $query | Add-Member -NotePropertyName ModelNameStatus -NotePropertyValue $(if ($mapping) { $mapping.modelNameStatus } else { 'NotAttempted' }) -Force
+        $query | Add-Member -NotePropertyName ModelWorkspaceNameStatus -NotePropertyValue $(if ($mapping) { $mapping.modelWorkspaceNameStatus } else { 'NotAttempted' }) -Force
     }
 }
 
@@ -4831,7 +4827,12 @@ function ConvertTo-FabricAppQueryRows {
         $part = 1
         while ($offset -lt $text.Length) {
             $length = [Math]::Min(32000, $text.Length - $offset)
-            if ([char]::IsHighSurrogate($text[$offset + $length - 1])) { $length-- }
+            $nextOffset = $offset + $length
+            if ($nextOffset -lt $text.Length -and
+                [char]::IsHighSurrogate($text[$nextOffset - 1]) -and
+                [char]::IsLowSurrogate($text[$nextOffset])) {
+                $length--
+            }
             $column = if ($part -eq 1) { 'QueryText' } else { "QueryText$part" }
             $record[$column] = $text.Substring($offset, $length)
             $offset += $length
@@ -4865,20 +4866,17 @@ function Export-FabricAppQueryWorkbook {
             @{
                 Name = 'FabricAppQueries'
                 Rows = $Queries
-                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName')
-                Exclude = @('QueryCharacters', 'SourceSHA256', 'SourceLine', 'SourceColumn', 'CapturedAtUtc', 'ParserWarnings', 'Coverage', 'ModelMappingEvidence', 'Parser')
+                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelNameSource', 'ModelNameStatus', 'ModelWorkspaceNameStatus')
             },
             @{
                 Name = 'FabricAppModels'
                 Rows = $Models
-                Headers = @('AppWorkspaceId', 'AppWorkspaceName', 'AppId', 'AppName', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelId', 'ModelName', 'Evidence')
-                Exclude = @()
+                Headers = @('AppWorkspaceId', 'AppWorkspaceName', 'AppId', 'AppName', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelId', 'ModelName', 'Evidence', 'ModelNameSource', 'ModelNameStatus', 'ModelWorkspaceNameStatus')
             },
             @{
                 Name = 'FabricApps'
                 Rows = $appRows
                 Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName')
-                Exclude = @()
             }
         )) {
             if ($definition.Rows.Count -gt 1048575) { throw 'App query export exceeds the Excel row limit.' }
@@ -4889,7 +4887,6 @@ function Export-FabricAppQueryWorkbook {
             foreach ($header in $definition.Headers) { $headers.Add($header) }
             foreach ($record in $definition.Rows) {
                 foreach ($property in $record.PSObject.Properties.Name) {
-                    if ($property -in (@('CatalogPath', 'OutputFolder') + @($definition.Exclude))) { continue }
                     if (-not $headers.Contains($property)) { $headers.Add($property) }
                 }
             }
@@ -4945,16 +4942,15 @@ function Export-FabricAppDaxEnvironment {
     $appQueryRows = @()
     $appModelRows = @()
     $appQueryCaptures = @()
+    $modelNameCache = @{}
     $appDaxRuntime = @{}
     $appDaxReady = $true
     if ($appItems.Count -eq 0) {
-        Write-Host '[WARN] No AppBackend items found in the selected workspaces. FabricAppQueries will contain headers only.' -ForegroundColor Yellow
     }
     if ($appItems.Count -gt 0 -and $Environment -eq 'Public') {
         try { $appDaxRuntime = Initialize-FabricAppDaxParser -Engine $ParserEngine -ErrorAction Stop }
         catch {
             $appDaxReady = $false
-            Write-Host "[WARN] App query parser initialization failed ($ParserEngine). Only Acorn mode requires Node.js/npm." -ForegroundColor Yellow
         }
     }
     foreach ($appItem in $appItems) {
@@ -4965,31 +4961,28 @@ function Export-FabricAppDaxEnvironment {
                 AppId = $appItem.FabricItemID
                 AppName = $appItem.FabricItemName
             }
-            Write-Host "[ERROR] App query extraction failed for $($appItem.WorkspaceName) ~ $($appItem.FabricItemName): parser initialization failed ($ParserEngine)." -ForegroundColor Red
             continue
         }
         Write-Host "[INFO] Extracting Fabric app queries: $($appItem.WorkspaceName) ~ $($appItem.FabricItemName)"
-        $appCapture = Get-FabricAppDaxCapture -WorkspaceId $appItem.WorkspaceId -WorkspaceName $appItem.WorkspaceName -AppId $appItem.FabricItemID -AppName $appItem.FabricItemName -ParserRuntime $appDaxRuntime -Environment $Environment -Datasets $Datasets -Workspaces $Workspaces
+        $appCapture = Get-FabricAppDaxCapture -WorkspaceId $appItem.WorkspaceId -WorkspaceName $appItem.WorkspaceName -AppId $appItem.FabricItemID -AppName $appItem.FabricItemName -ParserRuntime $appDaxRuntime -Environment $Environment -ModelNameCache $modelNameCache
         $appQueryRows += @($appCapture.Queries)
         $appModelRows += @($appCapture.Models)
         $appQueryCaptures += $appCapture.Capture
     }
     Export-FabricAppQueryWorkbook -Path $environmentWorkbook -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ErrorAction Stop
-    Write-Host "[INFO] Exported $($appQueryRows.Count) queries and $($appModelRows.Count) configured models to $environmentWorkbook. Query text is in FabricAppQueries; model configuration is in FabricAppModels."
+    Write-Host "[INFO] Exported $($appQueryRows.Count) queries and $($appModelRows.Count) configured models to $environmentWorkbook."
 }
 
 $EnableFabricAppDax = $true
 $FabricAppDaxParser = 'PowerShell'
 if ($EnableFabricAppDax) {
     try {
-        Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ErrorAction Stop
+        Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -ParserEngine $FabricAppDaxParser -ErrorAction Stop
     }
     catch {
-        Write-Host '[WARN] Final app query export failed. Check prerequisites and close Power BI Environment Detail.xlsx before rerunning. Earlier exports are retained; app queries are not backed up separately.' -ForegroundColor Yellow
     }
 }
 else {
-    Write-Host '[INFO] App query export is disabled. Set $EnableFabricAppDax = $true in the final section to include FabricApps and FabricAppQueries.'
 }
 
 Write-Output "All Excel files processed and combined successfully."
@@ -4997,4 +4990,4 @@ Write-Output "All Excel files processed and combined successfully."
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
-
+ 

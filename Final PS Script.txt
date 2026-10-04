@@ -4629,6 +4629,31 @@ function Get-FabricAppDaxCapture {
         $mwc = (Invoke-FabricAppDaxRequest -Uri ($cluster.GetLeftPart([UriPartial]::Authority) + '/metadata/v201606/generatemwctokenv2') -Method POST -Headers $headers -Body $claims).Content | ConvertFrom-Json
         if (-not $mwc.Token -or $mwc.TargetUriHost -ne $workload.DnsSafeHost) { throw 'Workload token target mismatch.' }
 
+        $headers = @{ Authorization = ('MwcToken ' + $mwc.Token); 'x-ms-workload-resource-moniker' = $AppId.ToString() }
+        $runtimeSettings = $null
+        try {
+            $runtimeSettings = (Invoke-FabricAppDaxRequest -Uri ($workload.AbsoluteUri.TrimEnd('/') + '/api/projectRuntimeSettings') -Headers $headers).Content | ConvertFrom-Json
+            foreach ($connector in $runtimeSettings.serviceSettings.connectors.PSObject.Properties) {
+                if ($connector.Value.connector -cne 'fabric-semanticmodel') { continue }
+                $modelGuid = [guid]::Empty
+                $modelWorkspaceGuid = [guid]::Empty
+                if (-not [guid]::TryParse([string]$connector.Value.config.itemId, [ref]$modelGuid) -or
+                    -not [guid]::TryParse([string]$connector.Value.config.workspaceId, [ref]$modelWorkspaceGuid) -or
+                    $modelGuid -eq [guid]::Empty -or $modelWorkspaceGuid -eq [guid]::Empty) {
+                    continue
+                }
+                $modelMappings.Add([PSCustomObject]@{
+                    connectionAlias = $connector.Name
+                    modelId = $modelGuid.ToString()
+                    modelWorkspaceId = $modelWorkspaceGuid.ToString()
+                    evidence = 'BackendConnectorConfiguration'
+                })
+            }
+        }
+        catch {
+        }
+        finally { $runtimeSettings = $null }
+
         $stage = 'Hosting authentication'
         $random = [Security.Cryptography.RandomNumberGenerator]::Create()
         $sha = [Security.Cryptography.SHA256]::Create()
@@ -4692,7 +4717,12 @@ function Get-FabricAppDaxCapture {
                     if ($LASTEXITCODE -ne 0) { throw 'JavaScript parsing failed.' }
                     $catalog = Get-Content -LiteralPath (Join-Path $assetFolder 'queries.json') -Raw | ConvertFrom-Json
                 }
-                foreach ($mapping in $catalog.modelMappings) { $modelMappings.Add($mapping) }
+                foreach ($mapping in $catalog.modelMappings) {
+                    $backendMappings = @($modelMappings | Where-Object {
+                        $_.evidence -eq 'BackendConnectorConfiguration' -and $_.connectionAlias -ceq $mapping.connectionAlias
+                    })
+                    if ($backendMappings.Count -eq 0) { $modelMappings.Add($mapping) }
+                }
                 foreach ($row in @(ConvertTo-FabricAppQueryRows -Catalog $catalog -WorkspaceId $WorkspaceId -WorkspaceName $WorkspaceName -AppId $AppId -AppName $AppName -SourceUrl $asset.AbsoluteUri)) {
                     $queries.Add($row)
                 }
@@ -4745,7 +4775,9 @@ function Get-FabricAppDaxCapture {
                 ModelWorkspaceNameStatus = $mapping.modelWorkspaceNameStatus
             }
         })
-    if ($queries.Count -gt 0 -or $models.Count -eq 0) { $captureError = '' }
+    if (-not $captureError -and $models.Count -eq 0) {
+        $captureError = 'No semantic-model targets were discovered in backend connector settings or app scripts; query model fields remain blank.'
+    }
     if ($captureError) {
     }
     else {
@@ -4990,4 +5022,3 @@ Write-Output "All Excel files processed and combined successfully."
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
- 

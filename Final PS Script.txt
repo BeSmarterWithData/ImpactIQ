@@ -3998,6 +3998,55 @@ function Get-FabricAppDaxSource {
             Parameters = $parameters.ToArray()
         })
     }
+    for ($tokenIndex = 0; $tokenIndex -lt $tokens.Count - 6; $tokenIndex++) {
+        if ($tokens[$tokenIndex].Kind -ne 'word' -or $tokens[$tokenIndex + 1].Value -ne '=') { continue }
+        $parameterOpen = $tokenIndex + 2
+        if ($tokens[$parameterOpen].Value -ne '(') { continue }
+        $parenthesisDepth = 0
+        $parameterClose = -1
+        for ($index = $parameterOpen; $index -lt $tokens.Count; $index++) {
+            if ($tokens[$index].Value -eq '(') { $parenthesisDepth++ }
+            elseif ($tokens[$index].Value -eq ')') {
+                $parenthesisDepth--
+                if ($parenthesisDepth -eq 0) { $parameterClose = $index; break }
+            }
+        }
+        if ($parameterClose -lt 0 -or $parameterClose + 2 -ge $tokens.Count -or
+            $tokens[$parameterClose + 1].Value -ne '=>') {
+            continue
+        }
+        $bodyOpen = $parameterClose + 2
+        $openingToken = $tokens[$bodyOpen].Value
+        $closingToken = switch ($openingToken) {
+            '(' { ')' }
+            '{' { '}' }
+            '[' { ']' }
+            default { $null }
+        }
+        if (-not $closingToken) { continue }
+        $bodyDepth = 0
+        $bodyClose = -1
+        for ($index = $bodyOpen; $index -lt $tokens.Count; $index++) {
+            if ($tokens[$index].Value -eq $openingToken) { $bodyDepth++ }
+            elseif ($tokens[$index].Value -eq $closingToken) {
+                $bodyDepth--
+                if ($bodyDepth -eq 0) { $bodyClose = $index; break }
+            }
+        }
+        if ($bodyClose -lt 0) { continue }
+        $parameters = [Collections.Generic.List[string]]::new()
+        for ($index = $parameterOpen + 1; $index -lt $parameterClose; $index++) {
+            if ($tokens[$index].Kind -eq 'word') { $parameters.Add($tokens[$index].Value) }
+        }
+        $functionRanges.Add([PSCustomObject]@{
+            Name = $tokens[$tokenIndex].Value
+            Start = $tokens[$tokenIndex].Start
+            End = $tokens[$bodyClose].End
+            OpenIndex = $bodyOpen
+            CloseIndex = $bodyClose
+            Parameters = $parameters.ToArray()
+        })
+    }
 
     function Get-AppDaxFunctionAt([int]$Position) {
         $match = $null
@@ -4120,19 +4169,25 @@ function Get-FabricAppDaxSource {
     }
 
     $wrapperParameterRoutes = @{}
+    $parameterizedModelRoutes = @{}
     foreach ($range in $functionRanges) {
         $dependencies = Get-AppDaxDependencies $range
         for ($index = $range.OpenIndex + 1; $index -lt $range.CloseIndex - 5; $index++) {
             $alias = $null
+            $aliasParameterIndex = -1
             $queryStart = $queryEnd = -1
-            if ($tokens[$index].Value -eq 'connection' -and $tokens[$index + 1].Value -eq ':') {
-                $alias = Resolve-AppDaxAlias $tokens[$index + 2]
-                if ($alias) {
-                    for ($propertyIndex = $index + 3; $propertyIndex -lt [Math]::Min($range.CloseIndex, $index + 40); $propertyIndex++) {
-                        if ($tokens[$propertyIndex].Value -eq 'query' -and $tokens[$propertyIndex + 1].Value -eq ':') {
-                            $queryStart = $propertyIndex + 2
-                            break
-                        }
+            if ($tokens[$index].Value -in @('connection', 'model') -and $tokens[$index + 1].Value -eq ':') {
+                $routeProperty = $tokens[$index].Value
+                $aliasToken = $tokens[$index + 2]
+                $alias = Resolve-AppDaxAlias $aliasToken
+                if (-not $alias -and $routeProperty -eq 'model' -and $aliasToken.Kind -eq 'word') {
+                    $aliasParameterIndex = [Array]::IndexOf([string[]]$range.Parameters, [string]$aliasToken.Value)
+                }
+                $queryProperty = if ($routeProperty -eq 'model') { 'dax' } else { 'query' }
+                for ($propertyIndex = $index + 3; $propertyIndex -lt [Math]::Min($range.CloseIndex, $index + 40); $propertyIndex++) {
+                    if ($tokens[$propertyIndex].Value -eq $queryProperty -and $tokens[$propertyIndex + 1].Value -eq ':') {
+                        $queryStart = $propertyIndex + 2
+                        break
                     }
                 }
             }
@@ -4143,7 +4198,7 @@ function Get-FabricAppDaxSource {
                     $queryStart = $index + 7
                 }
             }
-            if (-not $alias -or $queryStart -lt 0) { continue }
+            if ((-not $alias -and $aliasParameterIndex -lt 0) -or $queryStart -lt 0) { continue }
             $roundDepth = $squareDepth = $curlyDepth = 0
             $queryEnd = $queryStart
             while ($queryEnd -lt $range.CloseIndex) {
@@ -4163,12 +4218,74 @@ function Get-FabricAppDaxSource {
                 if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0 -and $value -eq ',') { break }
                 $queryEnd++
             }
-            Add-AppDaxExpressionRoute $alias $queryStart $queryEnd $range
-            if ($queryEnd -eq $queryStart + 1 -and $tokens[$queryStart].Kind -eq 'word') {
+            if ($alias) {
+                Add-AppDaxExpressionRoute $alias $queryStart $queryEnd $range
+            }
+            else {
+                if (-not $parameterizedModelRoutes.ContainsKey($range.Name)) {
+                    $parameterizedModelRoutes[$range.Name] = [Collections.Generic.List[object]]::new()
+                }
+                $parameterizedModelRoutes[$range.Name].Add([PSCustomObject]@{
+                    ParameterIndex = $aliasParameterIndex
+                    QueryStart = $queryStart
+                    QueryEnd = $queryEnd
+                    QueryParameterIndex = $(if ($queryEnd -eq $queryStart + 1 -and $tokens[$queryStart].Kind -eq 'word') {
+                        [Array]::IndexOf([string[]]$range.Parameters, [string]$tokens[$queryStart].Value)
+                    } else { -1 })
+                    Range = $range
+                })
+            }
+            if ($alias -and $queryEnd -eq $queryStart + 1 -and $tokens[$queryStart].Kind -eq 'word') {
                 $parameterIndex = [Array]::IndexOf([string[]]$range.Parameters, [string]$tokens[$queryStart].Value)
                 if ($parameterIndex -ge 0) {
                     if (-not $wrapperParameterRoutes.ContainsKey($range.Name)) { $wrapperParameterRoutes[$range.Name] = @{} }
                     $wrapperParameterRoutes[$range.Name][$parameterIndex] = $alias
+                }
+            }
+        }
+    }
+
+    foreach ($wrapperName in $parameterizedModelRoutes.Keys) {
+        for ($index = 0; $index -lt $tokens.Count - 2; $index++) {
+            if ($tokens[$index].Value -ne $wrapperName -or $tokens[$index + 1].Value -ne '(' -or
+                ($index -gt 0 -and $tokens[$index - 1].Value -eq 'function')) {
+                continue
+            }
+            $arguments = [Collections.Generic.List[object]]::new()
+            $argumentStart = $index + 2
+            $roundDepth = $squareDepth = $curlyDepth = 0
+            for ($cursor = $argumentStart; $cursor -lt $tokens.Count; $cursor++) {
+                $value = $tokens[$cursor].Value
+                if ($value -eq '(') { $roundDepth++ }
+                elseif ($value -eq ')') {
+                    if ($roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0) {
+                        $arguments.Add([PSCustomObject]@{ Start = $argumentStart; End = $cursor })
+                        break
+                    }
+                    else { $roundDepth-- }
+                }
+                elseif ($value -eq '[') { $squareDepth++ }
+                elseif ($value -eq ']') { $squareDepth-- }
+                elseif ($value -eq '{') { $curlyDepth++ }
+                elseif ($value -eq '}') { $curlyDepth-- }
+                elseif ($value -eq ',' -and $roundDepth -eq 0 -and $squareDepth -eq 0 -and $curlyDepth -eq 0) {
+                    $arguments.Add([PSCustomObject]@{ Start = $argumentStart; End = $cursor })
+                    $argumentStart = $cursor + 1
+                }
+            }
+            $callerRange = Get-AppDaxFunctionAt $tokens[$index].Start
+            foreach ($route in $parameterizedModelRoutes[$wrapperName]) {
+                if ($route.ParameterIndex -ge $arguments.Count) { continue }
+                $aliasArgument = $arguments[$route.ParameterIndex]
+                if ($aliasArgument.End -ne $aliasArgument.Start + 1) { continue }
+                $alias = Resolve-AppDaxAlias $tokens[$aliasArgument.Start]
+                if (-not $alias) { continue }
+                if ($route.QueryParameterIndex -ge 0 -and $route.QueryParameterIndex -lt $arguments.Count) {
+                    $queryArgument = $arguments[$route.QueryParameterIndex]
+                    Add-AppDaxExpressionRoute $alias $queryArgument.Start $queryArgument.End $callerRange
+                }
+                else {
+                    Add-AppDaxExpressionRoute $alias $route.QueryStart $route.QueryEnd $route.Range
                 }
             }
         }
@@ -4212,19 +4329,37 @@ function Get-FabricAppDaxSource {
     }
 
     foreach ($query in $orderedQueries) {
-        if ($queryAliases[[string]$query.start].Count -eq 0) {
-            $owner = $queryOwnerByStart[[string]$query.start]
-            if ($owner -and $owner -notlike 'query_*') {
-                $ownerPattern = '(?<![\w$])' + [regex]::Escape($owner) + '(?![\w$])'
-                foreach ($ownerMatch in [regex]::Matches($Source, $ownerPattern)) {
-                    $contextStart = [Math]::Max(0, $ownerMatch.Index - 700)
-                    $contextLength = [Math]::Min($Source.Length - $contextStart, 1400)
-                    $context = $Source.Substring($contextStart, $contextLength)
-                    foreach ($routeMatch in [regex]::Matches($context, '(?:connection\s*:\s*|semanticModel\s*\(\s*)(?<route>["'']?[a-zA-Z_$][\w$]*["'']?)')) {
-                        $route = $routeMatch.Groups['route'].Value.Trim("'", '"')
-                        if ($aliasVariables.ContainsKey($route)) { $route = $aliasVariables[$route] }
-                        if ($route -match '^[a-zA-Z_$][\w$]*$') { $null = $queryAliases[[string]$query.start].Add($route) }
-                    }
+        $queryPrefixStart = [Math]::Max(0, $query.start - 500)
+        $queryPrefix = $Source.Substring($queryPrefixStart, $query.start - $queryPrefixStart)
+        $modelObjectMatches = [regex]::Matches($queryPrefix, 'model\s*:\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,\s*dax\s*:\s*$')
+        if ($modelObjectMatches.Count -gt 0) {
+            $null = $queryAliases[[string]$query.start].Add(
+                $modelObjectMatches[$modelObjectMatches.Count - 1].Groups['route'].Value
+            )
+        }
+        $wrapperMatches = [regex]::Matches($queryPrefix, '(?<![\w$])[a-zA-Z_$][\w$]*\s*\(\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,')
+        if ($wrapperMatches.Count -gt 0) {
+            $null = $queryAliases[[string]$query.start].Add(
+                $wrapperMatches[$wrapperMatches.Count - 1].Groups['route'].Value
+            )
+        }
+        $owner = $queryOwnerByStart[[string]$query.start]
+        if ($owner -and $owner -notlike 'query_*') {
+            $ownerPattern = '(?<![\w$])' + [regex]::Escape($owner) + '(?![\w$])'
+            foreach ($callMatch in [regex]::Matches($Source, $ownerPattern + '\s*\(\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,')) {
+                $null = $queryAliases[[string]$query.start].Add($callMatch.Groups['route'].Value)
+            }
+            foreach ($ownerCall in [regex]::Matches($Source, $ownerPattern + '\s*\(')) {
+                $assignmentStart = [Math]::Max(0, $ownerCall.Index - 600)
+                $assignmentPrefix = $Source.Substring($assignmentStart, $ownerCall.Index - $assignmentStart)
+                $assignmentMatches = [regex]::Matches($assignmentPrefix, '(?<symbol>[a-zA-Z_$][\w$]*)\s*=')
+                if ($assignmentMatches.Count -eq 0) { continue }
+                $symbol = $assignmentMatches[$assignmentMatches.Count - 1].Groups['symbol'].Value
+                $symbolPattern = [regex]::Escape($symbol)
+                $routePattern = 'connection\s*:\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,\s*query\s*:\s*' +
+                    $symbolPattern + '(?![\w$])'
+                foreach ($routeMatch in [regex]::Matches($Source, $routePattern)) {
+                    $null = $queryAliases[[string]$query.start].Add($routeMatch.Groups['route'].Value)
                 }
             }
         }
@@ -4493,8 +4628,26 @@ function Resolve-FabricAppModelNames {
     param(
         [AllowEmptyCollection()][object[]]$Mappings = @(),
         [hashtable]$Cache = @{},
-        [string]$Environment = 'Public'
+        [string]$Environment = 'Public',
+        [AllowEmptyCollection()][object[]]$Datasets = @(),
+        [AllowEmptyCollection()][object[]]$Workspaces = @()
     )
+
+    $datasetLookup = @{}
+    foreach ($dataset in $Datasets) {
+        $datasetId = [string]$dataset.DatasetId
+        $datasetWorkspaceId = [string]$dataset.WorkspaceId
+        if ($datasetId -and $datasetWorkspaceId -and $dataset.DatasetName) {
+            $datasetLookup["$datasetWorkspaceId/$datasetId"] = [string]$dataset.DatasetName
+        }
+    }
+    $workspaceLookup = @{}
+    foreach ($workspace in $Workspaces) {
+        $workspaceId = [string]$workspace.WorkspaceId
+        if ($workspaceId -and $workspace.WorkspaceName) {
+            $workspaceLookup[$workspaceId] = [string]$workspace.WorkspaceName
+        }
+    }
 
     $headers = $null
     try {
@@ -4511,11 +4664,26 @@ function Resolve-FabricAppModelNames {
                 modelName = ''
                 modelWorkspaceName = ''
             }
+            if ($validIds) {
+                $workspaceId = $workspaceGuid.ToString()
+                $modelId = $modelGuid.ToString()
+                if ($workspaceLookup.ContainsKey($workspaceId)) {
+                    $result.modelWorkspaceName = $workspaceLookup[$workspaceId]
+                }
+                $datasetKey = "$workspaceId/$modelId"
+                if ($datasetLookup.ContainsKey($datasetKey)) {
+                    $result.modelName = $datasetLookup[$datasetKey]
+                }
+            }
             if ($Environment -ne 'Public' -or -not $validIds) {
                 [PSCustomObject]$result
                 continue
             }
             foreach ($kind in @('Workspace', 'Model')) {
+                if (($kind -eq 'Workspace' -and $result.modelWorkspaceName) -or
+                    ($kind -eq 'Model' -and $result.modelName)) {
+                    continue
+                }
                 $key = if ($kind -eq 'Workspace') { "Workspace/$workspaceGuid" } else { "Model/$workspaceGuid/$modelGuid" }
                 if (-not $Cache.ContainsKey($key)) {
                     $entry = @{ Name = '' }
@@ -4533,7 +4701,9 @@ function Resolve-FabricAppModelNames {
                             $entry.Name = [string]$metadata.displayName
                         }
                     }
-                    catch {}
+                    catch {
+                        Write-Warning "Could not resolve Fabric app $kind name for workspace $workspaceGuid and model $modelGuid. $($_.Exception.Message)"
+                    }
                     $Cache[$key] = $entry
                 }
                 $entry = $Cache[$key]
@@ -4746,8 +4916,36 @@ function Get-FabricAppDaxCapture {
     $configuredModels = @($modelMappings |
         Where-Object { $_.connectionAlias -and $_.modelId -and $_.modelWorkspaceId } |
         Select-Object connectionAlias, modelId, modelWorkspaceId, evidence -Unique)
-    $configuredModels = @(Resolve-FabricAppModelNames -Mappings $configuredModels -Cache $ModelNameCache -Environment $Environment)
-    Set-FabricAppQueryModelMapping -Queries $queries.ToArray() -Mappings $configuredModels
+    $configuredModels = @(Resolve-FabricAppModelNames -Mappings $configuredModels -Cache $ModelNameCache -Environment $Environment -Datasets $Datasets -Workspaces $Workspaces)
+    $configuredAliases = @($configuredModels.connectionAlias | Select-Object -Unique)
+    $queryRows = @($queries.ToArray())
+    if ($configuredAliases.Count -gt 0) {
+        $queryRows = @($queryRows |
+            Group-Object {
+                $text = @($_.PSObject.Properties |
+                    Where-Object { $_.Name -match '^QueryText(\d+)?$' } |
+                    Sort-Object {
+                        if ($_.Name -eq 'QueryText') { 1 }
+                        else { [int]$_.Name.Substring(9) }
+                    } |
+                    ForEach-Object { [string]$_.Value }) -join ''
+                ([string]$_.SourceUrl) + [char]0 + ([string]$_.QuerySymbol) + [char]0 + $text
+            } |
+            ForEach-Object {
+                $validRows = @($_.Group | Where-Object {
+                    $_.ConnectionAlias -and $configuredAliases -ccontains $_.ConnectionAlias
+                })
+                if ($validRows.Count -gt 0) {
+                    $validRows
+                }
+                else {
+                    $row = $_.Group[0]
+                    $row.ConnectionAlias = ''
+                    $row
+                }
+            })
+    }
+    Set-FabricAppQueryModelMapping -Queries $queryRows -Mappings $configuredModels
     $models = @($configuredModels |
         ForEach-Object {
             $mapping = $_
@@ -4772,7 +4970,7 @@ function Get-FabricAppDaxCapture {
     else {
         Write-Host "App query extraction completed for $WorkspaceName ~ $AppName"
     }
-    [PSCustomObject]@{ Queries = $queries.ToArray(); Models = $models; Capture = $capture }
+    [PSCustomObject]@{ Queries = $queryRows; Models = $models; Capture = $capture }
 }
 
 function Set-FabricAppQueryModelMapping {
@@ -4803,11 +5001,16 @@ function Set-FabricAppQueryModelMapping {
             $modelName = [string]$mapping.modelName
             $modelWorkspaceName = [string]$mapping.modelWorkspaceName
         }
+        $mappingEvidence = ''
+        if ($mapping) {
+            $mappingEvidence = if ($query.ConnectionAlias) { 'ConnectionAlias' } else { 'SingleConfiguredModel' }
+        }
         $query.ConnectionAlias = if ($mapping) { $mapping.connectionAlias } else { $query.ConnectionAlias }
         $query.ModelId = if ($mapping) { $mapping.modelId } else { '' }
         $query.ModelName = $modelName
         $query.ModelWorkspaceId = if ($mapping) { $mapping.modelWorkspaceId } else { '' }
         $query.ModelWorkspaceName = $modelWorkspaceName
+        $query | Add-Member -NotePropertyName ModelMappingEvidence -NotePropertyValue $mappingEvidence -Force
     }
 }
 
@@ -4825,38 +5028,42 @@ function ConvertTo-FabricAppQueryRows {
 
     foreach ($query in $Catalog.queries) {
         $connectionAliases = @($query.connectionAliases | Where-Object { $_ } | Select-Object -Unique)
-        $record = [ordered]@{
-            WorkspaceId = $WorkspaceId
-            WorkspaceName = $WorkspaceName
-            AppId = $AppId
-            AppName = $AppName
-            QuerySymbol = $query.symbol
-            Evidence = $query.evidence
-            QueryText = ''
-            SourceUrl = $SourceUrl
-            ConnectionAlias = $(if ($connectionAliases.Count -eq 1) { $connectionAliases[0] } else { '' })
-            ModelId = ''
-            ModelName = ''
-            ModelWorkspaceId = ''
-            ModelWorkspaceName = ''
-        }
-        $text = [string]$query.text
-        $offset = 0
-        $part = 1
-        while ($offset -lt $text.Length) {
-            $length = [Math]::Min(32000, $text.Length - $offset)
-            $nextOffset = $offset + $length
-            if ($nextOffset -lt $text.Length -and
-                [char]::IsHighSurrogate($text[$nextOffset - 1]) -and
-                [char]::IsLowSurrogate($text[$nextOffset])) {
-                $length--
+        $aliasesForRows = if ($connectionAliases.Count -gt 0) { $connectionAliases } else { @('') }
+        foreach ($connectionAlias in $aliasesForRows) {
+            $record = [ordered]@{
+                WorkspaceId = $WorkspaceId
+                WorkspaceName = $WorkspaceName
+                AppId = $AppId
+                AppName = $AppName
+                QuerySymbol = $query.symbol
+                Evidence = $query.evidence
+                QueryText = ''
+                SourceUrl = $SourceUrl
+                ConnectionAlias = $connectionAlias
+                ModelId = ''
+                ModelName = ''
+                ModelWorkspaceId = ''
+                ModelWorkspaceName = ''
+                ModelMappingEvidence = ''
             }
-            $column = if ($part -eq 1) { 'QueryText' } else { "QueryText$part" }
-            $record[$column] = $text.Substring($offset, $length)
-            $offset += $length
-            $part++
+            $text = [string]$query.text
+            $offset = 0
+            $part = 1
+            while ($offset -lt $text.Length) {
+                $length = [Math]::Min(32000, $text.Length - $offset)
+                $nextOffset = $offset + $length
+                if ($nextOffset -lt $text.Length -and
+                    [char]::IsHighSurrogate($text[$nextOffset - 1]) -and
+                    [char]::IsLowSurrogate($text[$nextOffset])) {
+                    $length--
+                }
+                $column = if ($part -eq 1) { 'QueryText' } else { "QueryText$part" }
+                $record[$column] = $text.Substring($offset, $length)
+                $offset += $length
+                $part++
+            }
+            [PSCustomObject]$record
         }
-        [PSCustomObject]$record
     }
 }
 
@@ -4884,7 +5091,7 @@ function Export-FabricAppQueryWorkbook {
             @{
                 Name = 'FabricAppQueries'
                 Rows = $Queries
-                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName')
+                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelMappingEvidence')
             },
             @{
                 Name = 'FabricAppModels'
@@ -4982,7 +5189,7 @@ function Export-FabricAppDaxEnvironment {
             continue
         }
         Write-Host "[INFO] Extracting Fabric app queries: $($appItem.WorkspaceName) ~ $($appItem.FabricItemName)"
-        $appCapture = Get-FabricAppDaxCapture -WorkspaceId $appItem.WorkspaceId -WorkspaceName $appItem.WorkspaceName -AppId $appItem.FabricItemID -AppName $appItem.FabricItemName -ParserRuntime $appDaxRuntime -Environment $Environment -ModelNameCache $modelNameCache
+        $appCapture = Get-FabricAppDaxCapture -WorkspaceId $appItem.WorkspaceId -WorkspaceName $appItem.WorkspaceName -AppId $appItem.FabricItemID -AppName $appItem.FabricItemName -ParserRuntime $appDaxRuntime -Environment $Environment -Datasets $Datasets -Workspaces $Workspaces -ModelNameCache $modelNameCache
         $appQueryRows += @($appCapture.Queries)
         $appModelRows += @($appCapture.Models)
         $appQueryCaptures += $appCapture.Capture
@@ -4995,7 +5202,7 @@ $EnableFabricAppDax = $true
 $FabricAppDaxParser = 'PowerShell'
 if ($EnableFabricAppDax) {
     try {
-        Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -ParserEngine $FabricAppDaxParser -ErrorAction Stop
+        Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ErrorAction Stop
     }
     catch {
     }

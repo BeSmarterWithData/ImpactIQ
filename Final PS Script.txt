@@ -3995,6 +3995,7 @@ function Get-FabricAppDaxSource {
             End = $tokens[$closeBrace].End
             OpenIndex = $openBrace
             CloseIndex = $closeBrace
+            ParameterOpen = $openParenthesis
             Parameters = $parameters.ToArray()
         })
     }
@@ -4044,6 +4045,7 @@ function Get-FabricAppDaxSource {
             End = $tokens[$bodyClose].End
             OpenIndex = $bodyOpen
             CloseIndex = $bodyClose
+            ParameterOpen = $parameterOpen
             Parameters = $parameters.ToArray()
         })
     }
@@ -4327,6 +4329,282 @@ function Get-FabricAppDaxSource {
             }
         }
     }
+
+    function Add-AppDaxConnectionRoutes {
+        # Track query and connection parameters together through Rayfin hooks,
+        # including declared defaults and explicit per-call overrides.
+        $routeFunctions = @{}
+        $routeParents = @{}
+        $routeParameters = @{}
+        $routeSummaries = @{}
+        $routeDeclarations = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        $routeBuilders = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        $routeBuilderQueries = @{}
+        $routeScopeCache = @{}
+
+        function Get-AppRouteScope([int]$Position) {
+            if (-not $routeScopeCache.ContainsKey($Position)) {
+                $owner = Get-AppDaxFunctionAt $Position
+                $routeScopeCache[$Position] = if ($owner) { [string]$owner.Start } else { '-1' }
+            }
+            $routeScopeCache[$Position]
+        }
+
+        function Get-AppRouteArguments([int]$Opening) {
+            $argumentStart = $Opening + 1
+            $round = $square = $curly = 0
+            for ($cursor = $argumentStart; $cursor -lt $tokens.Count; $cursor++) {
+                $value = $tokens[$cursor].Value
+                if ($value -eq '(') { $round++ }
+                elseif ($value -eq ')') {
+                    if ($round -eq 0 -and $square -eq 0 -and $curly -eq 0) {
+                        [PSCustomObject]@{ Start = $argumentStart; End = $cursor }
+                        return
+                    }
+                    $round--
+                }
+                elseif ($value -eq '[') { $square++ }
+                elseif ($value -eq ']') { $square-- }
+                elseif ($value -eq '{') { $curly++ }
+                elseif ($value -eq '}') { $curly-- }
+                elseif ($value -eq ',' -and $round -eq 0 -and $square -eq 0 -and $curly -eq 0) {
+                    [PSCustomObject]@{ Start = $argumentStart; End = $cursor }
+                    $argumentStart = $cursor + 1
+                }
+            }
+        }
+
+        function Get-AppRouteValueEnd([int]$Start) {
+            $depth = 0
+            for ($cursor = $Start; $cursor -lt $tokens.Count; $cursor++) {
+                if ($tokens[$cursor].Kind -ne 'punct') { continue }
+                $value = $tokens[$cursor].Value
+                if ($depth -eq 0 -and $value -in @(',', ';', ')', ']', '}')) { return $cursor }
+                if ($value -in @('(', '[', '{')) { $depth++ }
+                elseif ($value -in @(')', ']', '}')) { $depth-- }
+            }
+            $tokens.Count
+        }
+
+        foreach ($function in $functionRanges) {
+            $key = [string]$function.Start
+            $routeFunctions[$key] = $function
+            $container = $null
+            foreach ($candidate in $functionRanges) {
+                if ($candidate.Start -lt $function.Start -and $function.End -le $candidate.End -and
+                    ($null -eq $container -or ($candidate.End - $candidate.Start) -lt ($container.End - $container.Start))) {
+                    $container = $candidate
+                }
+            }
+            $parent = if ($container) { [string]$container.Start } else { '-1' }
+            $routeParents[$key] = $parent
+            $builderKey = $parent + [char]0 + $function.Name
+            if (-not $routeBuilders.ContainsKey($builderKey)) {
+                $routeBuilders[$builderKey] = [Collections.Generic.List[string]]::new()
+            }
+            $routeBuilders[$builderKey].Add($key)
+            $parameters = [Collections.Generic.List[object]]::new()
+            $supported = $true
+            foreach ($argument in @(Get-AppRouteArguments $function.ParameterOpen)) {
+                if ($argument.Start -eq $argument.End) { continue }
+                if ($tokens[$argument.Start].Kind -ne 'word' -or
+                    ($argument.End -gt $argument.Start + 1 -and $tokens[$argument.Start + 1].Value -ne '=')) {
+                    $supported = $false
+                    break
+                }
+                $default = if ($argument.End -gt $argument.Start + 1) {
+                    [PSCustomObject]@{ Start = $argument.Start + 2; End = $argument.End }
+                } else { $null }
+                $parameters.Add([PSCustomObject]@{ Name = $tokens[$argument.Start].Value; Default = $default })
+            }
+            if ($supported) {
+                $routeParameters[$key] = $parameters.ToArray()
+                $routeSummaries[$key] = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            }
+        }
+
+        for ($index = 1; $index -lt $tokens.Count - 2; $index++) {
+            if ($tokens[$index].Kind -ne 'word' -or $tokens[$index + 1].Value -ne '=' -or
+                $tokens[$index - 1].Value -cnotin @('const', 'let', 'var', ',')) { continue }
+            $scope = Get-AppRouteScope $tokens[$index].Start
+            if ($scope -ne '-1' -and $index -lt $routeFunctions[$scope].OpenIndex) { continue }
+            $routeDeclarations[$scope + [char]0 + $tokens[$index].Value] = [PSCustomObject]@{
+                Start = $index + 2
+                End = Get-AppRouteValueEnd ($index + 2)
+            }
+        }
+
+        function Find-AppRouteSymbol([string]$Name, [string]$Scope, $Table) {
+            while ($true) {
+                $key = $Scope + [char]0 + $Name
+                if ($Table.ContainsKey($key)) {
+                    return [PSCustomObject]@{ Scope = $Scope; Value = $Table[$key] }
+                }
+                if ($Scope -eq '-1') { return }
+                $Scope = $routeParents[$Scope]
+            }
+        }
+
+        foreach ($query in $orderedQueries) {
+            $owner = Get-AppRouteScope $query.start
+            if ($owner -eq '-1') { continue }
+            if (-not $routeBuilderQueries.ContainsKey($owner)) {
+                $routeBuilderQueries[$owner] = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            }
+            $null = $routeBuilderQueries[$owner].Add('query|' + $query.start)
+        }
+
+        function Get-AppRouteValues([int]$Start, [int]$End, [string]$Scope, [string]$Kind, $Seen) {
+            if ($Start -ge $End) { return }
+            if ($null -eq $Seen) { $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal) }
+            if ($Kind -eq 'alias') {
+                if ($End -ne $Start + 1) { return }
+                if ($tokens[$Start].Kind -eq 'string') {
+                    if ($tokens[$Start].Value -match '^[a-zA-Z_$][\w$]*$') {
+                        'alias|' + $tokens[$Start].Value
+                    }
+                    return
+                }
+            }
+            $result = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            for ($cursor = $Start; $cursor -lt $End; $cursor++) {
+                $token = $tokens[$cursor]
+                if ($Kind -eq 'query' -and $token.Kind -in @('string', 'template')) {
+                    foreach ($query in $orderedQueries) {
+                        if ($token.Start -le $query.start -and $query.end -le $token.End) {
+                            $null = $result.Add('query|' + $query.start)
+                        }
+                    }
+                }
+                if ($token.Kind -ne 'word' -or
+                    ($cursor -gt $Start -and $tokens[$cursor - 1].Value -in @('.', '?.'))) { continue }
+                $parameterIndex = -1
+                if ($routeParameters.ContainsKey($Scope)) {
+                    for ($p = 0; $p -lt $routeParameters[$Scope].Count; $p++) {
+                        if ($routeParameters[$Scope][$p].Name -ceq $token.Value) { $parameterIndex = $p; break }
+                    }
+                }
+                if ($parameterIndex -ge 0) {
+                    $null = $result.Add('parameter|' + $parameterIndex)
+                    continue
+                }
+                $declaration = Find-AppRouteSymbol $token.Value $Scope $routeDeclarations
+                if ($declaration) {
+                    $key = $declaration.Scope + [char]0 + $token.Value + [char]0 + $Kind
+                    if ($Seen.Add($key)) {
+                        foreach ($value in @(Get-AppRouteValues $declaration.Value.Start $declaration.Value.End $declaration.Scope $Kind $Seen)) {
+                            $null = $result.Add($value)
+                        }
+                        $null = $Seen.Remove($key)
+                    }
+                    continue
+                }
+                if ($Kind -eq 'query' -and $cursor + 1 -lt $End -and $tokens[$cursor + 1].Value -eq '(') {
+                    $builder = Find-AppRouteSymbol $token.Value $Scope $routeBuilders
+                    if ($builder -and $builder.Value.Count -eq 1 -and $routeBuilderQueries.ContainsKey($builder.Value[0])) {
+                        foreach ($value in $routeBuilderQueries[$builder.Value[0]]) { $null = $result.Add($value) }
+                    }
+                }
+            }
+            foreach ($value in $result) { $value }
+        }
+
+        for ($index = 0; $index -lt $tokens.Count - 4; $index++) {
+            if ($tokens[$index].Kind -ne 'punct' -or $tokens[$index].Value -ne '{') { continue }
+            $scope = Get-AppRouteScope $tokens[$index].Start
+            if (-not $routeParameters.ContainsKey($scope)) { continue }
+            $properties = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+            $cursor = $index + 1
+            $closed = $false
+            while ($cursor -lt $tokens.Count) {
+                if ($tokens[$cursor].Value -eq '}') { $closed = $true; break }
+                if ($tokens[$cursor].Kind -notin @('word', 'string')) { break }
+                $name = $tokens[$cursor].Value
+                if ($cursor + 1 -lt $tokens.Count -and $tokens[$cursor + 1].Value -eq ':') {
+                    $start = $cursor + 2
+                    $end = Get-AppRouteValueEnd $start
+                }
+                else { $start = $cursor; $end = $cursor + 1 }
+                if ($properties.ContainsKey($name)) { break }
+                $properties[$name] = [PSCustomObject]@{ Start = $start; End = $end }
+                $cursor = $end
+                if ($cursor -lt $tokens.Count -and $tokens[$cursor].Value -eq ',') { $cursor++ }
+                elseif ($cursor -ge $tokens.Count -or $tokens[$cursor].Value -ne '}') { break }
+            }
+            if (-not $closed -or -not $properties.ContainsKey('connection') -or -not $properties.ContainsKey('query')) { continue }
+            $aliasRange = $properties['connection']
+            $queryRange = $properties['query']
+            $aliases = @(Get-AppRouteValues $aliasRange.Start $aliasRange.End $scope 'alias')
+            $queryValues = @(Get-AppRouteValues $queryRange.Start $queryRange.End $scope 'query')
+            foreach ($alias in $aliases) {
+                if (-not $alias.StartsWith('parameter|')) { continue }
+                foreach ($queryValue in $queryValues) {
+                    $null = $routeSummaries[$scope].Add($alias + [char]0 + $queryValue)
+                }
+            }
+        }
+
+        $calls = [Collections.Generic.List[object]]::new()
+        $wrapperNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        foreach ($key in $routeParameters.Keys) { $null = $wrapperNames.Add($routeFunctions[$key].Name) }
+        for ($index = 0; $index -lt $tokens.Count - 2; $index++) {
+            $token = $tokens[$index]
+            if ($token.Kind -ne 'word' -or -not $wrapperNames.Contains($token.Value) -or
+                $tokens[$index + 1].Value -ne '(' -or
+                ($index -gt 0 -and $tokens[$index - 1].Value -cin @('function', '.', '?.'))) { continue }
+            $scope = Get-AppRouteScope $token.Start
+            $builder = Find-AppRouteSymbol $token.Value $scope $routeBuilders
+            if ($builder -and $builder.Value.Count -eq 1 -and $routeSummaries.ContainsKey($builder.Value[0])) {
+                $calls.Add([PSCustomObject]@{
+                    Caller = $scope
+                    Callee = $builder.Value[0]
+                    Arguments = @(Get-AppRouteArguments ($index + 1))
+                })
+            }
+        }
+
+        function Resolve-AppRouteArgument([string]$Value, $Call, [string]$Kind) {
+            if (-not $Value.StartsWith('parameter|')) { return $Value }
+            $index = [int]$Value.Substring(10)
+            if ($index -lt $Call.Arguments.Count) {
+                $argument = $Call.Arguments[$index]
+                if ($argument.Start -lt $argument.End -and
+                    -not ($argument.End -eq $argument.Start + 1 -and $tokens[$argument.Start].Value -ceq 'undefined')) {
+                    Get-AppRouteValues $argument.Start $argument.End $Call.Caller $Kind
+                    return
+                }
+            }
+            $default = $routeParameters[$Call.Callee][$index].Default
+            if ($null -ne $default) {
+                Get-AppRouteValues $default.Start $default.End $routeParents[$Call.Callee] $Kind
+            }
+        }
+
+        $changed = $true
+        while ($changed) {
+            $changed = $false
+            foreach ($call in $calls) {
+                $routes = @($routeSummaries[$call.Callee] | ForEach-Object { $_ })
+                foreach ($route in $routes) {
+                    $pair = $route.Split([char]0)
+                    $aliases = @(Resolve-AppRouteArgument $pair[0] $call 'alias')
+                    $queryValues = @(Resolve-AppRouteArgument $pair[1] $call 'query')
+                    foreach ($alias in $aliases) {
+                        foreach ($queryValue in $queryValues) {
+                            if ($alias.StartsWith('alias|') -and $queryValue.StartsWith('query|')) {
+                                $null = $queryAliases[$queryValue.Substring(6)].Add($alias.Substring(6))
+                            }
+                            elseif ($routeSummaries.ContainsKey($call.Caller)) {
+                                if ($routeSummaries[$call.Caller].Add($alias + [char]0 + $queryValue)) { $changed = $true }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Add-AppDaxConnectionRoutes
 
     foreach ($query in $orderedQueries) {
         $queryPrefixStart = [Math]::Max(0, $query.start - 500)

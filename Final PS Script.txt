@@ -5275,6 +5275,14 @@ function Get-FabricAppDaxCapture {
     $configuredModels = @(Resolve-FabricAppModelNames -Mappings $configuredModels -Cache $ModelNameCache -Environment $Environment -Datasets $Datasets -Workspaces $Workspaces)
     $configuredAliases = @($configuredModels.connectionAlias | Select-Object -Unique)
     $queryRows = @($queries.ToArray())
+    foreach ($queryRow in $queryRows) {
+        $queryAlias = [string]$queryRow.ConnectionAlias
+        if (-not $queryAlias -or $configuredAliases -ccontains $queryAlias) { continue }
+        $aliasMatches = @($configuredAliases | Where-Object { $_ -ieq $queryAlias })
+        if ($aliasMatches.Count -eq 1) {
+            $queryRow.ConnectionAlias = $aliasMatches[0]
+        }
+    }
     if ($configuredAliases.Count -gt 0) {
         $queryRows = @($queryRows |
             Group-Object {

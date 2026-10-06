@@ -3739,13 +3739,14 @@ function Get-FabricAppDaxSource {
     $tokens = [Collections.Generic.List[object]]::new()
     $queries = [Collections.Generic.List[object]]::new()
     $references = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $state = @{ Position = 0; Depth = 0 }
+    $state = @{ Position = 0; Depth = 0; LexMatch = $null }
     $lex = [regex]::new('\G(?:(?<space>\s+)|(?<comment>//[^\r\n]*|/\*[\s\S]*?\*/)|(?<string>"(?:\\[\s\S]|[^"\\\r\n])*"|''(?:\\[\s\S]|[^''\\\r\n])*'')|(?<word>[a-zA-Z_$][\w$]*)|(?<number>\d+(?:\.\d+)?)|(?<punct>=>|\+\+|--|&&|\|\||\?\?|[^\s]))', 'Compiled')
     $regexLiteral = [regex]::new('\G/(?:\\[^\r\n]|\[(?:\\[^\r\n]|[^\]\\\r\n])*\]|[^/\\\[\r\n])+/[a-z]*', 'Compiled')
     $templateChunk = [regex]::new('\G(?:[^`\\$]+|\\(?:\r\n|[\s\S])|\$(?!\{))+', 'Compiled')
     $escapePattern = [regex]::new('\\(?:\r\n|[\s\S])', 'Compiled')
 
     function ConvertFrom-AppJsString([string]$Text) {
+        if ($Text.IndexOf('\') -lt 0) { return $Text }
         $builder = [Text.StringBuilder]::new()
         $offset = 0
         foreach ($escape in $escapePattern.Matches($Text)) {
@@ -3824,7 +3825,13 @@ function Get-FabricAppDaxSource {
         try {
             while ($state.Position -lt $Source.Length) {
                 $start = $state.Position
-                $match = $lex.Match($Source, $start)
+                # Restart only when template/regex scanning has moved beyond the previous match.
+                $match = if ($null -ne $state.LexMatch -and
+                    $state.LexMatch.Index + $state.LexMatch.Length -eq $start) {
+                    $state.LexMatch.NextMatch()
+                }
+                else { $lex.Match($Source, $start) }
+                $state.LexMatch = $match
                 if (-not $match.Success) { throw 'Could not scan JavaScript token.' }
                 $value = $match.Value
                 $state.Position += $match.Length
@@ -3852,7 +3859,8 @@ function Get-FabricAppDaxSource {
                             $state.Position += $chunk.Length
                         }
                         elseif ($Source[$state.Position] -eq '`') { $state.Position++; $closed = $true; break }
-                        elseif ($Source.Substring($state.Position).StartsWith('${')) {
+                        elseif ($state.Position + 1 -lt $Source.Length -and
+                            $Source[$state.Position] -eq '$' -and $Source[$state.Position + 1] -eq '{') {
                             $state.Position += 2
                             $expressionStart = $state.Position
                             Read-AppJsCode $true
@@ -3929,6 +3937,30 @@ function Get-FabricAppDaxSource {
         catch { }
     }
     $orderedQueries = @($queries | Sort-Object start)
+    $literalTokenByStart = @{}
+    $queriesByToken = @{}
+    for ($tokenIndex = 0; $tokenIndex -lt $tokens.Count; $tokenIndex++) {
+        $token = $tokens[$tokenIndex]
+        if ($token.Kind -notin @('string', 'template')) { continue }
+        if ($tokenIndex -ge 2 -and -not $literalTokenByStart.ContainsKey($token.Start)) {
+            $literalTokenByStart[$token.Start] = $tokenIndex
+        }
+        # Template tokens can contain other query literals and are emitted after their children.
+        $low = 0
+        $high = $orderedQueries.Count
+        while ($low -lt $high) {
+            $middle = $low + (($high - $low) -shr 1)
+            if ($orderedQueries[$middle].start -lt $token.Start) { $low = $middle + 1 }
+            else { $high = $middle }
+        }
+        $contained = [Collections.Generic.List[object]]::new()
+        for ($queryIndex = $low; $queryIndex -lt $orderedQueries.Count; $queryIndex++) {
+            $query = $orderedQueries[$queryIndex]
+            if ($query.start -ge $token.End) { break }
+            if ($query.end -le $token.End) { $contained.Add($query) }
+        }
+        if ($contained.Count) { $queriesByToken[$tokenIndex] = $contained.ToArray() }
+    }
     $line = 1
     $lineStart = 0
     $scanOffset = 0
@@ -4050,15 +4082,52 @@ function Get-FabricAppDaxSource {
         })
     }
 
-    function Get-AppDaxFunctionAt([int]$Position) {
-        $match = $null
-        foreach ($range in $functionRanges) {
-            if ($range.Start -le $Position -and $range.End -ge $Position -and
-                ($null -eq $match -or ($range.End - $range.Start) -lt ($match.End - $match.Start))) {
-                $match = $range
+    $scopeEvents = [Collections.Generic.SortedDictionary[int,object]]::new()
+    $rangesByRank = @{}
+    $functionParents = @{}
+    for ($rangeIndex = 0; $rangeIndex -lt $functionRanges.Count; $rangeIndex++) {
+        $range = $functionRanges[$rangeIndex]
+        # Preserve the original shortest-range rule, including first-match ties and inclusive ends.
+        $rank = [long]($range.End - $range.Start) * ($functionRanges.Count + 1) + $rangeIndex
+        $rangesByRank[$rank] = $range
+        foreach ($position in @([int]$range.Start, [int]($range.End + 1))) {
+            if (-not $scopeEvents.ContainsKey($position)) {
+                $scopeEvents[$position] = @{
+                    Add = [Collections.Generic.List[long]]::new()
+                    Remove = [Collections.Generic.List[long]]::new()
+                }
             }
         }
-        $match
+        $scopeEvents[[int]$range.Start].Add.Add($rank)
+        $scopeEvents[[int]($range.End + 1)].Remove.Add($rank)
+    }
+    $activeRanges = [Collections.Generic.SortedSet[long]]::new()
+    $scopePositions = [Collections.Generic.List[int]]::new()
+    $scopeOwners = [Collections.Generic.List[object]]::new()
+    foreach ($event in $scopeEvents.GetEnumerator()) {
+        foreach ($rank in $event.Value.Remove) { $null = $activeRanges.Remove($rank) }
+        foreach ($rank in $event.Value.Add) {
+            $range = $rangesByRank[$rank]
+            $parent = '-1'
+            foreach ($candidateRank in $activeRanges) {
+                $candidate = $rangesByRank[$candidateRank]
+                if ($candidate.End -ge $range.End) {
+                    $parent = [string]$candidate.Start
+                    break
+                }
+            }
+            $functionParents[[string]$range.Start] = $parent
+        }
+        foreach ($rank in $event.Value.Add) { $null = $activeRanges.Add($rank) }
+        $scopePositions.Add($event.Key)
+        $scopeOwners.Add($(if ($activeRanges.Count) { $rangesByRank[$activeRanges.Min] } else { $null }))
+    }
+    $scopeStarts = $scopePositions.ToArray()
+
+    function Get-AppDaxFunctionAt([int]$Position) {
+        $index = [Array]::BinarySearch($scopeStarts, $Position)
+        if ($index -lt 0) { $index = (-bnot $index) - 1 }
+        if ($index -ge 0) { $scopeOwners[$index] }
     }
 
     function Resolve-AppDaxAlias($Token) {
@@ -4117,12 +4186,11 @@ function Get-FabricAppDaxSource {
         $ownerFunction = Get-AppDaxFunctionAt $query.start
         $owner = if ($ownerFunction) { $ownerFunction.Name } else { $query.symbol }
         if (-not $ownerFunction) {
-            for ($tokenIndex = 2; $tokenIndex -lt $tokens.Count; $tokenIndex++) {
-                if ($tokens[$tokenIndex].Start -ne $query.start -or $tokens[$tokenIndex].Kind -notin @('string', 'template')) { continue }
+            if ($literalTokenByStart.ContainsKey($query.start)) {
+                $tokenIndex = $literalTokenByStart[$query.start]
                 if ($tokens[$tokenIndex - 1].Value -eq '=' -and $tokens[$tokenIndex - 2].Kind -eq 'word') {
                     $owner = $tokens[$tokenIndex - 2].Value
                 }
-                break
             }
             if ($owner -like 'query_*') {
                 $declarationStart = [Math]::Max(0, $query.start - 500)
@@ -4152,10 +4220,8 @@ function Get-FabricAppDaxSource {
         $seenSymbols = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         for ($index = $StartIndex; $index -lt $EndIndex; $index++) {
             if ($tokens[$index].Kind -eq 'word') { $pendingSymbols.Push($tokens[$index].Value) }
-            foreach ($query in $orderedQueries) {
-                if ($query.start -ge $tokens[$index].Start -and $query.end -le $tokens[$index].End) {
-                    $null = $queryAliases[[string]$query.start].Add($Alias)
-                }
+            foreach ($query in $queriesByToken[$index]) {
+                $null = $queryAliases[[string]$query.start].Add($Alias)
             }
         }
         while ($pendingSymbols.Count -gt 0) {
@@ -4389,14 +4455,7 @@ function Get-FabricAppDaxSource {
         foreach ($function in $functionRanges) {
             $key = [string]$function.Start
             $routeFunctions[$key] = $function
-            $container = $null
-            foreach ($candidate in $functionRanges) {
-                if ($candidate.Start -lt $function.Start -and $function.End -le $candidate.End -and
-                    ($null -eq $container -or ($candidate.End - $candidate.Start) -lt ($container.End - $container.Start))) {
-                    $container = $candidate
-                }
-            }
-            $parent = if ($container) { [string]$container.Start } else { '-1' }
+            $parent = $functionParents[$key]
             $routeParents[$key] = $parent
             $builderKey = $parent + [char]0 + $function.Name
             if (-not $routeBuilders.ContainsKey($builderKey)) {
@@ -4470,10 +4529,8 @@ function Get-FabricAppDaxSource {
             for ($cursor = $Start; $cursor -lt $End; $cursor++) {
                 $token = $tokens[$cursor]
                 if ($Kind -eq 'query' -and $token.Kind -in @('string', 'template')) {
-                    foreach ($query in $orderedQueries) {
-                        if ($token.Start -le $query.start -and $query.end -le $token.End) {
-                            $null = $result.Add('query|' + $query.start)
-                        }
+                    foreach ($query in $queriesByToken[$cursor]) {
+                        $null = $result.Add('query|' + $query.start)
                     }
                 }
                 if ($token.Kind -ne 'word' -or
@@ -4544,7 +4601,7 @@ function Get-FabricAppDaxSource {
             }
         }
 
-        $calls = [Collections.Generic.List[object]]::new()
+        $callsByCallee = @{}
         $wrapperNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($key in $routeParameters.Keys) { $null = $wrapperNames.Add($routeFunctions[$key].Name) }
         for ($index = 0; $index -lt $tokens.Count - 2; $index++) {
@@ -4555,9 +4612,13 @@ function Get-FabricAppDaxSource {
             $scope = Get-AppRouteScope $token.Start
             $builder = Find-AppRouteSymbol $token.Value $scope $routeBuilders
             if ($builder -and $builder.Value.Count -eq 1 -and $routeSummaries.ContainsKey($builder.Value[0])) {
-                $calls.Add([PSCustomObject]@{
+                $callee = $builder.Value[0]
+                if (-not $callsByCallee.ContainsKey($callee)) {
+                    $callsByCallee[$callee] = [Collections.Generic.List[object]]::new()
+                }
+                $callsByCallee[$callee].Add([PSCustomObject]@{
                     Caller = $scope
-                    Callee = $builder.Value[0]
+                    Callee = $callee
                     Arguments = @(Get-AppRouteArguments ($index + 1))
                 })
             }
@@ -4580,22 +4641,27 @@ function Get-FabricAppDaxSource {
             }
         }
 
-        $changed = $true
-        while ($changed) {
-            $changed = $false
-            foreach ($call in $calls) {
-                $routes = @($routeSummaries[$call.Callee] | ForEach-Object { $_ })
-                foreach ($route in $routes) {
-                    $pair = $route.Split([char]0)
-                    $aliases = @(Resolve-AppRouteArgument $pair[0] $call 'alias')
-                    $queryValues = @(Resolve-AppRouteArgument $pair[1] $call 'query')
-                    foreach ($alias in $aliases) {
-                        foreach ($queryValue in $queryValues) {
-                            if ($alias.StartsWith('alias|') -and $queryValue.StartsWith('query|')) {
-                                $null = $queryAliases[$queryValue.Substring(6)].Add($alias.Substring(6))
-                            }
-                            elseif ($routeSummaries.ContainsKey($call.Caller)) {
-                                if ($routeSummaries[$call.Caller].Add($alias + [char]0 + $queryValue)) { $changed = $true }
+        $pendingRoutes = [Collections.Generic.Queue[object]]::new()
+        foreach ($callee in $routeSummaries.Keys) {
+            foreach ($route in $routeSummaries[$callee]) {
+                $pendingRoutes.Enqueue([PSCustomObject]@{ Callee = $callee; Route = $route })
+            }
+        }
+        while ($pendingRoutes.Count) {
+            $entry = $pendingRoutes.Dequeue()
+            $pair = $entry.Route.Split([char]0)
+            foreach ($call in $callsByCallee[$entry.Callee]) {
+                $aliases = @(Resolve-AppRouteArgument $pair[0] $call 'alias')
+                $queryValues = @(Resolve-AppRouteArgument $pair[1] $call 'query')
+                foreach ($alias in $aliases) {
+                    foreach ($queryValue in $queryValues) {
+                        if ($alias.StartsWith('alias|') -and $queryValue.StartsWith('query|')) {
+                            $null = $queryAliases[$queryValue.Substring(6)].Add($alias.Substring(6))
+                        }
+                        elseif ($routeSummaries.ContainsKey($call.Caller)) {
+                            $route = $alias + [char]0 + $queryValue
+                            if ($routeSummaries[$call.Caller].Add($route)) {
+                                $pendingRoutes.Enqueue([PSCustomObject]@{ Callee = $call.Caller; Route = $route })
                             }
                         }
                     }
@@ -4606,6 +4672,8 @@ function Get-FabricAppDaxSource {
 
     Add-AppDaxConnectionRoutes
 
+    $ownerAliasCache = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+    $routeMatchCache = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
     foreach ($query in $orderedQueries) {
         $queryPrefixStart = [Math]::Max(0, $query.start - 500)
         $queryPrefix = $Source.Substring($queryPrefixStart, $query.start - $queryPrefixStart)
@@ -4623,22 +4691,32 @@ function Get-FabricAppDaxSource {
         }
         $owner = $queryOwnerByStart[[string]$query.start]
         if ($owner -and $owner -notlike 'query_*') {
-            $ownerPattern = '(?<![\w$])' + [regex]::Escape($owner) + '(?![\w$])'
-            foreach ($callMatch in [regex]::Matches($Source, $ownerPattern + '\s*\(\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,')) {
-                $null = $queryAliases[[string]$query.start].Add($callMatch.Groups['route'].Value)
-            }
-            foreach ($ownerCall in [regex]::Matches($Source, $ownerPattern + '\s*\(')) {
-                $assignmentStart = [Math]::Max(0, $ownerCall.Index - 600)
-                $assignmentPrefix = $Source.Substring($assignmentStart, $ownerCall.Index - $assignmentStart)
-                $assignmentMatches = [regex]::Matches($assignmentPrefix, '(?<symbol>[a-zA-Z_$][\w$]*)\s*=')
-                if ($assignmentMatches.Count -eq 0) { continue }
-                $symbol = $assignmentMatches[$assignmentMatches.Count - 1].Groups['symbol'].Value
-                $symbolPattern = [regex]::Escape($symbol)
-                $routePattern = 'connection\s*:\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,\s*query\s*:\s*' +
-                    $symbolPattern + '(?![\w$])'
-                foreach ($routeMatch in [regex]::Matches($Source, $routePattern)) {
-                    $null = $queryAliases[[string]$query.start].Add($routeMatch.Groups['route'].Value)
+            if (-not $ownerAliasCache.ContainsKey($owner)) {
+                $ownerAliases = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                $ownerPattern = '(?<![\w$])' + [regex]::Escape($owner) + '(?![\w$])'
+                foreach ($callMatch in [regex]::Matches($Source, $ownerPattern + '\s*\(\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,')) {
+                    $null = $ownerAliases.Add($callMatch.Groups['route'].Value)
                 }
+                foreach ($ownerCall in [regex]::Matches($Source, $ownerPattern + '\s*\(')) {
+                    $assignmentStart = [Math]::Max(0, $ownerCall.Index - 600)
+                    $assignmentPrefix = $Source.Substring($assignmentStart, $ownerCall.Index - $assignmentStart)
+                    $assignmentMatches = [regex]::Matches($assignmentPrefix, '(?<symbol>[a-zA-Z_$][\w$]*)\s*=')
+                    if ($assignmentMatches.Count -eq 0) { continue }
+                    $symbol = $assignmentMatches[$assignmentMatches.Count - 1].Groups['symbol'].Value
+                    if (-not $routeMatchCache.ContainsKey($symbol)) {
+                        $symbolPattern = [regex]::Escape($symbol)
+                        $routePattern = 'connection\s*:\s*["''](?<route>[a-zA-Z_$][\w$]*)["'']\s*,\s*query\s*:\s*' +
+                            $symbolPattern + '(?![\w$])'
+                        $routeMatchCache[$symbol] = [regex]::Matches($Source, $routePattern)
+                    }
+                    foreach ($routeMatch in $routeMatchCache[$symbol]) {
+                        $null = $ownerAliases.Add($routeMatch.Groups['route'].Value)
+                    }
+                }
+                $ownerAliasCache[$owner] = $ownerAliases
+            }
+            foreach ($alias in $ownerAliasCache[$owner]) {
+                $null = $queryAliases[[string]$query.start].Add($alias)
             }
         }
         $aliases = @($queryAliases[[string]$query.start] | Sort-Object)

@@ -35,7 +35,7 @@ This provides a quick and automated way to identify where and how specific field
 
 #### ✨ Recently Added Features
 
-- **Fabric App Model Usage** Fabric Apps open up new possibilities for reporting on semantic models. You can now explore the queries behind each app and see exactly which model objects it uses.
+- **Fabric App Model Usage** → Fabric Apps open up new possibilities for reporting on semantic models. You can now explore the queries behind each app and see exactly which model objects it uses.
 - **Run Against Specific Models** → Instead of scanning full workspaces, you can now select individual Models to run against. A popup lets you choose exactly which models to process - **Any connected reports across all workspaces you have access to are included automatically.**
 - **Run Against Specific Reports** → You can now select individual reports to run against. A popup lets you choose exactly which reports to process - connected models are included automatically.
 - **Sovereign Cloud Support** → Now supports Power BI in Government and International clouds! Choose from Public (default), Germany, USGov, China, USGovHigh, or USGovMil environments at script start.

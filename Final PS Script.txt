@@ -654,7 +654,8 @@ function Rename-Properties {
 function Show-WorkspacePicker {
     param(
         [Parameter(Mandatory)]
-        [array]$Workspaces # array of PSCustomObjects with id + name
+        [array]$Workspaces, # array of PSCustomObjects with id + name
+        [switch]$RequireSelection
     )
 
     Add-Type -AssemblyName System.Windows.Forms
@@ -833,7 +834,7 @@ function Show-WorkspacePicker {
     # If nothing selected from workspace list:
     # - If "Include My Workspace" is checked, process only My Workspace (empty array for regular workspaces)
     # - Otherwise, default to all workspaces (backwards compatibility with timeout/cancel behavior)
-    if ($selectedIds.Count -eq 0 -and -not $includeMy) {
+    if ($selectedIds.Count -eq 0 -and -not $includeMy -and -not $RequireSelection) {
         $selectedIds = $Workspaces.id
     }
 
@@ -854,7 +855,7 @@ function Show-RunModeDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "ImpactIQ - Select Run Mode"
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(440, 300)
+    $form.Size = New-Object System.Drawing.Size(440, 350)
     $form.TopMost = $true
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
@@ -895,10 +896,20 @@ function Show-RunModeDialog {
     })
     $form.Controls.Add($btnModels)
 
+    $btnAgents = New-Object System.Windows.Forms.Button
+    $btnAgents.Text = "Run against specific Fabric Data Agents"
+    $btnAgents.Size = New-Object System.Drawing.Size(380, 40)
+    $btnAgents.Location = New-Object System.Drawing.Point(20, 210)
+    $btnAgents.Add_Click({
+        $form.Tag = 'Agents'
+        $form.Close()
+    })
+    $form.Controls.Add($btnAgents)
+
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
     $btnCancel.Size = New-Object System.Drawing.Size(380, 30)
-    $btnCancel.Location = New-Object System.Drawing.Point(20, 210)
+    $btnCancel.Location = New-Object System.Drawing.Point(20, 260)
     $btnCancel.Add_Click({
         $form.Tag = 'Cancel'
         $form.Close()
@@ -1151,11 +1162,16 @@ function Show-ReportPicker {
 # Show Model Scope Selection Dialog
 # ================================
 function Show-ModelScopeDialog {
+    param(
+        [string]$Title = "ImpactIQ - Model Selection Scope",
+        [string]$ItemLabel = "Models"
+    )
+
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "ImpactIQ - Model Selection Scope"
+    $form.Text = $Title
     $form.StartPosition = 'CenterScreen'
     $form.Size = New-Object System.Drawing.Size(440, 250)
     $form.TopMost = $true
@@ -1163,13 +1179,13 @@ function Show-ModelScopeDialog {
     $form.MaximizeBox = $false
 
     $label = New-Object System.Windows.Forms.Label
-    $label.Text = "Which models would you like to choose from?"
+    $label.Text = "Which $($ItemLabel.ToLowerInvariant()) would you like to choose from?"
     $label.AutoSize = $true
     $label.Location = New-Object System.Drawing.Point(20, 20)
     $form.Controls.Add($label)
 
     $btnAll = New-Object System.Windows.Forms.Button
-    $btnAll.Text = "Models from ALL workspaces"
+    $btnAll.Text = "$ItemLabel from ALL workspaces"
     $btnAll.Size = New-Object System.Drawing.Size(380, 40)
     $btnAll.Location = New-Object System.Drawing.Point(20, 55)
     $btnAll.Add_Click({
@@ -1179,7 +1195,7 @@ function Show-ModelScopeDialog {
     $form.Controls.Add($btnAll)
 
     $btnSpecific = New-Object System.Windows.Forms.Button
-    $btnSpecific.Text = "Models from specific workspace(s)"
+    $btnSpecific.Text = "$ItemLabel from specific workspace(s)"
     $btnSpecific.Size = New-Object System.Drawing.Size(380, 40)
     $btnSpecific.Location = New-Object System.Drawing.Point(20, 105)
     $btnSpecific.Add_Click({
@@ -1213,21 +1229,23 @@ function Show-ModelScopeDialog {
 function Show-ModelPicker {
     param(
         [Parameter(Mandatory)]
-        [array]$Models
+        [array]$Models,
+        [string]$Title = "Select Models",
+        [string]$Prompt = "Select the models to run against (reports using these models will be included automatically):"
     )
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
     $form               = New-Object System.Windows.Forms.Form
-    $form.Text          = "Select Models"
+    $form.Text          = $Title
     $form.StartPosition = 'CenterScreen'
     $form.Size          = New-Object System.Drawing.Size(650,580)
     $form.TopMost       = $true
 
     # Instruction label
     $lbl                = New-Object System.Windows.Forms.Label
-    $lbl.Text           = "Select the models to run against (reports using these models will be included automatically):"
+    $lbl.Text           = $Prompt
     $lbl.AutoSize       = $true
     $lbl.Location       = New-Object System.Drawing.Point(12,12)
     $form.Controls.Add($lbl)
@@ -1366,8 +1384,10 @@ function Show-ModelPicker {
     $form.AcceptButton = $okBtn
     $form.CancelButton = $cancelBtn
     [void]$form.ShowDialog()
+    $timer.Stop()
+    $timer.Dispose()
 
-    if ($form.Tag -eq 'Cancel') {
+    if ($form.Tag -ne 'OK' -and $form.Tag -ne 'Timeout') {
         return $null
     }
 
@@ -1521,6 +1541,165 @@ $fabricItemsRenameMap = @{
 }
 
 
+function Get-FabricDataAgentInventory {
+    param(
+        [AllowEmptyCollection()][object[]]$Workspaces
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $agents = @()
+    $failures = @()
+    if ($Workspaces.Count -eq 0) { return @() }
+    $accessToken = Get-FabricAccessToken
+    foreach ($workspace in $Workspaces) {
+        try {
+            $url = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$($workspace.id)/items?type=DataAgent"
+            foreach ($agent in (Invoke-FabricPagedGet -Url $url -AccessToken $accessToken)) {
+                $agents += [PSCustomObject]@{
+                    WorkspaceId = $workspace.id
+                    WorkspaceName = $workspace.name
+                    Agent = $agent
+                }
+            }
+        }
+        catch {
+            $detail = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.GetBaseException().Message }
+            $failures += [PSCustomObject]@{
+                WorkspaceId = $workspace.id
+                Detail = $detail
+            }
+        }
+    }
+
+    if ($failures.Count -eq $Workspaces.Count) {
+        throw "Data Agent discovery failed in all $($Workspaces.Count) workspace(s). Check Fabric sign-in and item read permissions. First failure: $($failures[0].Detail)"
+    }
+    if ($failures.Count -gt 0) {
+        Write-Host "[WARN] Data Agent discovery skipped $($failures.Count) of $($Workspaces.Count) workspace(s); results may be incomplete. First failure: $($failures[0].Detail)" -ForegroundColor Yellow
+    }
+    return $agents
+}
+
+function Get-FabricDataAgentToken {
+    $ErrorActionPreference = 'Stop'
+    $resource = $global:PowerBIEndpoints.FabricApiPrefix
+    $context = Get-AzContext -ErrorAction Stop
+    $azCommand = Get-Command az -ErrorAction SilentlyContinue
+
+    # The CLI client can carry delegated scopes that the Azure PowerShell client lacks.
+    if ($azCommand) {
+        try {
+            $cloud = (& az cloud show --query name -o tsv 2>$null)
+            if ($LASTEXITCODE -ne 0 -or $cloud -ne $context.Environment.Name) {
+                throw "Azure CLI cloud does not match the current Fabric sign-in."
+            }
+            $tenantId = $context.Tenant.Id
+            $token = (& az account get-access-token --resource $resource --tenant $tenantId --query accessToken -o tsv 2>$null)
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
+                Write-Host "[INFO] Signing in to Azure CLI for Data Agent definitions..." -ForegroundColor Cyan
+                & az login --tenant $tenantId --allow-no-subscriptions --output none
+                if ($LASTEXITCODE -ne 0) { throw "Azure CLI sign-in failed." }
+                $token = (& az account get-access-token --resource $resource --tenant $tenantId --query accessToken -o tsv 2>$null)
+            }
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
+                throw "Azure CLI did not return a Fabric access token."
+            }
+            return $token.Trim()
+        }
+        catch {
+            Write-Host "[WARN] Azure CLI token acquisition failed: $($_.Exception.Message). Trying the existing Fabric sign-in." -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "[WARN] Azure CLI is not installed. Using the existing Fabric sign-in; if definitions return 403, install Azure CLI and grant the required Fabric permissions." -ForegroundColor Yellow
+    }
+
+    return Get-FabricAccessToken
+}
+
+function Get-FabricDataAgentDefinition {
+    param(
+        [string]$WorkspaceId,
+        [string]$DataAgentId,
+        [string]$AccessToken,
+        [int]$TimeoutSeconds = 300
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json' }
+    $definitionUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$WorkspaceId/dataAgents/$DataAgentId/getDefinition"
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    try {
+        $response = Invoke-WebRequest -Uri $definitionUrl -Method POST -Headers $headers -Body '{}' -UseBasicParsing -TimeoutSec $TimeoutSeconds
+        if ([int]$response.StatusCode -eq 200) {
+            $definition = ($response.Content | ConvertFrom-Json).definition
+        }
+        elseif ([int]$response.StatusCode -eq 202) {
+            $operationUrl = [string]($response.Headers['Location'] | Select-Object -First 1)
+            if (-not $operationUrl) { throw "Definition operation did not return a Location header." }
+            do {
+                $retrySeconds = 2
+                if ($response.Headers['Retry-After']) {
+                    $retrySeconds = [Math]::Max(1, [int]($response.Headers['Retry-After'] | Select-Object -First 1))
+                }
+                $remainingSeconds = ($deadline - (Get-Date)).TotalSeconds
+                if ($remainingSeconds -le $retrySeconds) { throw "Definition operation timed out after $TimeoutSeconds seconds." }
+                Start-Sleep -Seconds $retrySeconds
+                $requestTimeout = [Math]::Max(1, [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+                $response = Invoke-WebRequest -Uri $operationUrl -Method GET -Headers $headers -UseBasicParsing -TimeoutSec $requestTimeout
+                $operation = $response.Content | ConvertFrom-Json
+                if ($operation.status -in @('Failed', 'Canceled', 'Cancelled')) {
+                    throw "Definition operation $($operation.status): $($operation.error | ConvertTo-Json -Compress)"
+                }
+                if ($operation.status -notin @('NotStarted', 'Running', 'Succeeded')) {
+                    throw "Unexpected definition operation status '$($operation.status)'."
+                }
+            } while ($operation.status -ne 'Succeeded')
+
+            $remainingSeconds = ($deadline - (Get-Date)).TotalSeconds
+            if ($remainingSeconds -le 0) { throw "Definition operation timed out after $TimeoutSeconds seconds." }
+            $resultUrl = $operationUrl.TrimEnd('/') + '/result'
+            $response = Invoke-WebRequest -Uri $resultUrl -Method GET -Headers $headers -UseBasicParsing -TimeoutSec ([Math]::Max(1, [int][Math]::Ceiling($remainingSeconds)))
+            $definition = ($response.Content | ConvertFrom-Json).definition
+        }
+        else {
+            throw "Unexpected getDefinition HTTP status $($response.StatusCode)."
+        }
+        if (-not $definition.parts) { throw "Definition contains no parts." }
+        return $definition
+    }
+    catch {
+        Write-Host "[WARN] Could not retrieve definition for Data Agent $DataAgentId in workspace $WorkspaceId : $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
+}
+
+function Get-FabricDataAgentModelTargets {
+    param(
+        [Parameter(Mandatory)]$Definition
+    )
+
+    $ErrorActionPreference = 'Stop'
+    foreach ($part in $Definition.parts) {
+        $path = $part.path -replace '\\', '/'
+        if ($path -notmatch '^Files/Config/[^/]+/(?:.*/)?datasource\.json$') { continue }
+        try {
+            if ($part.payloadType -ne 'InlineBase64') { throw "Unsupported datasource payload type." }
+            $source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part.payload)) | ConvertFrom-Json
+            if ($source.type -eq 'semantic_model') {
+                if (-not $source.artifactId -or -not $source.workspaceId) {
+                    throw "Semantic model source is missing artifactId or workspaceId."
+                }
+                [PSCustomObject]@{ DatasetId = $source.artifactId; WorkspaceId = $source.workspaceId }
+            }
+        }
+        catch {
+            throw "Cannot resolve connected models from '$path': $($_.Exception.Message)"
+        }
+    }
+}
+
 # Fetch and filter workspaces
 $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
 $workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
@@ -1537,7 +1716,83 @@ if ($runMode -eq 'Cancel') {
     exit
 }
 
-if ($runMode -eq 'Reports') {
+if ($runMode -eq 'Agents') {
+    $agentSelectionComplete = $false
+    while (-not $agentSelectionComplete) {
+    $agentScope = Show-ModelScopeDialog -Title "ImpactIQ - Data Agent Selection Scope" -ItemLabel "Data Agents"
+    if ($agentScope -eq 'Cancel') {
+        $reportPickerCancelled = $true
+        break
+    }
+    $agentWorkspacesToScan = @($workspacesResponse.value)
+    if ($agentScope -eq 'Specific') {
+        try {
+            $agentWorkspaceSelection = Show-WorkspacePicker -Workspaces $workspacesResponse.value -RequireSelection
+        }
+        catch {
+            if ($_.Exception.Message -ne "User cancelled workspace selection.") { throw }
+            Write-Host "[INFO] Workspace selection cancelled. Returning to Data Agent scope selection."
+            continue
+        }
+        $agentWorkspaceIds = @($agentWorkspaceSelection.SelectedWorkspaceIds)
+        $agentWorkspacesToScan = @($workspacesResponse.value | Where-Object { $agentWorkspaceIds -contains $_.id })
+        if ($agentWorkspacesToScan.Count -eq 0) {
+            Write-Host "[WARN] Select at least one Fabric workspace. Returning to Data Agent scope selection." -ForegroundColor Yellow
+            continue
+        }
+    }
+    $agentChoices = @()
+    foreach ($entry in (Get-FabricDataAgentInventory -Workspaces $agentWorkspacesToScan)) {
+        $agentChoices += [PSCustomObject]@{
+            DatasetId = "$($entry.WorkspaceId)|$($entry.Agent.id)"
+            DatasetName = $entry.Agent.displayName
+            WorkspaceId = $entry.WorkspaceId
+            WorkspaceName = $entry.WorkspaceName
+            Agent = $entry.Agent
+        }
+    }
+    if ($agentChoices.Count -eq 0) {
+        Write-Host "[WARN] No accessible Fabric Data Agents found in this scope. Returning to Data Agent scope selection." -ForegroundColor Yellow
+        continue
+    }
+    $pickedAgents = @(Show-ModelPicker -Models $agentChoices -Title "Select Fabric Data Agents" -Prompt "Select agents and their connected semantic models (no reports). Search by workspace, name or ID:" |
+        Where-Object { $_ })
+    if ($pickedAgents.Count -eq 0) {
+        continue
+    }
+    $agentSelectionComplete = $true
+    }
+    if ($reportPickerCancelled) { continue }
+    $script:SelectedDataAgents = @{}
+    $script:DataAgentDefinitions = @{}
+    $global:SelectedDatasetIds = @{}
+    $global:SelectedReportIds = @{}
+    $neededWorkspaceIds = @{}
+    $script:DataAgentDefinitionToken = Get-FabricDataAgentToken
+    foreach ($pickedAgent in $pickedAgents) {
+        $key = $pickedAgent.DatasetId
+        $choice = $agentChoices | Where-Object { $_.DatasetId -eq $key } | Select-Object -First 1
+        $script:SelectedDataAgents[$key] = $choice.Agent
+        $neededWorkspaceIds[$choice.WorkspaceId] = $true
+        $definition = Get-FabricDataAgentDefinition -WorkspaceId $choice.WorkspaceId -DataAgentId $choice.Agent.id -AccessToken $script:DataAgentDefinitionToken
+        if (-not $definition) {
+            throw "Cannot scope connected semantic models for '$($choice.Agent.displayName)' without its definition. Check the reported permissions/authentication failure and rerun."
+        }
+        $script:DataAgentDefinitions[$key] = $definition
+        foreach ($target in (Get-FabricDataAgentModelTargets -Definition $definition)) {
+            $global:SelectedDatasetIds[$target.DatasetId] = $true
+            $neededWorkspaceIds[$target.WorkspaceId] = $true
+            if ($workspacesResponse.value.id -notcontains $target.WorkspaceId) {
+                Write-Host "[WARN] Connected model $($target.DatasetId) is in inaccessible workspace $($target.WorkspaceId); it cannot be extracted." -ForegroundColor Yellow
+            }
+        }
+    }
+    $workspacesInfo = @($workspacesResponse.value | Where-Object { $neededWorkspaceIds.ContainsKey($_.id) } |
+        ForEach-Object { Rename-Properties -object $_ -renameMap $workspaceRenameMap })
+    $IncludeMyWorkspace = $false
+    $selection = $null
+    $global:RunMode = 'Agents'
+} elseif ($runMode -eq 'Reports') {
     # ---- Reports Mode: choose scope, optionally pick workspaces, then pick reports ----
     # Each sub-dialog cancel steps back ONE level (instead of bouncing all the way
     # out, which previously looked like an infinite loop).
@@ -1945,9 +2200,15 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
     # Fetch datasets
     $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets"
-    $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
+    if ($global:RunMode -eq 'Agents') {
+        $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl -ErrorAction Stop | ConvertFrom-Json
+    }
+    else {
+        $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
+    }
 
     foreach ($dataset in $datasets.value) {
+        if ($global:RunMode -eq 'Agents' -and -not $global:SelectedDatasetIds.ContainsKey($dataset.id)) { continue }
         $renamedDataset = Rename-Properties -object $dataset -renameMap $datasetRenameMap
         $renamedDataset | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
         $renamedDataset | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
@@ -1975,7 +2236,10 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
     # Fetch reports
     $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports"
-    $reports = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+    $reports = $null
+    if ($global:RunMode -ne 'Agents') {
+        $reports = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+    }
 
 	# Create a hash set to store Report IDs
 	$reportIds = @{}
@@ -2015,6 +2279,14 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 }
 
 # When running in Reports mode, filter to only selected reports and their connected models
+if ($global:RunMode -eq 'Agents') {
+    foreach ($selectedDatasetId in $global:SelectedDatasetIds.Keys) {
+        if ($datasetsInfo.DatasetId -notcontains $selectedDatasetId) {
+            Write-Host "[WARN] Connected semantic model $selectedDatasetId was not accessible in the selected model workspaces; no model detail will be extracted for it." -ForegroundColor Yellow
+        }
+    }
+}
+
 if ($global:RunMode -eq 'Reports') {
     Write-Host "[INFO] Filtering results to selected reports and connected models..."
     $reportsInfo        = @($reportsInfo        | Where-Object { $global:SelectedReportIds.ContainsKey($_.ReportId) })
@@ -2036,7 +2308,10 @@ if ($global:RunMode -eq 'Models') {
 
 # Fetch Apps and App Reports that are in filtered workspaces
 $appsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps"
-$apps = Invoke-PowerBIRestMethod -Method GET -Url $appsUrl | ConvertFrom-Json
+$apps = $null
+if ($global:RunMode -ne 'Agents') {
+    $apps = Invoke-PowerBIRestMethod -Method GET -Url $appsUrl | ConvertFrom-Json
+}
 
 # Create a hash set to store App Report IDs
 $appReportIds = @{}
@@ -2045,7 +2320,7 @@ $originalReportObjectIds = @{}
 foreach ($app in $apps.value) {
     if ($workspacesInfo.WorkspaceId -contains $app.workspaceId) {
         $renamedApp = Rename-Properties -object $app -renameMap $appRenameMap
-        $appsInfo += $renamedApp
+            $appsInfo += $renamedApp
 
         # Fetch reports within each app
         $appReportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps/$($app.id)/reports"
@@ -2129,6 +2404,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh Schedule ext
 
 # Fetch Dataflows for Workspaces
 foreach ($workspace in $workspacesInfo) {
+    if ($global:RunMode -eq 'Agents') { continue }
 
 Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extraction process started."
 
@@ -2300,6 +2576,12 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extra
     try {
         if (-not $fabricAccessToken) { $fabricAccessToken = Get-FabricAccessToken }
         $fabricItems = @(Invoke-FabricPagedGet -Url $fabricItemsUrl -AccessToken $fabricAccessToken)
+        if ($global:RunMode -eq 'Agents') {
+            $fabricItems = @($fabricItems | Where-Object {
+                ($_.type -eq 'DataAgent' -and $script:SelectedDataAgents.ContainsKey("$workspaceId|$($_.id)")) -or
+                ($_.type -eq 'SemanticModel' -and $global:SelectedDatasetIds.ContainsKey($_.id))
+            })
+        }
 
         # Record reports that carry a sensitivity label (presence only - the id is not needed).
         foreach ($fabricItem in $fabricItems) {
@@ -2615,6 +2897,9 @@ Model.Database.Name = `"$newModelDatabaseName`";
         # Clean up the temporary script file
         Remove-Item -Path $tempScriptPath
     }
+    elseif ($global:RunMode -eq 'Agents') {
+        Write-Host "[WARN] Model '$($dataset.DatasetName)' has no dedicated capacity XMLA export. Metadata is included, but model detail cannot be extracted without downloading a report (disabled in Data Agents mode)." -ForegroundColor Yellow
+    }
 }
 
 Write-Output "Model Backup Process Completed"
@@ -2627,6 +2912,7 @@ Write-Output "Model Backup Process Completed"
 
 #### Start of Report Backup ####
 
+if ($global:RunMode -ne 'Agents') {
 
 
 
@@ -3134,6 +3420,7 @@ if (Test-Path -Path $newDateFolder) {
 
 Write-Output "Report Detail Extraction Process Completed. Excel output saved to $outputExcelFile"
 
+}
 
 
 
@@ -3168,7 +3455,7 @@ if ($latestModelDateFolder) {
 # Check if there are any .bim files in the $folderPath
 $folderPathBimFiles = Get-ChildItem -Path $folderPath -Filter *.bim
 if ($folderPathBimFiles.Count -eq 0) {
-    $sourceFolderPath = $newDateFolder
+    $sourceFolderPath = if ($global:RunMode -eq 'Agents') { $folderPath } else { $newDateFolder }
 } else {
     $sourceFolderPath = $folderPath
 }
@@ -3190,6 +3477,10 @@ foreach ($dataset in $datasetsInfo) {
     $cleanDatasetName = $cleanDatasetName.TrimStart()
 
     # Construct the argument list for the first model script run
+    if ($global:RunMode -eq 'Agents' -and -not (Test-Path -LiteralPath "$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim")) {
+        Write-Host "[WARN] Model backup unavailable for '$($dataset.DatasetName)'; skipping model detail." -ForegroundColor Yellow
+        continue
+    }
     $modelScriptArgs = "`"$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`" -S `"$Script3Path`""
     
     # Start the Tabular Editor process to run the first model script
@@ -3256,6 +3547,7 @@ foreach ($dataset in $datasetsInfo) {
     $cleanDatasetName = $cleanDatasetName.TrimStart()
 
     # Construct the argument list for the second model script run
+    if ($global:RunMode -eq 'Agents' -and -not (Test-Path -LiteralPath "$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim")) { continue }
     $modelScriptArgs = "`"$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`" -S `"$Script4Path`""
     
     # Start the Tabular Editor process to run the second model script
@@ -3296,6 +3588,7 @@ Write-Output "Measure Dependency Detail Extraction Process Completed. Excel outp
 
 #### Start of Power BI Dataflow Backup and Detail Extract ####
 
+if ($global:RunMode -ne 'Agents') {
 # Function to download and extract Fabric (Gen2) dataflows
 function Export-FabricDataflow {
     param (
@@ -3730,6 +4023,178 @@ if (Test-Path -Path $sourceFilePath) {
 }
 
 Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
+
+}
+#### Start of Power BI Data Agent Detail Extract ####
+
+function Export-FabricDataAgentDetail {
+    param(
+        [string]$BaseFolderPath,
+        [string]$ReportDate,
+        [AllowEmptyCollection()][object[]]$Workspaces,
+        [hashtable]$DatasetNames
+    )
+
+    $ErrorActionPreference = 'Stop'
+    Write-Output "Data Agent Detail Extraction Process Started"
+    $agentsInfo = @()
+    $sourcesInfo = @()
+    $definitionToken = if ($global:RunMode -eq 'Agents') { $script:DataAgentDefinitionToken } else { $null }
+    $tokenAttempted = [bool]$definitionToken
+    $sourceTypes = @{
+        semantic_model = "Semantic Model"
+        lakehouse = "Lakehouse"
+        lakehouse_tables = "Lakehouse (Tables)"
+        data_warehouse = "Data Warehouse"
+        kusto = "KQL Database"
+        graph = "Graph (GQL)"
+        mirrored_database = "Mirrored Database"
+        mirrored_azure_databricks = "Mirrored Azure Databricks"
+        unknown = "Unknown"
+    }
+
+    $inventory = @()
+    if ($global:RunMode -ne 'Agents') {
+        $inventoryWorkspaces = @($Workspaces | Where-Object { $_.WorkspaceId -ne "My Workspace" } |
+            ForEach-Object { [PSCustomObject]@{ id = $_.WorkspaceId; name = $_.WorkspaceName } })
+        $inventory = @(Get-FabricDataAgentInventory -Workspaces $inventoryWorkspaces)
+    }
+
+    foreach ($workspace in $Workspaces) {
+        $workspaceId = $workspace.WorkspaceId
+        $workspaceName = $workspace.WorkspaceName
+        if ($workspaceId -eq "My Workspace") { continue }
+        $agents = @()
+        if ($global:RunMode -eq 'Agents') {
+            $agents = @($script:SelectedDataAgents.Keys | Where-Object { $_.StartsWith("$workspaceId|") } |
+                ForEach-Object { $script:SelectedDataAgents[$_] })
+        }
+        else {
+            $agents = @($inventory | Where-Object { $_.WorkspaceId -eq $workspaceId } | ForEach-Object { $_.Agent })
+        }
+
+        foreach ($agent in $agents) {
+            if (-not $tokenAttempted) {
+                $tokenAttempted = $true
+                try { $definitionToken = Get-FabricDataAgentToken }
+                catch {
+                    Write-Host "[WARN] Fabric authentication failed for Data Agent definitions: $($_.Exception.Message). Agents will still be listed." -ForegroundColor Yellow
+                }
+            }
+            $definition = $null
+            $agentKey = "$workspaceId|$($agent.id)"
+            if ($global:RunMode -eq 'Agents' -and $script:DataAgentDefinitions.ContainsKey($agentKey)) {
+                $definition = $script:DataAgentDefinitions[$agentKey]
+            }
+            elseif ($definitionToken) {
+                $definition = Get-FabricDataAgentDefinition -WorkspaceId $workspaceId -DataAgentId $agent.id -AccessToken $definitionToken
+            }
+            $cleanWorkspaceName = ($workspaceName -replace '\[', '(' -replace '\]', ')' -replace '[^a-zA-Z0-9\(\)&,.-]', ' ').TrimStart()
+            $cleanAgentName = ($agent.displayName -replace '\[', '(' -replace '\]', ')' -replace '[^a-zA-Z0-9\(\)&,.-]', ' ').TrimStart()
+            $combinedName = "$cleanWorkspaceName ~ $cleanAgentName"
+            $schemaVersion = ""
+            $aiInstructions = ""
+            $sourceCount = 0
+            $definitionRetrieved = $false
+
+            if ($definition) {
+                $definitionRetrieved = $true
+                foreach ($part in $definition.parts) {
+                    try {
+                        if ($part.payloadType -ne 'InlineBase64') {
+                            throw "Unsupported definition payload type '$($part.payloadType)'."
+                        }
+                        $relativePath = $part.path -replace '\\', '/'
+                        if ($relativePath -notmatch '^Files/Config/(data_agent\.json|[^/]+/stage_config\.json|[^/]+/(?:.*/)?datasource\.json)$') {
+                            continue
+                        }
+                        $partJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($part.payload)) | ConvertFrom-Json
+                        if ($relativePath -eq 'Files/Config/data_agent.json') {
+                            $schemaVersion = $partJson.'$schema'
+                        }
+                        elseif ($relativePath -eq 'Files/Config/draft/stage_config.json') {
+                            $aiInstructions = $partJson.aiInstructions
+                        }
+                        elseif ($relativePath.EndsWith('/datasource.json')) {
+                            $stage = $relativePath.Split('/')[2]
+                            $sourceType = [string]$partJson.type
+                            $friendlyType = if ($sourceTypes.ContainsKey($sourceType)) { $sourceTypes[$sourceType] } else { $sourceType }
+                            $resolvedName = $partJson.displayName
+                            if ($partJson.artifactId -and $DatasetNames.ContainsKey($partJson.artifactId)) {
+                                $resolvedName = $DatasetNames[$partJson.artifactId]
+                            }
+                            $sourceWorkspaceName = ($Workspaces | Where-Object { $_.WorkspaceId -eq $partJson.workspaceId } | Select-Object -First 1).WorkspaceName
+                            if (-not $sourceWorkspaceName) { $sourceWorkspaceName = "Unknown Workspace" }
+                            $sourcesInfo += [PSCustomObject][ordered]@{
+                                "Data Agent ID" = $agent.id
+                                "Data Agent Name" = $agent.displayName
+                                "Workspace ID" = $workspaceId
+                                "Workspace Name" = $workspaceName
+                                "Stage" = $stage
+                                "Source Type" = $friendlyType
+                                "Source Type (Raw)" = $sourceType
+                                "Source Display Name" = $partJson.displayName
+                                "Connected Item ID" = $partJson.artifactId
+                                "Connected Item Name" = $resolvedName
+                                "Source Workspace ID" = $partJson.workspaceId
+                                "Source Workspace Name" = $sourceWorkspaceName
+                                "Source Instructions" = $partJson.dataSourceInstructions
+                                "Source Description" = $partJson.userDescription
+                                "Selected Top-Level Elements" = @($partJson.elements | Where-Object { $null -ne $_ }).Count
+                                "Report Date" = $ReportDate
+                                "Workspace Name - Data Agent Name" = $combinedName
+                            }
+                            if ($stage -eq 'draft') { $sourceCount++ }
+                        }
+                    }
+                    catch {
+                        $definitionRetrieved = $false
+                        Write-Host "[WARN] Data Agent '$($agent.displayName)' part '$($part.path)' could not be extracted: $($_.Exception.Message)" -ForegroundColor Yellow
+                    }
+                }
+            }
+
+            $agentsInfo += [PSCustomObject][ordered]@{
+                "Data Agent ID" = $agent.id
+                "Data Agent Name" = $agent.displayName
+                "Description" = $agent.description
+                "Workspace ID" = $workspaceId
+                "Workspace Name" = $workspaceName
+                "Schema Version" = $schemaVersion
+                "AI Instructions" = $aiInstructions
+                "Connected Source Count" = $sourceCount
+                "Definition Retrieved" = $definitionRetrieved
+                "Sensitivity Label ID" = $agent.sensitivityLabel.id
+                "Report Date" = $ReportDate
+                "Workspace Name - Data Agent Name" = $combinedName
+            }
+        }
+    }
+
+    Write-Host "[INFO] Data Agent extraction complete. Agents found: $($agentsInfo.Count); connected sources: $($sourcesInfo.Count)." -ForegroundColor Cyan
+    if ($agentsInfo.Count -eq 0) {
+        $agentsInfo += [PSCustomObject][ordered]@{
+            "Data Agent ID" = ""; "Data Agent Name" = ""; "Description" = ""; "Workspace ID" = ""; "Workspace Name" = ""
+            "Schema Version" = ""; "AI Instructions" = ""; "Connected Source Count" = ""; "Definition Retrieved" = ""; "Sensitivity Label ID" = ""
+            "Report Date" = ""; "Workspace Name - Data Agent Name" = ""
+        }
+    }
+    if ($sourcesInfo.Count -eq 0) {
+        $sourcesInfo += [PSCustomObject][ordered]@{
+            "Data Agent ID" = ""; "Data Agent Name" = ""; "Workspace ID" = ""; "Workspace Name" = ""; "Stage" = ""
+            "Source Type" = ""; "Source Type (Raw)" = ""; "Source Display Name" = ""; "Connected Item ID" = ""
+            "Connected Item Name" = ""; "Source Workspace ID" = ""; "Source Workspace Name" = ""; "Source Instructions" = ""
+            "Source Description" = ""; "Selected Top-Level Elements" = ""; "Report Date" = ""; "Workspace Name - Data Agent Name" = ""
+        }
+    }
+    $outputPath = Join-Path $BaseFolderPath "Data Agent Detail.xlsx"
+    if (Test-Path -LiteralPath $outputPath) { Remove-Item -LiteralPath $outputPath -Force }
+    $agentsInfo | Export-Excel -Path $outputPath -WorksheetName "Data Agents" -AutoSize -ErrorAction Stop
+    $sourcesInfo | Export-Excel -Path $outputPath -WorksheetName "Data Agent Sources" -AutoSize -Append -ErrorAction Stop
+    Write-Output "Data Agent Detail Extraction Process Completed. Excel output saved to $outputPath"
+}
+
+Export-FabricDataAgentDetail -BaseFolderPath $baseFolderPath -ReportDate $date -Workspaces $workspacesInfo -DatasetNames $datasetNameLookup
 
 function Get-FabricAppDaxSource {
     [CmdletBinding()]

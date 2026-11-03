@@ -628,8 +628,6 @@ $date = (Get-Date -UFormat "%Y-%m-%d")
 
 
 
-Write-Output "Power BI Environment Detail Extract Process Started"
-
 # Define the Information Extract Excel file path
 $excelFile = "$baseFolderPath\Power BI Environment Detail.xlsx"
 
@@ -3236,6 +3234,7 @@ function Get-FabricAppDaxCapture {
     }
     catch {
         $captureError = "$stage failed. Check sign-in, app permissions, prerequisites, and preview API availability."
+        Write-Host "[WARN] Fabric App '$AppName': $captureError" -ForegroundColor Yellow
     }
     finally {
         $env:NODE_PATH = $previousNodePath
@@ -3307,11 +3306,9 @@ function Get-FabricAppDaxCapture {
         })
     if (-not $captureError -and $models.Count -eq 0) {
         $captureError = 'No semantic-model targets were discovered in backend connector settings or app scripts; query model fields remain blank.'
-    }
-    if ($captureError) {
         Write-Host "[WARN] Fabric App '$AppName': $captureError" -ForegroundColor Yellow
     }
-    else {
+    if (-not $captureError) {
         Write-Host "App query extraction completed for $WorkspaceName ~ $AppName"
     }
     [PSCustomObject]@{ Queries = $queryRows; Models = $models; Capture = $capture; Error = $captureError }
@@ -3632,6 +3629,7 @@ if ($runMode -eq 'FabricApps') {
         $key = $choice.DatasetId
         $script:SelectedFabricApps[$key] = $choice.App
         $neededWorkspaceIds[$choice.WorkspaceId] = $true
+        Write-Host "Extracting $($choice.App.displayName) Fabric App detail"
         $capture = Get-FabricAppDaxCapture -WorkspaceId $choice.WorkspaceId -WorkspaceName $choice.WorkspaceName -AppId $choice.App.id -AppName $choice.App.displayName -ParserRuntime $appRuntime -Environment $EnvironmentForEndpoints -ModelNameCache $appModelNameCache
         if ($capture.Error -or @($capture.Models).Count -eq 0) {
             throw "Cannot reliably scope connected Models for Fabric App '$($choice.App.displayName)': $($capture.Error)"
@@ -4039,6 +4037,7 @@ if ($runMode -eq 'FabricApps') {
 }
 } # end while (reportPickerCancelled)
 
+Write-Output "Power BI Environment Detail Extract Process Started"
 
 # Initialize collections for all necessary information
 $fabricItemsInfo = @()
@@ -4844,6 +4843,35 @@ Model.Database.Name = `"$newModelDatabaseName`";
 
 Write-Output "Model Backup Process Completed"
 
+function Export-EmptyDetailWorkbook {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Worksheets
+    )
+
+    $ErrorActionPreference = 'Stop'
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+
+    $package = Open-ExcelPackage -Path $Path -Create -ErrorAction Stop
+    try {
+        foreach ($worksheetName in $Worksheets.Keys) {
+            $sheet = $package.Workbook.Worksheets.Add($worksheetName)
+            $headers = $Worksheets[$worksheetName]
+            for ($column = 0; $column -lt $headers.Count; $column++) {
+                $sheet.Cells[1, ($column + 1)].Value = $headers[$column]
+            }
+        }
+        $package.Save()
+    }
+    finally {
+        $package.Dispose()
+    }
+    Write-Output "Empty detail workbook saved to $Path"
+}
+
 
 
 
@@ -5360,6 +5388,23 @@ if (Test-Path -Path $newDateFolder) {
 
 Write-Output "Report Detail Extraction Process Completed. Excel output saved to $outputExcelFile"
 
+}
+else {
+    # Keep the Power Query sheet/column contract without extracting out-of-scope reports.
+    $reportDetailWorksheets = [ordered]@{
+        Bookmarks = @('ReportName', 'ReportID', 'ModelID', 'Name', 'Id', 'PageName', 'PageId', 'VisualId', 'VisualHiddenFlag', 'SuppressData', 'CurrentPageSelected', 'ApplyVisualDisplayState', 'ApplyToAllVisuals', 'ReportDate')
+        Connections = @('ReportName', 'ReportID', 'ModelID', 'ServerName', 'Type', 'ReportDate')
+        CustomVisuals = @('ReportName', 'ReportID', 'ModelID', 'Name', 'ReportDate')
+        PageFilters = @('ReportName', 'ReportID', 'ModelID', 'PageId', 'PageName', 'DisplayName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'ReportDate')
+        Pages = @('ReportName', 'ReportID', 'ModelID', 'Id', 'Name', 'Number', 'Width', 'Height', 'DisplayOption', 'HiddenFlag', 'VisualCount', 'DataVisualCount', 'VisibleVisualCount', 'PageFilterCount', 'BackgroundImage', 'WallpaperImage', 'Type', 'ReportDate')
+        ReportFilters = @('ReportName', 'ReportID', 'ModelID', 'DisplayName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'ReportDate')
+        ReportLevelMeasures = @('ReportName', 'ReportID', 'ModelID', 'TableName', 'ObjectName', 'ObjectType', 'Expression', 'DataType', 'HiddenFlag', 'FormatString', 'DataCategory', 'ReportDate')
+        VisualFilters = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'VisualId', 'VisualName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'DisplayName', 'ReportDate')
+        VisualInteractions = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'SourceVisualID', 'SourceVisualName', 'TargetVisualID', 'TargetVisualName', 'TypeID', 'Type', 'ReportDate')
+        VisualObjects = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'VisualId', 'VisualName', 'VisualType', 'AppliedFilterVersion', 'CustomVisualFlag', 'TableName', 'ObjectName', 'ObjectType', 'ImplicitMeasure', 'Sparkline', 'VisualCalc', 'Format', 'Source', 'DisplayName', 'ReportDate')
+        Visuals = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'Id', 'Name', 'Type', 'DisplayType', 'Title', 'SubTitle', 'AltText', 'CustomVisualFlag', 'HiddenFlag', 'X', 'Y', 'Z', 'Width', 'Height', 'TabOrder', 'ObjectCount', 'VisualFilterCount', 'DataLimit', 'ShowItemsNoDataFlag', 'Divider', 'SlicerType', 'RowSubTotals', 'ColumnSubTotals', 'DataVisual', 'HasSparkline', 'ParentGroup', 'ReportDate')
+    }
+    Export-EmptyDetailWorkbook -Path (Join-Path $baseFolderPath 'Report Detail.xlsx') -Worksheets $reportDetailWorksheets -ErrorAction Stop
 }
 
 
@@ -5964,6 +6009,12 @@ if (Test-Path -Path $sourceFilePath) {
 
 Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
 
+}
+else {
+    $dataflowDetailWorksheets = [ordered]@{
+        Sheet1 = @('Dataflow ID', 'Dataflow Name', 'Query Name', 'Query', 'Report Date', 'Workspace Name - Dataflow Name')
+    }
+    Export-EmptyDetailWorkbook -Path (Join-Path $baseFolderPath 'Dataflow Detail.xlsx') -Worksheets $dataflowDetailWorksheets -ErrorAction Stop
 }
 #### Start of Power BI Data Agent Detail Extract ####
 

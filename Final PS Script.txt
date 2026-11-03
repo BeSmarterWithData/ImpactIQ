@@ -2383,6 +2383,10 @@ function Get-FabricAppDaxSource {
         $routeDeclarations = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
         $routeBuilders = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
         $routeBuilderQueries = @{}
+        $routeReturns = @{}
+        $routeShadowedParameters = @{}
+        $routeValueCache = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        $routeRecursionState = @{ Cycles = 0 }
         $routeScopeCache = @{}
 
         function Get-AppRouteScope([int]$Position) {
@@ -2439,6 +2443,7 @@ function Get-FabricAppDaxSource {
                 $routeBuilders[$builderKey] = [Collections.Generic.List[string]]::new()
             }
             $routeBuilders[$builderKey].Add($key)
+            $routeSummaries[$key] = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             $parameters = [Collections.Generic.List[object]]::new()
             $supported = $true
             foreach ($argument in @(Get-AppRouteArguments $function.ParameterOpen)) {
@@ -2455,8 +2460,25 @@ function Get-FabricAppDaxSource {
             }
             if ($supported) {
                 $routeParameters[$key] = $parameters.ToArray()
-                $routeSummaries[$key] = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             }
+            else {
+                # Local expressions are still usable, but unsupported bindings must shadow outer symbols.
+                $routeShadowedParameters[$key] = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($name in $function.Parameters) { $null = $routeShadowedParameters[$key].Add($name) }
+            }
+        }
+
+        for ($index = 0; $index -lt $tokens.Count - 1; $index++) {
+            if ($tokens[$index].Kind -ne 'word' -or $tokens[$index].Value -cne 'return') { continue }
+            $scope = Get-AppRouteScope $tokens[$index].Start
+            if (-not $routeFunctions.ContainsKey($scope)) { continue }
+            if (-not $routeReturns.ContainsKey($scope)) {
+                $routeReturns[$scope] = [Collections.Generic.List[object]]::new()
+            }
+            $routeReturns[$scope].Add([PSCustomObject]@{
+                Start = $index + 1
+                End = Get-AppRouteValueEnd ($index + 1)
+            })
         }
 
         for ($index = 1; $index -lt $tokens.Count - 2; $index++) {
@@ -2493,6 +2515,12 @@ function Get-FabricAppDaxSource {
         function Get-AppRouteValues([int]$Start, [int]$End, [string]$Scope, [string]$Kind, $Seen) {
             if ($Start -ge $End) { return }
             if ($null -eq $Seen) { $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal) }
+            $cacheKey = $Scope + [char]0 + $Kind + [char]0 + $Start + ':' + $End
+            if ($routeValueCache.ContainsKey($cacheKey)) {
+                foreach ($value in $routeValueCache[$cacheKey]) { $value }
+                return
+            }
+            $cyclesAtStart = $routeRecursionState.Cycles
             if ($Kind -eq 'alias') {
                 if ($End -ne $Start + 1) { return }
                 if ($tokens[$Start].Kind -eq 'string') {
@@ -2512,6 +2540,7 @@ function Get-FabricAppDaxSource {
                 }
                 if ($token.Kind -ne 'word' -or
                     ($cursor -gt $Start -and $tokens[$cursor - 1].Value -in @('.', '?.'))) { continue }
+                if ($routeShadowedParameters.ContainsKey($Scope) -and $routeShadowedParameters[$Scope].Contains($token.Value)) { continue }
                 $parameterIndex = -1
                 if ($routeParameters.ContainsKey($Scope)) {
                     for ($p = 0; $p -lt $routeParameters[$Scope].Count; $p++) {
@@ -2531,22 +2560,38 @@ function Get-FabricAppDaxSource {
                         }
                         $null = $Seen.Remove($key)
                     }
+                    else { $routeRecursionState.Cycles++ }
                     continue
                 }
                 if ($Kind -eq 'query' -and $cursor + 1 -lt $End -and $tokens[$cursor + 1].Value -eq '(') {
                     $builder = Find-AppRouteSymbol $token.Value $Scope $routeBuilders
-                    if ($builder -and $builder.Value.Count -eq 1 -and $routeBuilderQueries.ContainsKey($builder.Value[0])) {
-                        foreach ($value in $routeBuilderQueries[$builder.Value[0]]) { $null = $result.Add($value) }
+                    if ($builder -and $builder.Value.Count -eq 1) {
+                        $builderScope = $builder.Value[0]
+                        if ($routeBuilderQueries.ContainsKey($builderScope)) {
+                            foreach ($value in $routeBuilderQueries[$builderScope]) { $null = $result.Add($value) }
+                        }
+                        $key = $builderScope + [char]0 + 'return'
+                        if ($Seen.Add($key)) {
+                            foreach ($returnRange in $routeReturns[$builderScope]) {
+                                foreach ($value in @(Get-AppRouteValues $returnRange.Start $returnRange.End $builderScope 'query' $Seen)) {
+                                    if ($value.StartsWith('query|')) { $null = $result.Add($value) }
+                                }
+                            }
+                            $null = $Seen.Remove($key)
+                        }
+                        else { $routeRecursionState.Cycles++ }
                     }
                 }
             }
+            # A cycle-truncated result is incomplete and must not poison later independent traversals.
+            if ($routeRecursionState.Cycles -eq $cyclesAtStart) { $routeValueCache[$cacheKey] = @($result) }
             foreach ($value in $result) { $value }
         }
 
         for ($index = 0; $index -lt $tokens.Count - 4; $index++) {
             if ($tokens[$index].Kind -ne 'punct' -or $tokens[$index].Value -ne '{') { continue }
             $scope = Get-AppRouteScope $tokens[$index].Start
-            if (-not $routeParameters.ContainsKey($scope)) { continue }
+            if (-not $routeSummaries.ContainsKey($scope)) { continue }
             $properties = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
             $cursor = $index + 1
             $closed = $false
@@ -2571,9 +2616,13 @@ function Get-FabricAppDaxSource {
             $aliases = @(Get-AppRouteValues $aliasRange.Start $aliasRange.End $scope 'alias')
             $queryValues = @(Get-AppRouteValues $queryRange.Start $queryRange.End $scope 'query')
             foreach ($alias in $aliases) {
-                if (-not $alias.StartsWith('parameter|')) { continue }
                 foreach ($queryValue in $queryValues) {
-                    $null = $routeSummaries[$scope].Add($alias + [char]0 + $queryValue)
+                    if ($alias.StartsWith('alias|') -and $queryValue.StartsWith('query|')) {
+                        $null = $queryAliases[$queryValue.Substring(6)].Add($alias.Substring(6))
+                    }
+                    else {
+                        $null = $routeSummaries[$scope].Add($alias + [char]0 + $queryValue)
+                    }
                 }
             }
         }
@@ -3418,6 +3467,14 @@ function Export-FabricAppQueryWorkbook {
     )
 
     Import-Module ImportExcel -ErrorAction Stop
+    $unmappedQueries = @($Queries | Where-Object { -not $_.ModelId -or -not $_.ModelWorkspaceId })
+    Write-Host "[INFO] Fabric App model mapping: $($Queries.Count - $unmappedQueries.Count) of $($Queries.Count) captured query rows resolved."
+    if ($unmappedQueries.Count -gt 0) {
+        Write-Host "[WARN] $($unmappedQueries.Count) query row(s) remain unresolved after connection tracing. Export will continue with their model fields blank." -ForegroundColor Yellow
+        foreach ($query in $unmappedQueries) {
+            Write-Host "  $($query.WorkspaceName) ~ $($query.AppName) ~ $($query.QuerySymbol) (connection: '$($query.ConnectionAlias)')" -ForegroundColor Yellow
+        }
+    }
     $appRows = @($Captures | ForEach-Object {
         [PSCustomObject][ordered]@{
             WorkspaceId = $_.WorkspaceId

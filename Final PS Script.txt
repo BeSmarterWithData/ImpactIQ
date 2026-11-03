@@ -2385,8 +2385,9 @@ function Get-FabricAppDaxSource {
         $routeBuilderQueries = @{}
         $routeReturns = @{}
         $routeShadowedParameters = @{}
-        $routeValueCache = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
-        $routeRecursionState = @{ Cycles = 0 }
+        $routeExpressions = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+        $routePendingExpressions = [Collections.Generic.Queue[object]]::new()
+        $routePendingValues = [Collections.Generic.Queue[object]]::new()
         $routeScopeCache = @{}
 
         function Get-AppRouteScope([int]$Position) {
@@ -2512,80 +2513,110 @@ function Get-FabricAppDaxSource {
             $null = $routeBuilderQueries[$owner].Add('query|' + $query.start)
         }
 
-        function Get-AppRouteValues([int]$Start, [int]$End, [string]$Scope, [string]$Kind, $Seen) {
+        function Get-AppRouteExpression([int]$Start, [int]$End, [string]$Scope, [string]$Kind) {
+            $key = $Scope + [char]0 + $Kind + [char]0 + $Start + ':' + $End
+            if (-not $routeExpressions.ContainsKey($key)) {
+                $node = [PSCustomObject]@{
+                    Key = $key
+                    Start = $Start
+                    End = $End
+                    Scope = $Scope
+                    Kind = $Kind
+                    Values = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                    Dependents = [Collections.Generic.Dictionary[string,bool]]::new([StringComparer]::Ordinal)
+                }
+                $routeExpressions[$key] = $node
+                $routePendingExpressions.Enqueue($node)
+            }
+            $routeExpressions[$key]
+        }
+
+        function Add-AppRouteValue($Node, [string]$Value) {
+            if ($Node.Values.Add($Value)) {
+                $routePendingValues.Enqueue([PSCustomObject]@{ Node = $Node; Value = $Value })
+            }
+        }
+
+        function Add-AppRouteDependency($Parent, $Child, [bool]$QueriesOnly = $false) {
+            if (-not $Child.Dependents.ContainsKey($Parent.Key)) {
+                $Child.Dependents[$Parent.Key] = $QueriesOnly
+            }
+            elseif (-not $QueriesOnly) {
+                $Child.Dependents[$Parent.Key] = $false
+            }
+            foreach ($value in $Child.Values) {
+                if (-not $Child.Dependents[$Parent.Key] -or $value.StartsWith('query|')) {
+                    Add-AppRouteValue $Parent $value
+                }
+            }
+        }
+
+        function Get-AppRouteValues([int]$Start, [int]$End, [string]$Scope, [string]$Kind) {
             if ($Start -ge $End) { return }
-            if ($null -eq $Seen) { $Seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal) }
-            $cacheKey = $Scope + [char]0 + $Kind + [char]0 + $Start + ':' + $End
-            if ($routeValueCache.ContainsKey($cacheKey)) {
-                foreach ($value in $routeValueCache[$cacheKey]) { $value }
-                return
-            }
-            $cyclesAtStart = $routeRecursionState.Cycles
-            if ($Kind -eq 'alias') {
-                if ($End -ne $Start + 1) { return }
-                if ($tokens[$Start].Kind -eq 'string') {
-                    if ($tokens[$Start].Value -match '^[a-zA-Z_$][\w$]*$') {
-                        'alias|' + $tokens[$Start].Value
-                    }
-                    return
-                }
-            }
-            $result = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-            for ($cursor = $Start; $cursor -lt $End; $cursor++) {
-                $token = $tokens[$cursor]
-                if ($Kind -eq 'query' -and $token.Kind -in @('string', 'template')) {
-                    foreach ($query in $queriesByToken[$cursor]) {
-                        $null = $result.Add('query|' + $query.start)
-                    }
-                }
-                if ($token.Kind -ne 'word' -or
-                    ($cursor -gt $Start -and $tokens[$cursor - 1].Value -in @('.', '?.'))) { continue }
-                if ($routeShadowedParameters.ContainsKey($Scope) -and $routeShadowedParameters[$Scope].Contains($token.Value)) { continue }
-                $parameterIndex = -1
-                if ($routeParameters.ContainsKey($Scope)) {
-                    for ($p = 0; $p -lt $routeParameters[$Scope].Count; $p++) {
-                        if ($routeParameters[$Scope][$p].Name -ceq $token.Value) { $parameterIndex = $p; break }
-                    }
-                }
-                if ($parameterIndex -ge 0) {
-                    $null = $result.Add('parameter|' + $parameterIndex)
-                    continue
-                }
-                $declaration = Find-AppRouteSymbol $token.Value $Scope $routeDeclarations
-                if ($declaration) {
-                    $key = $declaration.Scope + [char]0 + $token.Value + [char]0 + $Kind
-                    if ($Seen.Add($key)) {
-                        foreach ($value in @(Get-AppRouteValues $declaration.Value.Start $declaration.Value.End $declaration.Scope $Kind $Seen)) {
-                            $null = $result.Add($value)
+            $root = Get-AppRouteExpression $Start $End $Scope $Kind
+            # Build each expression once; cyclic dependencies converge by propagating only new facts.
+            while ($routePendingExpressions.Count) {
+                $node = $routePendingExpressions.Dequeue()
+                if ($node.Kind -eq 'alias') {
+                    if ($node.End -ne $node.Start + 1) { continue }
+                    if ($tokens[$node.Start].Kind -eq 'string') {
+                        if ($tokens[$node.Start].Value -match '^[a-zA-Z_$][\w$]*$') {
+                            Add-AppRouteValue $node ('alias|' + $tokens[$node.Start].Value)
                         }
-                        $null = $Seen.Remove($key)
+                        continue
                     }
-                    else { $routeRecursionState.Cycles++ }
-                    continue
                 }
-                if ($Kind -eq 'query' -and $cursor + 1 -lt $End -and $tokens[$cursor + 1].Value -eq '(') {
-                    $builder = Find-AppRouteSymbol $token.Value $Scope $routeBuilders
-                    if ($builder -and $builder.Value.Count -eq 1) {
-                        $builderScope = $builder.Value[0]
-                        if ($routeBuilderQueries.ContainsKey($builderScope)) {
-                            foreach ($value in $routeBuilderQueries[$builderScope]) { $null = $result.Add($value) }
+                for ($cursor = $node.Start; $cursor -lt $node.End; $cursor++) {
+                    $token = $tokens[$cursor]
+                    if ($node.Kind -eq 'query' -and $token.Kind -in @('string', 'template')) {
+                        foreach ($query in $queriesByToken[$cursor]) {
+                            Add-AppRouteValue $node ('query|' + $query.start)
                         }
-                        $key = $builderScope + [char]0 + 'return'
-                        if ($Seen.Add($key)) {
-                            foreach ($returnRange in $routeReturns[$builderScope]) {
-                                foreach ($value in @(Get-AppRouteValues $returnRange.Start $returnRange.End $builderScope 'query' $Seen)) {
-                                    if ($value.StartsWith('query|')) { $null = $result.Add($value) }
-                                }
+                    }
+                    if ($token.Kind -ne 'word' -or
+                        ($cursor -gt $node.Start -and $tokens[$cursor - 1].Value -in @('.', '?.'))) { continue }
+                    if ($routeShadowedParameters.ContainsKey($node.Scope) -and $routeShadowedParameters[$node.Scope].Contains($token.Value)) { continue }
+                    $parameterIndex = -1
+                    if ($routeParameters.ContainsKey($node.Scope)) {
+                        for ($p = 0; $p -lt $routeParameters[$node.Scope].Count; $p++) {
+                            if ($routeParameters[$node.Scope][$p].Name -ceq $token.Value) { $parameterIndex = $p; break }
+                        }
+                    }
+                    if ($parameterIndex -ge 0) {
+                        Add-AppRouteValue $node ('parameter|' + $parameterIndex)
+                        continue
+                    }
+                    $declaration = Find-AppRouteSymbol $token.Value $node.Scope $routeDeclarations
+                    if ($declaration) {
+                        $child = Get-AppRouteExpression $declaration.Value.Start $declaration.Value.End $declaration.Scope $node.Kind
+                        Add-AppRouteDependency $node $child
+                        continue
+                    }
+                    if ($node.Kind -eq 'query' -and $cursor + 1 -lt $node.End -and $tokens[$cursor + 1].Value -eq '(') {
+                        $builder = Find-AppRouteSymbol $token.Value $node.Scope $routeBuilders
+                        if ($builder -and $builder.Value.Count -eq 1) {
+                            $builderScope = $builder.Value[0]
+                            if ($routeBuilderQueries.ContainsKey($builderScope)) {
+                                foreach ($value in $routeBuilderQueries[$builderScope]) { Add-AppRouteValue $node $value }
                             }
-                            $null = $Seen.Remove($key)
+                            foreach ($returnRange in $routeReturns[$builderScope]) {
+                                if ($returnRange.Start -ge $returnRange.End) { continue }
+                                $child = Get-AppRouteExpression $returnRange.Start $returnRange.End $builderScope 'query'
+                                Add-AppRouteDependency $node $child $true
+                            }
                         }
-                        else { $routeRecursionState.Cycles++ }
                     }
                 }
             }
-            # A cycle-truncated result is incomplete and must not poison later independent traversals.
-            if ($routeRecursionState.Cycles -eq $cyclesAtStart) { $routeValueCache[$cacheKey] = @($result) }
-            foreach ($value in $result) { $value }
+            while ($routePendingValues.Count) {
+                $entry = $routePendingValues.Dequeue()
+                foreach ($dependent in $entry.Node.Dependents.GetEnumerator()) {
+                    if (-not $dependent.Value -or $entry.Value.StartsWith('query|')) {
+                        Add-AppRouteValue $routeExpressions[$dependent.Key] $entry.Value
+                    }
+                }
+            }
+            foreach ($value in $root.Values) { $value }
         }
 
         for ($index = 0; $index -lt $tokens.Count - 4; $index++) {

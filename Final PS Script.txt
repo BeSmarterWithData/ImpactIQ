@@ -1772,7 +1772,7 @@ function Get-FabricAppDaxSource {
     }
 
     function Add-AppJsLiteral([int]$Start, [int]$End, [string]$Text, [string[]]$Expressions) {
-        if ($Text -match '^\s*(?:EVALUATE|DEFINE)\b') {
+        if ($Text -match '^(?:\s+|(?://|--)[^\r\n]*(?:\r?\n|$)|/\*[\s\S]*?\*/)*(?:EVALUATE|DEFINE)\b') {
             $prefixStart = [Math]::Max(0, $Start - 300)
             $prefix = $Source.Substring($prefixStart, $Start - $prefixStart)
             $owner = [regex]::Match($prefix, '(?:function\s+(?<name>[\w$]+)\([^{}]*\)\s*\{\s*return\s*|(?:const|let|var)\s+(?<name>[\w$]+)\s*=\s*)$')
@@ -2863,7 +2863,7 @@ function extractDax(source) {
                 (index < expressions.length ? '${' + expressions[index] + '}' : '')
             ).join('');
         }
-        if (text && /^\s*(?:EVALUATE|DEFINE)\b/i.test(text)) {
+        if (text && /^(?:\s+|(?:\/\/|--)[^\r\n]*(?:\r?\n|$)|\/\*[\s\S]*?\*\/)*(?:EVALUATE|DEFINE)\b/i.test(text)) {
             const owner = [...ancestors].reverse().find(parent =>
                 parent.type === 'FunctionDeclaration' || parent.type === 'VariableDeclarator'
             );
@@ -3161,11 +3161,17 @@ function Get-FabricAppDaxCapture {
         WorkspaceName = $WorkspaceName
         AppId = $AppId.ToString()
         AppName = $AppName
+        CaptureStatus = 'Started'
+        CaptureError = ''
+        AssetsInspected = 0
+        SkippedAssets = 0
     }
     $stage = 'Discovery'
     $fabricToken = $powerBiToken = $mwc = $handoff = $session = $headers = $null
     $previousNodePath = $env:NODE_PATH
     if ($Environment -ne 'Public') {
+        $capture.CaptureStatus = 'Failed'
+        $capture.CaptureError = 'Fabric App extraction is only supported in the Public cloud.'
         Write-Host "[ERROR] App query extraction failed for $WorkspaceName ~ $AppName`: the preview hosting flow has only been verified in the Public cloud." -ForegroundColor Red
         return [PSCustomObject]@{ Queries = @(); Models = @(); Capture = $capture; Error = 'Fabric App extraction is only supported in the Public cloud.' }
     }
@@ -3391,6 +3397,10 @@ function Get-FabricAppDaxCapture {
     if (-not $captureError) {
         Write-Host "App query extraction completed for $WorkspaceName ~ $AppName"
     }
+    $capture.CaptureStatus = if ($captureError) { 'Partial' } else { 'StaticAssetsInspected' }
+    $capture.CaptureError = $captureError
+    $capture.AssetsInspected = $assetCount
+    $capture.SkippedAssets = $failedAssets
     [PSCustomObject]@{ Queries = $queryRows; Models = $models; Capture = $capture; Error = $captureError }
 }
 
@@ -3466,6 +3476,7 @@ function ConvertTo-FabricAppQueryRows {
                 ModelWorkspaceId = ''
                 ModelWorkspaceName = ''
                 ModelMappingEvidence = ''
+                TemplateExpressions = @($query.expressions | Where-Object { $null -ne $_ })
             }
             $text = [string]$query.text
             $offset = 0
@@ -3494,7 +3505,10 @@ function Export-FabricAppQueryWorkbook {
         [Parameter(Mandatory)][string]$Path,
         [AllowEmptyCollection()][object[]]$Queries = @(),
         [AllowEmptyCollection()][object[]]$Models = @(),
-        [AllowEmptyCollection()][object[]]$Captures = @()
+        [AllowEmptyCollection()][object[]]$Captures = @(),
+        [AllowEmptyCollection()][object[]]$Dependencies = @(),
+        [AllowEmptyCollection()][object[]]$DependencyStatus = @(),
+        [switch]$IncludeDependencies
     )
 
     Import-Module ImportExcel -ErrorAction Stop
@@ -3512,16 +3526,15 @@ function Export-FabricAppQueryWorkbook {
             WorkspaceName = $_.WorkspaceName
             AppId = $_.AppId
             AppName = $_.AppName
+            CaptureStatus = $_.CaptureStatus
+            CaptureError = $_.CaptureError
+            AssetsInspected = $_.AssetsInspected
+            SkippedAssets = $_.SkippedAssets
         }
     })
     $package = Open-ExcelPackage -Path $Path -Create -ErrorAction Stop
     try {
-        foreach ($definition in @(
-            @{
-                Name = 'FabricAppQueries'
-                Rows = $Queries
-                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelMappingEvidence')
-            },
+        $definitions = @(
             @{
                 Name = 'FabricAppModels'
                 Rows = $Models
@@ -3530,9 +3543,30 @@ function Export-FabricAppQueryWorkbook {
             @{
                 Name = 'FabricApps'
                 Rows = $appRows
-                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName')
+                Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'CaptureStatus', 'CaptureError', 'AssetsInspected', 'SkippedAssets')
             }
-        )) {
+        )
+        if ($IncludeDependencies) {
+            $definitions = @(
+                @{
+                    Name = 'FabricAppQueries'
+                    Rows = $Queries
+                    Headers = @('WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'Evidence', 'QueryText', 'SourceUrl', 'ConnectionAlias', 'ModelId', 'ModelName', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelMappingEvidence')
+                }
+            ) + $definitions + @(
+                @{
+                    Name = 'QueryDependencies'
+                    Rows = $Dependencies
+                    Headers = @('QueryId', 'WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelId', 'ModelName', 'ObjectName', 'ObjectType', 'ObjectTable', 'DependsOn', 'DependsOnType', 'DependsOnTable', 'DependencyKind', 'DependencyDepth', 'Resolution', 'Detail')
+                },
+                @{
+                    Name = 'QueryDependencyStatus'
+                    Rows = $DependencyStatus
+                    Headers = @('QueryId', 'AppId', 'AppName', 'QuerySymbol', 'ModelId', 'Status', 'DirectObjectCount', 'RelatedObjectCount', 'UnresolvedCount', 'Coverage')
+                }
+            )
+        }
+        foreach ($definition in $definitions) {
             if ($definition.Rows.Count -gt 1048575) { throw 'App query export exceeds the Excel row limit.' }
             $sheet = $package.Workbook.Worksheets[$definition.Name]
             if ($sheet) { $package.Workbook.Worksheets.Delete($definition.Name) }
@@ -3541,6 +3575,7 @@ function Export-FabricAppQueryWorkbook {
             foreach ($header in $definition.Headers) { $headers.Add($header) }
             foreach ($record in $definition.Rows) {
                 foreach ($property in $record.PSObject.Properties.Name) {
+                    if ($property -eq 'TemplateExpressions') { continue }
                     if (-not $headers.Contains($property)) { $headers.Add($property) }
                 }
             }
@@ -3566,7 +3601,11 @@ function Export-FabricAppQueryWorkbook {
             $sheet.Cells.Style.WrapText = $true
             $sheet.View.FreezePanes(2, 1)
         }
-        foreach ($legacySheet in @('AppQueries', 'AppQueryCaptures')) {
+        $legacySheets = @('AppQueries', 'AppQueryCaptures')
+        if (-not $IncludeDependencies) {
+            $legacySheets += @('FabricAppQueries', 'QueryDependencies', 'QueryDependencyStatus')
+        }
+        foreach ($legacySheet in $legacySheets) {
             if ($package.Workbook.Worksheets[$legacySheet]) { $package.Workbook.Worksheets.Delete($legacySheet) }
         }
         $package.Save()
@@ -3574,6 +3613,472 @@ function Export-FabricAppQueryWorkbook {
     finally {
         $package.Dispose()
     }
+}
+
+function Get-FabricAppDaxReferences {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [string[]]$TemplateExpressions = @(),
+        [string]$DefaultTable = '',
+        [switch]$IsTemplate
+    )
+
+    $TemplateExpressions = @($TemplateExpressions | Where-Object { -not [string]::IsNullOrEmpty($_) })
+    $dynamicMarker = '__ImpactIQDynamicExpression__'
+    while ($Text.Contains($dynamicMarker)) { $dynamicMarker += '_' }
+    foreach ($expression in $TemplateExpressions) {
+        $Text = $Text.Replace(('${' + $expression + '}'), $dynamicMarker)
+    }
+    if (($IsTemplate -or $TemplateExpressions.Count) -and $Text.Contains('${')) {
+        throw [FormatException]::new('A JavaScript interpolation could not be separated from the DAX. Its runtime dependencies remain unresolved.')
+    }
+    $lexer = [regex]::new('\G(?:(?<space>\s+)|(?<comment>//[^\r\n]*|--[^\r\n]*|/\*[\s\S]*?\*/)|(?<string>"(?:[^"]|"")*")|(?<table>''(?:[^'']|'''')*'')|(?<field>\[(?:[^\]]|\]\])*\])|(?<word>[\p{L}_][\p{L}\p{N}_.]*)|(?<number>\d+(?:\.\d+)?)|(?<punct>[^\s]))')
+    $tokens = [Collections.Generic.List[object]]::new()
+    $position = 0
+    while ($position -lt $Text.Length) {
+        $match = $lexer.Match($Text, $position)
+        if (-not $match.Success) { throw [FormatException]::new("Invalid DAX token at position $position.") }
+        $position += $match.Length
+        if ($match.Groups['space'].Success -or $match.Groups['comment'].Success) { continue }
+        foreach ($kind in @('string', 'table', 'field', 'word', 'number', 'punct')) {
+            if ($match.Groups[$kind].Success) { break }
+        }
+        $value = $match.Value
+        if ($kind -eq 'punct' -and $value -in @('"', "'", '[')) {
+            throw [FormatException]::new("Unterminated DAX identifier or string at position $($match.Index).")
+        }
+        if ($value -eq '/' -and $position -lt $Text.Length -and $Text[$position] -eq '*') {
+            throw [FormatException]::new('Unterminated DAX comment.')
+        }
+        if ($kind -eq 'string') { $value = $value.Substring(1, $value.Length - 2).Replace('""', '"') }
+        elseif ($kind -eq 'table') { $value = $value.Substring(1, $value.Length - 2).Replace("''", "'") }
+        elseif ($kind -eq 'field') { $value = $value.Substring(1, $value.Length - 2).Replace(']]', ']') }
+        $tokens.Add([PSCustomObject]@{ Kind = $kind; Value = $value })
+    }
+    $variables = @{}
+    $localMeasures = @{}
+    $definitions = @{}
+    for ($index = 0; $index -lt $tokens.Count - 1; $index++) {
+        if ($tokens[$index].Kind -ne 'word') { continue }
+        if ($tokens[$index].Value -eq 'VAR' -and $tokens[$index + 1].Kind -eq 'word') {
+            $variables[$tokens[$index + 1].Value] = $true
+        }
+        if ($tokens[$index].Value -in @('COLUMN', 'TABLE', 'FUNCTION') -and
+            $index -gt 0 -and $tokens[$index - 1].Value -ne '(') {
+            throw [FormatException]::new('Query-scoped COLUMN/TABLE/FUNCTION definitions require engine validation; they are not treated as persisted model objects.')
+        }
+        if ($tokens[$index].Value -eq 'MEASURE' -and $index + 2 -lt $tokens.Count -and $tokens[$index + 2].Kind -eq 'field') {
+            $name = $tokens[$index + 2].Value
+            $localMeasures[$name] = $true
+            $localMeasures[($tokens[$index + 1].Value + [char]0 + $name)] = $true
+            $definitions[$index + 1] = $true
+            $definitions[$index + 2] = $true
+        }
+    }
+    $depths = [int[]]::new($tokens.Count)
+    $depth = 0
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $depths[$index] = $depth
+        if ($tokens[$index].Kind -ne 'punct') { continue }
+        if ($tokens[$index].Value -in @('(', '{')) { $depth++ }
+        elseif ($tokens[$index].Value -in @(')', '}')) { $depth-- }
+    }
+    $variableRanges = @{}
+    for ($index = 0; $index -lt $tokens.Count - 3; $index++) {
+        if ($tokens[$index].Kind -ne 'word' -or $tokens[$index].Value -ne 'VAR' -or $tokens[$index + 2].Value -ne '=') { continue }
+        $end = $index + 3
+        while ($end -lt $tokens.Count) {
+            if ($depths[$end] -lt $depths[$index] -or
+                ($depths[$end] -eq $depths[$index] -and
+                    (($tokens[$end].Kind -eq 'word' -and $tokens[$end].Value -in @('VAR', 'RETURN', 'EVALUATE')) -or
+                    ($tokens[$end].Kind -eq 'punct' -and $tokens[$end].Value -in @(')', '}'))))) { break }
+            $end++
+        }
+        $name = $tokens[$index + 1].Value
+        if (-not $variableRanges.ContainsKey($name)) { $variableRanges[$name] = [Collections.Generic.List[object]]::new() }
+        $variableRanges[$name].Add(@{ Start = $index + 3; End = $end })
+    }
+    function Get-DaxReachableRanges([int]$Start, [int]$End) {
+        $ranges = [Collections.Generic.List[object]]::new()
+        $pending = [Collections.Generic.Queue[object]]::new()
+        $pending.Enqueue(@{ Start = $Start; End = $End })
+        $seen = @{}
+        while ($pending.Count) {
+            $range = $pending.Dequeue()
+            $ranges.Add($range)
+            for ($cursor = $range.Start; $cursor -lt $range.End; $cursor++) {
+                $name = $tokens[$cursor].Value
+                if ($tokens[$cursor].Kind -ne 'word' -or $seen.ContainsKey($name) -or -not $variableRanges.ContainsKey($name)) { continue }
+                $seen[$name] = $true
+                if ($variableRanges[$name].Count -eq 1) { $pending.Enqueue($variableRanges[$name][0]) }
+            }
+        }
+        $ranges.ToArray()
+    }
+    $aliases = @{}
+    $aliasRangeCache = @{}
+    $outputRanges = @()
+    $frames = [Collections.Generic.List[object]]::new()
+    $references = [Collections.Generic.List[object]]::new()
+    $reserved = @{}
+    foreach ($word in @('DEFINE', 'EVALUATE', 'VAR', 'MEASURE', 'RETURN', 'ORDER', 'BY', 'ASC', 'DESC', 'IN', 'NOT', 'AND', 'OR', 'TRUE', 'FALSE', 'INTEGER', 'STRING', 'DOUBLE', 'BOOLEAN', 'DATETIME', 'CURRENCY', 'VARIANT', 'BLANK', 'DAY', 'WEEK', 'MONTH', 'QUARTER', 'YEAR', 'SECOND', 'MINUTE', 'HOUR', 'SKIP', 'DENSE', 'BOTH', 'NONE', 'ONEWAY', 'ONEWAY_LEFTFILTERSRIGHT', 'ONEWAY_RIGHTFILTERSLEFT', 'DEFAULT', 'FIRST', 'LAST', 'KEEP', 'IGNORE', 'STRICT', 'RELAXED', 'EXTENDING', 'PRECISE', 'BLANKS', 'ANCHORED', 'START', 'AT', 'ABS', 'REL')) {
+        $reserved[$word] = $true
+    }
+    $ordering = $false
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = $tokens[$index]
+        $previous = if ($index -gt 0) { $tokens[$index - 1] } else { $null }
+        $next = if ($index + 1 -lt $tokens.Count) { $tokens[$index + 1] } else { $null }
+        if ($token.Kind -eq 'word' -and $token.Value -eq 'EVALUATE') {
+            $ordering = $false
+            $end = $index + 1
+            while ($end -lt $tokens.Count -and -not ($depths[$end] -eq 0 -and $tokens[$end].Kind -eq 'word' -and $tokens[$end].Value -in @('ORDER', 'EVALUATE'))) { $end++ }
+            $outputRanges = @(Get-DaxReachableRanges ($index + 1) $end)
+        }
+        if ($token.Kind -eq 'word' -and $token.Value -eq 'BY' -and $previous.Value -eq 'ORDER') { $ordering = $true }
+        if ($token.Kind -eq 'punct' -and $token.Value -eq '(') {
+            $newFrame = @{ Function = [string]$previous.Value; Argument = 0; Braces = 0; Table = ''; InputVariable = ''; Start = $index; End = -1 }
+            $frames.Add($newFrame)
+            if ($newFrame.Function -eq 'GENERATESERIES') {
+                if (-not $aliases.ContainsKey('Value')) { $aliases['Value'] = [Collections.Generic.List[object]]::new() }
+                $aliases['Value'].Add($newFrame)
+            }
+            continue
+        }
+        if ($token.Kind -eq 'punct' -and $token.Value -eq ')') {
+            if ($frames.Count -eq 0) { throw [FormatException]::new('Unbalanced DAX parentheses.') }
+            $frames[$frames.Count - 1].End = $index
+            $frames.RemoveAt($frames.Count - 1)
+            continue
+        }
+        $frame = if ($frames.Count) { $frames[$frames.Count - 1] } else { $null }
+        if ($frame -and $token.Kind -eq 'punct') {
+            if ($token.Value -eq '{') { $frame.Braces++ }
+            elseif ($token.Value -eq '}') { $frame.Braces-- }
+            elseif ($token.Value -eq ',' -and $frame.Braces -eq 0) { $frame.Argument++ }
+        }
+        if ($frame -and $frame.Argument -eq 0 -and $previous.Value -eq '(' -and
+            $token.Kind -in @('table', 'word') -and $next.Value -ne '(') {
+            if ($variables.ContainsKey($token.Value)) { $frame.InputVariable = $token.Value }
+            else { $frame.Table = $token.Value }
+        }
+        if ($frame -and $token.Kind -eq 'string' -and $frame.Braces -eq 0 -and $previous.Value -in @('(', ',')) {
+            $isAlias = ($frame.Function -in @('ROW', 'DATATABLE') -and $frame.Argument % 2 -eq 0) -or
+                ($frame.Function -in @('SELECTCOLUMNS', 'ADDCOLUMNS') -and $frame.Argument % 2 -eq 1) -or
+                $frame.Function -in @('SUMMARIZE', 'SUMMARIZECOLUMNS', 'GROUPBY', 'ROLLUPADDISSUBTOTAL')
+            if ($isAlias) {
+                if (-not $aliases.ContainsKey($token.Value)) { $aliases[$token.Value] = [Collections.Generic.List[object]]::new() }
+                $aliases[$token.Value].Add($frame)
+            }
+        }
+        if ($definitions.ContainsKey($index)) { continue }
+        if ($next.Kind -ne 'field' -and ($token.Kind -eq 'table' -or ($token.Kind -eq 'word' -and
+            -not $reserved.ContainsKey($token.Value) -and -not $variables.ContainsKey($token.Value) -and
+            $next.Value -ne '(' -and $previous.Value -ne 'VAR'))) {
+            $requiredTable = $previous.Kind -eq 'word' -and $previous.Value -eq 'EVALUATE'
+            if ($frame -and $previous.Kind -eq 'punct' -and $previous.Value -in @('(', ',')) {
+                $requiredTable = $requiredTable -or
+                    ($frame.Argument -eq 0 -and $frame.Function -in @('FILTER', 'SUMX', 'AVERAGEX', 'MINX', 'MAXX', 'COUNTX', 'COUNTAX', 'PRODUCTX', 'CONCATENATEX', 'ADDCOLUMNS', 'SELECTCOLUMNS', 'RANKX', 'COUNTROWS', 'VALUES', 'DISTINCT', 'ALL', 'ALLNOBLANKROW', 'ALLSELECTED', 'ALLEXCEPT', 'REMOVEFILTERS', 'SUMMARIZE', 'GROUPBY', 'CALCULATETABLE', 'RELATEDTABLE', 'TREATAS')) -or
+                    ($frame.Function -in @('UNION', 'INTERSECT', 'EXCEPT', 'CROSSJOIN', 'GENERATE', 'GENERATEALL', 'NATURALINNERJOIN', 'NATURALLEFTOUTERJOIN')) -or
+                    ($frame.Function -eq 'TOPN' -and $frame.Argument -eq 1)
+            }
+            if ($TemplateExpressions.Count -and $token.Kind -eq 'word' -and
+                $token.Value -eq $dynamicMarker -and -not $requiredTable) { continue }
+            $references.Add([PSCustomObject]@{
+                Kind = $(if ($token.Kind -eq 'table' -or $requiredTable) { 'Table' } else { 'PossibleTable' })
+                Table = $token.Value; Name = ''; ContextTable = ''; Alias = $false; Ordering = $ordering; GeneratedValue = $false
+                Dynamic = $TemplateExpressions.Count -gt 0 -and $token.Value.Contains($dynamicMarker)
+            })
+        }
+        if ($token.Kind -ne 'field') { continue }
+        $qualified = $previous.Kind -in @('table', 'word') -and -not $reserved.ContainsKey($previous.Value)
+        $table = if ($qualified) { $previous.Value } else { '' }
+        if (($qualified -and $localMeasures.ContainsKey(($table + [char]0 + $token.Value))) -or
+            (-not $qualified -and $localMeasures.ContainsKey($token.Value))) { continue }
+        $context = $DefaultTable
+        for ($frameIndex = $frames.Count - 1; $frameIndex -ge 0; $frameIndex--) {
+            $candidate = $frames[$frameIndex]
+            if ($candidate.Table -and $candidate.Function -in @('FILTER', 'SUMX', 'AVERAGEX', 'MINX', 'MAXX', 'COUNTX', 'COUNTAX', 'PRODUCTX', 'CONCATENATEX', 'ADDCOLUMNS', 'SELECTCOLUMNS', 'RANKX', 'GENERATE')) {
+                $context = $candidate.Table
+                break
+            }
+        }
+        $visibleAlias = $false
+        if (-not $qualified -and $aliases.ContainsKey($token.Value)) {
+            $visibleRanges = if ($ordering) { $outputRanges } else {
+                foreach ($activeFrame in $frames) {
+                    @{ Start = $activeFrame.Start; End = $index }
+                    $variable = $activeFrame.InputVariable
+                    if ($variable -and $variableRanges.ContainsKey($variable) -and $variableRanges[$variable].Count -eq 1) {
+                        if (-not $aliasRangeCache.ContainsKey($variable)) {
+                            $range = $variableRanges[$variable][0]
+                            $aliasRangeCache[$variable] = @(Get-DaxReachableRanges $range.Start $range.End)
+                        }
+                        $aliasRangeCache[$variable]
+                    }
+                }
+            }
+            foreach ($definitionFrame in $aliases[$token.Value]) {
+                if ($definitionFrame.End -lt 0 -or $definitionFrame.End -ge $index) { continue }
+                foreach ($range in $visibleRanges) {
+                    if ($definitionFrame.Start -ge $range.Start -and $definitionFrame.End -le $range.End) { $visibleAlias = $true; break }
+                }
+                if ($visibleAlias) { break }
+            }
+        }
+        $references.Add([PSCustomObject]@{
+            Kind = 'Field'; Table = $table; Name = $token.Value; ContextTable = $context
+            Alias = $visibleAlias; Ordering = $ordering; GeneratedValue = $false
+            Dynamic = $TemplateExpressions.Count -gt 0 -and ($table.Contains($dynamicMarker) -or $token.Value.Contains($dynamicMarker))
+        })
+    }
+    if ($frames.Count) { throw [FormatException]::new('Unbalanced DAX parentheses.') }
+    $references.ToArray()
+}
+
+function Get-FabricAppQueryDependencies {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Queries = @(),
+        [AllowEmptyCollection()][object[]]$ModelObjects = @(),
+        [AllowEmptyCollection()][object[]]$ModelDependencies = @()
+    )
+
+    $ErrorActionPreference = 'Stop'
+    function Get-ObjectKey([string]$Type, [string]$Table, [string]$Name) {
+        ($Type + [char]0 + $Table + [char]0 + $Name).ToLowerInvariant()
+    }
+    function Get-ObjectType([string]$Type) {
+        if ($Type -match 'Column$') { return 'Column' }
+        $Type
+    }
+    $models = @{}
+    foreach ($row in $ModelObjects) {
+        $type = Get-ObjectType ([string]$row.Type)
+        if ($type -notin @('Table', 'Column', 'Measure', 'CalculationItem') -or -not $row.ModelID) { continue }
+        $id = [string]$row.ModelID
+        if (-not $models.ContainsKey($id)) { $models[$id] = @{ Objects = @{}; Fields = @{}; Names = @{}; Graph = @{} } }
+        $model = $models[$id]
+        $key = Get-ObjectKey $type $row.Table $row.Name
+        if ($model.Objects.ContainsKey($key) -and -not $row.Expression) { continue }
+        $object = [PSCustomObject]@{ Key = $key; Type = $type; Table = [string]$row.Table; Name = [string]$row.Name; Expression = [string]$row.Expression; Calculated = $row.Type -eq 'CalculatedColumn' }
+        $model.Objects[$key] = $object
+        if ($type -in @('Column', 'Measure')) { $model.Fields[([string]$row.Table + [char]0 + [string]$row.Name)] = $key }
+        $nameKey = $type + [char]0 + [string]$row.Name
+        if (-not $model.Names.ContainsKey($nameKey)) { $model.Names[$nameKey] = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
+        $null = $model.Names[$nameKey].Add($key)
+    }
+    function Resolve-QueryReference($Reference, $Model) {
+        if ($Reference.Dynamic) { return }
+        $keys = @()
+        if ($Reference.Kind -in @('Table', 'PossibleTable')) {
+            $key = Get-ObjectKey 'Table' $Reference.Table $Reference.Table
+            if ($Model.Objects.ContainsKey($key)) { return $Model.Objects[$key] }
+            return
+        }
+        if (-not $Reference.Table -and $Reference.Alias) { return }
+        if ($Reference.Table) {
+            $key = $Reference.Table + [char]0 + $Reference.Name
+            if ($Model.Fields.ContainsKey($key)) { return $Model.Objects[$Model.Fields[$key]] }
+            return
+        }
+        $nameKey = 'Measure' + [char]0 + $Reference.Name
+        if ($Model.Names.ContainsKey($nameKey)) { $keys += @($Model.Names[$nameKey]) }
+        if ($Reference.ContextTable) {
+            $columnKey = Get-ObjectKey 'Column' $Reference.ContextTable $Reference.Name
+            if ($Model.Objects.ContainsKey($columnKey)) { $keys += $columnKey }
+        }
+        if ($keys.Count -eq 1) { return $Model.Objects[$keys[0]] }
+    }
+    foreach ($row in $ModelDependencies) {
+        $id = [string]$row.ModelID
+        if (-not $models.ContainsKey($id)) { continue }
+        $model = $models[$id]
+        $nameKey = (Get-ObjectType ([string]$row.ObjectType)) + [char]0 + [string]$row.ObjectName
+        if (-not $model.Names.ContainsKey($nameKey)) { continue }
+        $parents = @($model.Names[$nameKey])
+        if ($row.ObjectTable) { $parents = @($parents | Where-Object { $model.Objects[$_].Table -eq $row.ObjectTable }) }
+        if ($parents.Count -ne 1) { continue }
+        $key = $parents[0]
+        if (-not $model.Graph.ContainsKey($key)) { $model.Graph[$key] = [Collections.Generic.List[object]]::new() }
+        try {
+            $references = @(Get-FabricAppDaxReferences -Text ([string]$row.DependsOn))
+            $fields = @($references | Where-Object { $_.Kind -eq 'Field' })
+            $targets = if ($fields.Count) { $fields } else { @($references | Where-Object { $_.Kind -in @('Table', 'PossibleTable') }) }
+            if ($targets.Count -eq 0) { throw [FormatException]::new("Unrecognized model dependency: $($row.DependsOn)") }
+            foreach ($target in $targets) { $model.Graph[$key].Add($target) }
+        }
+        catch [FormatException] {
+            $model.Graph[$key].Add([PSCustomObject]@{ Kind = 'Invalid'; Table = ''; Name = [string]$row.DependsOn; Error = $_.Exception.Message })
+        }
+    }
+    $edges = [Collections.Generic.List[object]]::new()
+    $statuses = [Collections.Generic.List[object]]::new()
+    $queryRows = [Collections.Generic.List[object]]::new()
+    $formulaCache = @{}
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($query in $Queries) {
+            $text = @($query.PSObject.Properties | Where-Object { $_.Name -match '^QueryText(\d+)?$' } |
+                Sort-Object { if ($_.Name -eq 'QueryText') { 1 } else { [int]$_.Name.Substring(9) } } |
+                ForEach-Object { [string]$_.Value }) -join ''
+            $identity = @($query.WorkspaceId, $query.AppId, $query.SourceUrl, $query.QuerySymbol, $query.ConnectionAlias, $query.ModelWorkspaceId, $query.ModelId, $text) | ConvertTo-Json -Compress
+            $queryId = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).Replace('-', '').ToLowerInvariant()
+            $exportQuery = $query | Select-Object * -ExcludeProperty TemplateExpressions
+            $exportQuery | Add-Member -NotePropertyName QueryId -NotePropertyValue $queryId -Force
+            $queryRows.Add($exportQuery)
+            $seenEdges = @{}
+            $seenObjects = @{}
+            $directObjects = @{}
+            $queue = [Collections.Generic.Queue[object]]::new()
+            $queryState = @{ Unresolved = 0 }
+            $model = $models[[string]$query.ModelId]
+            function Add-QueryEdge($Parent, $Target, [string]$Kind, [int]$Depth, [string]$Detail = '') {
+                $targetKey = Get-ObjectKey $Target.Type $Target.Table $Target.Name
+                $edgeKey = $Parent.Key + [char]1 + $targetKey + [char]1 + $Kind
+                if ($seenEdges.ContainsKey($edgeKey)) { return }
+                $seenEdges[$edgeKey] = $true
+                $resolved = -not $Detail
+                if (-not $resolved) { $queryState.Unresolved++ }
+                $edges.Add([PSCustomObject][ordered]@{
+                    QueryId = $queryId; WorkspaceId = $query.WorkspaceId; WorkspaceName = $query.WorkspaceName
+                    AppId = $query.AppId; AppName = $query.AppName; QuerySymbol = $query.QuerySymbol
+                    ConnectionAlias = $query.ConnectionAlias; ModelWorkspaceId = $query.ModelWorkspaceId
+                    ModelId = $query.ModelId; ModelName = $query.ModelName
+                    ObjectName = $Parent.Name; ObjectType = $Parent.Type; ObjectTable = $Parent.Table
+                    DependsOn = $Target.Name; DependsOnType = $Target.Type; DependsOnTable = $Target.Table
+                    DependencyKind = $Kind; DependencyDepth = $Depth
+                    Resolution = $(if ($resolved) { 'Resolved' } else { 'Unresolved' }); Detail = $Detail
+                })
+                if ($resolved -and -not $seenObjects.ContainsKey($targetKey)) {
+                    $seenObjects[$targetKey] = $true
+                    $queue.Enqueue(@{ Object = $Target; Depth = $Depth })
+                }
+                if ($resolved -and $Kind -eq 'Direct query reference') { $directObjects[$targetKey] = $true }
+            }
+            function Add-QueryReferences($Parent, [object[]]$References, [string]$Kind, [int]$Depth, [string]$ResolutionError = '') {
+                foreach ($reference in $References) {
+                    $target = if (-not $ResolutionError) { Resolve-QueryReference $reference $model }
+                    if ($target) {
+                        Add-QueryEdge $Parent $target $Kind $Depth
+                    }
+                    elseif ($reference.Kind -eq 'Field' -and -not $reference.Table -and ($reference.Alias -or $reference.GeneratedValue)) {
+                        continue
+                    }
+                    else {
+                        $detail = if ($ResolutionError) { $ResolutionError }
+                            elseif ($reference.Kind -eq 'Invalid') { $reference.Error }
+                            else { 'Reference is missing, ambiguous, or runtime-generated; no model object was guessed.' }
+                        Add-QueryEdge $Parent ([PSCustomObject]@{
+                            Type = $(if ($reference.Kind -in @('Table', 'PossibleTable')) { 'Table' } else { 'Unknown' })
+                            Table = $reference.Table; Name = $(if ($reference.Name) { $reference.Name } else { $reference.Table })
+                        }) $Kind $Depth $detail
+                    }
+                }
+            }
+            $root = [PSCustomObject]@{ Key = $queryId; Name = $query.QuerySymbol; Type = 'Query'; Table = '' }
+            $status = 'ResolvedStaticReferences'
+            $resolutionError = ''
+            if (-not $query.ModelId -or -not $query.ModelWorkspaceId) {
+                $status = 'MissingModelMapping'
+                $resolutionError = 'The query has no unambiguous semantic-model mapping.'
+            }
+            elseif (-not $model) {
+                $status = 'MissingModelMetadata'
+                $resolutionError = 'No model-object metadata was extracted for this model ID. Check model access and model-detail extraction.'
+            }
+            if ($resolutionError) {
+                try {
+                    $references = @(Get-FabricAppDaxReferences -Text $text -TemplateExpressions @($query.TemplateExpressions) -IsTemplate:($query.Evidence -eq 'DynamicTemplate'))
+                    Add-QueryReferences $root $references 'Direct query reference' 1 $resolutionError
+                }
+                catch [FormatException] {
+                    Add-QueryEdge $root ([PSCustomObject]@{ Type = 'Unknown'; Table = ''; Name = '' }) 'Direct query reference' 1 $_.Exception.Message
+                }
+                if (-not $queryState.Unresolved) {
+                    Add-QueryEdge $root ([PSCustomObject]@{ Type = 'Unknown'; Table = ''; Name = '' }) 'Direct query reference' 1 $resolutionError
+                }
+            }
+            else {
+                try {
+                    $references = @(Get-FabricAppDaxReferences -Text $text -TemplateExpressions @($query.TemplateExpressions) -IsTemplate:($query.Evidence -eq 'DynamicTemplate'))
+                    Add-QueryReferences $root $references 'Direct query reference' 1
+                }
+                catch [FormatException] {
+                    Add-QueryEdge $root ([PSCustomObject]@{ Type = 'Unknown'; Table = ''; Name = '' }) 'Direct query reference' 1 $_.Exception.Message
+                }
+                while ($queue.Count) {
+                    $entry = $queue.Dequeue()
+                    $object = $entry.Object
+                    if ($object.Type -ne 'Table') {
+                        $tableKey = Get-ObjectKey 'Table' $object.Table $object.Table
+                        if ($model.Objects.ContainsKey($tableKey)) {
+                            Add-QueryEdge $object $model.Objects[$tableKey] 'Object table' ($entry.Depth + 1)
+                        }
+                        else {
+                            Add-QueryEdge $object ([PSCustomObject]@{ Type = 'Table'; Table = $object.Table; Name = $object.Table }) 'Object table' ($entry.Depth + 1) 'The containing table is missing from model metadata.'
+                        }
+                    }
+                    $cacheKey = [string]$query.ModelId + [char]1 + $object.Key
+                    if (-not $formulaCache.ContainsKey($cacheKey)) {
+                        if ($model.Graph.ContainsKey($object.Key)) {
+                            $formulaCache[$cacheKey] = @($model.Graph[$object.Key].ToArray())
+                        }
+                        elseif ($object.Expression) {
+                            try {
+                                $context = if ($object.Calculated) { $object.Table } else { '' }
+                                $formulaCache[$cacheKey] = @(Get-FabricAppDaxReferences -Text $object.Expression -DefaultTable $context)
+                            }
+                            catch [FormatException] {
+                                $formulaCache[$cacheKey] = @([PSCustomObject]@{ Kind = 'Invalid'; Table = ''; Name = $object.Name; Error = $_.Exception.Message })
+                            }
+                        }
+                        else { $formulaCache[$cacheKey] = @() }
+                    }
+                    Add-QueryReferences $object @($formulaCache[$cacheKey]) 'Model object dependency' ($entry.Depth + 1)
+                }
+                if ($queryState.Unresolved) { $status = 'UnresolvedReferences' }
+                elseif ($query.Evidence -eq 'DynamicTemplate') { $status = 'PartialDynamicTemplate' }
+            }
+            $statuses.Add([PSCustomObject][ordered]@{
+                QueryId = $queryId; AppId = $query.AppId; AppName = $query.AppName; QuerySymbol = $query.QuerySymbol; ModelId = $query.ModelId
+                Status = $status; DirectObjectCount = $directObjects.Count; RelatedObjectCount = $seenObjects.Count; UnresolvedCount = $queryState.Unresolved
+                Coverage = 'Metadata-matched static references and reachable model dependencies only. Runtime JavaScript, unvisited assets, implicit relationships, RLS and calculation-group execution are not proven by this extract.'
+            })
+        }
+    }
+    finally { $sha.Dispose() }
+    [PSCustomObject]@{ Queries = $queryRows.ToArray(); Dependencies = $edges.ToArray(); Status = $statuses.ToArray() }
+}
+
+function Export-FabricAppQueryDependencyDetail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$BaseFolderPath,
+        [AllowEmptyCollection()][object[]]$Queries = @(),
+        [AllowEmptyCollection()][object[]]$Models = @(),
+        [AllowEmptyCollection()][object[]]$Captures = @(),
+        [AllowEmptyCollection()][object[]]$ModelObjects = @(),
+        [AllowEmptyCollection()][object[]]$ModelDependencies = @()
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $result = Get-FabricAppQueryDependencies -Queries $Queries -ModelObjects $ModelObjects -ModelDependencies $ModelDependencies
+    $path = Join-Path $BaseFolderPath 'Fabric App Detail.xlsx'
+    $temporaryPath = Join-Path $BaseFolderPath ('AppQueryDependencies-' + [guid]::NewGuid().ToString('N') + '.xlsx')
+    try {
+        Export-FabricAppQueryWorkbook -Path $temporaryPath -Queries $result.Queries -Models $Models -Captures $Captures -Dependencies $result.Dependencies -DependencyStatus $result.Status -IncludeDependencies -ErrorAction Stop
+        Move-Item -LiteralPath $temporaryPath -Destination $path -Force -ErrorAction Stop
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction Stop }
+    }
+    $incomplete = @($result.Status | Where-Object { $_.Status -ne 'ResolvedStaticReferences' })
+    if ($incomplete.Count) {
+        Write-Warning "$($incomplete.Count) app query row(s) have partial or unresolved dependencies. Review QueryDependencyStatus and unresolved QueryDependencies rows in $path." -WarningAction Continue
+    }
+    Write-Host "[INFO] Exported $($result.Dependencies.Count) app query dependency edges to $path."
 }
 
 function Export-FabricAppDaxEnvironment {
@@ -3584,7 +4089,9 @@ function Export-FabricAppDaxEnvironment {
         [string]$Environment = 'Public',
         [AllowEmptyCollection()][object[]]$Datasets = @(),
         [AllowEmptyCollection()][object[]]$Workspaces = @(),
-        [ValidateSet('PowerShell', 'Acorn')][string]$ParserEngine = 'PowerShell'
+        [ValidateSet('PowerShell', 'Acorn')][string]$ParserEngine = 'PowerShell',
+        [AllowEmptyCollection()][object[]]$ModelObjects = @(),
+        [AllowEmptyCollection()][object[]]$ModelDependencies = @()
     )
 
     $ErrorActionPreference = 'Stop'
@@ -3605,6 +4112,7 @@ function Export-FabricAppDaxEnvironment {
         try { $appDaxRuntime = Initialize-FabricAppDaxParser -Engine $ParserEngine -ErrorAction Stop }
         catch {
             $appDaxReady = $false
+            Write-Warning "Fabric App parser initialization failed: $($_.Exception.Message)" -WarningAction Continue
         }
     }
     foreach ($appItem in $appItems) {
@@ -3614,6 +4122,10 @@ function Export-FabricAppDaxEnvironment {
                 WorkspaceName = $appItem.WorkspaceName
                 AppId = $appItem.FabricItemID
                 AppName = $appItem.FabricItemName
+                CaptureStatus = 'Failed'
+                CaptureError = 'Fabric App parser initialization failed. Check the console error.'
+                AssetsInspected = 0
+                SkippedAssets = 0
             }
             continue
         }
@@ -3624,6 +4136,7 @@ function Export-FabricAppDaxEnvironment {
         $appQueryCaptures += $appCapture.Capture
     }
     Export-FabricAppQueryWorkbook -Path $environmentWorkbook -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ErrorAction Stop
+    Export-FabricAppQueryDependencyDetail -BaseFolderPath $BaseFolderPath -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ModelObjects $ModelObjects -ModelDependencies $ModelDependencies -ErrorAction Stop
     Write-Host "[INFO] Exported $($appQueryRows.Count) queries and $($appModelRows.Count) configured models to $environmentWorkbook."
 }
 
@@ -6284,9 +6797,10 @@ if ($EnableFabricAppDax) {
         if ($global:RunMode -eq 'FabricApps') {
             $captures = @($script:FabricAppCaptures.Values)
             Export-FabricAppQueryWorkbook -Path (Join-Path $baseFolderPath 'Power BI Environment Detail.xlsx') -Queries @($captures | ForEach-Object { $_.Queries }) -Models @($captures | ForEach-Object { $_.Models }) -Captures @($captures | ForEach-Object { $_.Capture }) -ErrorAction Stop
+            Export-FabricAppQueryDependencyDetail -BaseFolderPath $baseFolderPath -Queries @($captures | ForEach-Object { $_.Queries }) -Models @($captures | ForEach-Object { $_.Models }) -Captures @($captures | ForEach-Object { $_.Capture }) -ModelObjects @($semanticModelsCsvData) -ModelDependencies @($measureDependenciesCsvData) -ErrorAction Stop
         }
         else {
-            Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ErrorAction Stop
+            Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ModelObjects @($semanticModelsCsvData) -ModelDependencies @($measureDependenciesCsvData) -ErrorAction Stop
         }
     }
     catch {

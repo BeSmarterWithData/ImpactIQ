@@ -403,6 +403,8 @@ if (-not $tabularEditorWorks) {
     Write-Host "[ERROR] Tabular Editor is not able to run - this will cause blank outputs for Model Detail and Report Detail" -ForegroundColor Red
 }
 
+Write-Host "[INFO] Getting things ready - checking required modules before environment selection and sign-in..." -ForegroundColor Cyan
+
 $pbiToolsPath = Join-Path -Path $baseFolderPath -ChildPath "Config\PBI Tools\pbi-tools.exe"
 
 # Force TLS 1.2 (required for PSGallery on older systems)
@@ -607,6 +609,7 @@ trap {
 
 if (-not (Get-Variable -Name LoginEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
 
+    Write-Host "[INFO] Opening environment selection. Sign-in will follow..." -ForegroundColor Cyan
     $selectedEnv = Show-EnvironmentSelectionDialog -TimeoutSeconds 60
 
     # Handle timeout, cancellation, or no selection
@@ -4484,10 +4487,17 @@ if ($runMode -eq 'FabricApps') {
             Write-Host "Extracting $($choice.App.displayName) Fabric App detail"
             $capture = Get-FabricAppDaxCapture -WorkspaceId $choice.WorkspaceId -WorkspaceName $choice.WorkspaceName -AppId $choice.App.id -AppName $choice.App.displayName -ParserRuntime $appRuntime -Environment $EnvironmentForEndpoints -ModelNameCache $appModelNameCache
             $script:FabricAppCaptures[$key] = $capture
-            if ($capture.Error -or @($capture.Models).Count -eq 0) {
+            if (@($capture.Models).Count -eq 0) {
                 throw "Cannot reliably scope connected Models for Fabric App '$($choice.App.displayName)': $($capture.Error)"
             }
+            if ($capture.Error) {
+                Write-Host "[WARN] Fabric App '$($choice.App.displayName)' query capture is incomplete: $($capture.Error) Continuing with its explicitly configured model connections." -ForegroundColor Yellow
+            }
             foreach ($model in $capture.Models) {
+                if (-not $model.ModelId -or -not $model.ModelWorkspaceId) {
+                    Write-Host "[WARN] Fabric App '$($choice.App.displayName)' has a model connection without both model and workspace IDs; that connection cannot be extracted." -ForegroundColor Yellow
+                    continue
+                }
                 $global:SelectedDatasetIds[$model.ModelId] = $true
                 $neededWorkspaceIds[$model.ModelWorkspaceId] = $true
                 if ($workspacesResponse.value.id -notcontains $model.ModelWorkspaceId) {
@@ -4501,6 +4511,7 @@ if ($runMode -eq 'FabricApps') {
     }
     $workspacesInfo = @($workspacesResponse.value | Where-Object { $neededWorkspaceIds.ContainsKey($_.id) } |
         ForEach-Object { Rename-Properties -object $_ -renameMap $workspaceRenameMap })
+    Write-Host "[INFO] Resolved $($global:SelectedDatasetIds.Count) connected model(s). Preparing model metadata and eligible XMLA downloads..." -ForegroundColor Cyan
     $IncludeMyWorkspace = $false
     $selection = $null
     $global:RunMode = 'FabricApps'

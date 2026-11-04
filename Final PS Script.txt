@@ -12,6 +12,259 @@ $Script3Path = Join-Path $configFolder "Model Detail Extract Script.csx"
 $Script4Path = Join-Path $configFolder "Measure Dependency Extract Script.csx"
 $TabularEditor2Path = Join-Path (Join-Path $configFolder "TabularEditor") "TabularEditor.exe"
 
+
+function Protect-ImpactIQLogText {
+    param([AllowEmptyString()][string]$Text)
+
+    $Text = [regex]::Replace($Text, '(?i)\b(Bearer|MwcToken)\s+\S+', '$1 [REDACTED]')
+    $Text = [regex]::Replace($Text, '\beyJ[\w-]+\.[\w-]+\.[\w-]+\b', '[REDACTED]')
+    $Text = [regex]::Replace($Text, '(?i)(["'']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|password|pwd|handoffCode|codeVerifier|authorization)["'']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|''(?:''''|[^''])*''|[^;\r\n,}]+)', '$1[REDACTED]')
+    [regex]::Replace($Text, '(?i)([?&](?:_hc|code|code_verifier|access_token|token|sig)=)[^&\s"'']+', '$1[REDACTED]')
+}
+
+function Write-ImpactIQDiagnostic {
+    param(
+        [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level,
+        [AllowEmptyString()][string]$Message
+    )
+
+    $text = Protect-ImpactIQLogText $Message
+    $script:ImpactIQDiagnostics.Writer.WriteLine(('[{0:O}] [{1}] {2}' -f [DateTime]::UtcNow, $Level, $text))
+}
+
+function Get-ImpactIQDiagnosticLevel {
+    param([AllowEmptyString()][string]$Text)
+
+    if ($Text -match '(?i)\b(?:errors?|fatal|exception|failed|failure)\b|\[ERROR\]') { return 'ERROR' }
+    if ($Text -match '(?i)\bwarn(?:ing)?s?\b|\[WARN\]') { return 'WARN' }
+}
+
+function Write-ImpactIQRunRecord {
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Record,
+        [switch]$DiscardOutput
+    )
+
+    if ($Record -is [Management.Automation.ErrorRecord]) {
+        # Redirection can clone an ErrorRecord while retaining the same exception.
+        if ($script:ImpactIQDiagnostics.SeenExceptions.Add($Record.Exception)) {
+            $message = $Record.Exception.Message
+            if ($Record.InvocationInfo.ScriptLineNumber) {
+                $message += " (line $($Record.InvocationInfo.ScriptLineNumber), $($Record.FullyQualifiedErrorId))"
+            }
+            Write-ImpactIQDiagnostic -Level ERROR -Message $message
+        }
+        return
+    }
+    if ($Record -is [Management.Automation.WarningRecord]) {
+        Write-ImpactIQDiagnostic -Level WARN -Message $Record.Message
+        return
+    }
+    if ($Record -is [Management.Automation.InformationRecord]) {
+        $data = $Record.MessageData
+        $text = [string]$data
+        $level = Get-ImpactIQDiagnosticLevel $text
+        if (-not $level -and $data -is [Management.Automation.HostInformationMessage]) {
+            if ($data.ForegroundColor -eq [ConsoleColor]::Red) { $level = 'ERROR' }
+            elseif ($data.ForegroundColor -eq [ConsoleColor]::Yellow) { $level = 'WARN' }
+        }
+        if ($level) {
+            Write-ImpactIQDiagnostic -Level $level -Message $text
+        }
+        elseif (-not $DiscardOutput) {
+            if ($data -is [Management.Automation.HostInformationMessage]) {
+                $parameters = @{ Object = $data.Message; NoNewline = $data.NoNewLine }
+                if ($null -ne $data.ForegroundColor) { $parameters.ForegroundColor = $data.ForegroundColor }
+                if ($null -ne $data.BackgroundColor) { $parameters.BackgroundColor = $data.BackgroundColor }
+                Microsoft.PowerShell.Utility\Write-Host @parameters
+            }
+            else {
+                Microsoft.PowerShell.Utility\Write-Information -MessageData $data -Tags $Record.Tags -InformationAction Continue
+            }
+        }
+        return
+    }
+    if ($Record -is [string]) {
+        $level = Get-ImpactIQDiagnosticLevel $Record
+        if ($level) {
+            Write-ImpactIQDiagnostic -Level $level -Message $Record
+            return
+        }
+    }
+    if (-not $DiscardOutput) { Write-Output -NoEnumerate $Record }
+}
+
+function Write-ImpactIQContinuingError {
+    param(
+        [Parameter(Mandatory)][Management.Automation.ErrorRecord]$Record,
+        [string]$Context = 'Extraction step'
+    )
+
+    $script:ImpactIQRunFailed = $true
+    Write-ImpactIQRunRecord -Record $Record
+    Write-ImpactIQDiagnostic -Level WARN -Message "$Context could not complete; continuing with the remaining work."
+}
+
+function Invoke-ImpactIQLoggedRun {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][Alias('LogPath')][string]$ImpactIQLogPath,
+        [Parameter(Mandatory)][Alias('Action')][scriptblock]$ImpactIQAction,
+        [switch]$KeepOpen,
+        [switch]$StartSession
+    )
+
+    $impactIQPreviousErrorPreference = $ErrorActionPreference
+    $impactIQPreviousWarningPreference = $WarningPreference
+    $impactIQCloseWriter = $false
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        if ($StartSession -or -not ($script:ImpactIQDiagnostics -and $script:ImpactIQDiagnostics.SessionOpen)) {
+            if ($script:ImpactIQDiagnostics -and $script:ImpactIQDiagnostics.Writer) {
+                $script:ImpactIQDiagnostics.Writer.Dispose()
+            }
+            $script:ImpactIQRunFailed = $false
+            $script:ImpactIQLogUnavailable = $false
+            $script:ImpactIQDiagnostics = @{
+                Writer = $null
+                LogPath = $ImpactIQLogPath
+                SessionOpen = $true
+                SeenExceptions = [Collections.Generic.HashSet[Exception]]::new()
+            }
+            foreach ($impactIQRecord in @($global:Error)) { $null = $script:ImpactIQDiagnostics.SeenExceptions.Add($impactIQRecord.Exception) }
+        }
+        if ($script:ImpactIQDiagnostics.LogPath -ne $ImpactIQLogPath) {
+            throw 'The diagnostic log path cannot change during an extraction session.'
+        }
+        if (-not $script:ImpactIQDiagnostics.Writer) {
+            $null = [IO.Directory]::CreateDirectory((Split-Path -Path $ImpactIQLogPath -Parent))
+            $script:ImpactIQDiagnostics.Writer = [IO.StreamWriter]::new($ImpactIQLogPath, $true, [Text.UTF8Encoding]::new($false))
+            $script:ImpactIQDiagnostics.Writer.AutoFlush = $true
+            Write-ImpactIQDiagnostic -Level INFO -Message 'ImpactIQ run started.'
+        }
+        $ErrorActionPreference = 'SilentlyContinue'
+        $WarningPreference = 'Continue'
+        try {
+            . $ImpactIQAction 2>&1 3>&1 6>&1 | ForEach-Object { Write-ImpactIQRunRecord -Record $_ }
+        }
+        catch {
+            $script:ImpactIQRunFailed = $true
+            Write-ImpactIQRunRecord -Record $_
+        }
+        finally {
+            $impactIQErrorHistory = @($global:Error)
+            [array]::Reverse($impactIQErrorHistory)
+            foreach ($impactIQRecord in $impactIQErrorHistory) { Write-ImpactIQRunRecord -Record $impactIQRecord }
+            if (-not $KeepOpen -and $script:ImpactIQRunFailed) {
+                Write-ImpactIQDiagnostic -Level WARN -Message 'The run encountered errors. Some steps or outputs may be incomplete.'
+            }
+        }
+    }
+    catch {
+        $script:ImpactIQRunFailed = $true
+        $script:ImpactIQLogUnavailable = $true
+        $impactIQCloseWriter = $true
+        $impactIQFallbackPath = Join-Path ([IO.Path]::GetTempPath()) 'ImpactIQ-errorlog.txt'
+        $impactIQLogMessage = Protect-ImpactIQLogText ("Cannot write diagnostics to '$ImpactIQLogPath': " + $_.Exception.Message)
+        try {
+            [IO.File]::AppendAllText($impactIQFallbackPath, ('[{0:O}] [ERROR] {1}{2}' -f [DateTime]::UtcNow, $impactIQLogMessage, [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+        }
+        catch [IO.IOException] { $script:ImpactIQLogUnavailable = $true }
+        catch [UnauthorizedAccessException] { $script:ImpactIQLogUnavailable = $true }
+    }
+    finally {
+        $script:ImpactIQDiagnostics.SessionOpen = [bool]$KeepOpen
+        if ((-not $KeepOpen -or $impactIQCloseWriter) -and $script:ImpactIQDiagnostics.Writer) {
+            try { $script:ImpactIQDiagnostics.Writer.Dispose() }
+            catch [IO.IOException] { $script:ImpactIQRunFailed = $true; $script:ImpactIQLogUnavailable = $true }
+            finally { $script:ImpactIQDiagnostics.Writer = $null }
+        }
+        $ErrorActionPreference = $impactIQPreviousErrorPreference
+        $WarningPreference = $impactIQPreviousWarningPreference
+    }
+}
+
+function Invoke-ImpactIQNativeCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [switch]$DiscardOutput
+    )
+
+    $ErrorActionPreference = 'Continue'
+    try { $null = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop }
+    catch [Management.Automation.CommandNotFoundException] {
+        $global:LASTEXITCODE = 1
+        Write-ImpactIQContinuingError -Record $_ -Context "Native command '$FilePath'"
+        return
+    }
+    & $FilePath @ArgumentList 2>&1 | ForEach-Object {
+        Write-ImpactIQRunRecord -Record $_ -DiscardOutput:$DiscardOutput
+    }
+    $exitCode = $LASTEXITCODE
+    $global:LASTEXITCODE = $exitCode
+    if ($exitCode -ne 0) {
+        Write-ImpactIQDiagnostic -Level ERROR -Message ("Native command '{0}' exited with code {1}." -f [IO.Path]::GetFileName($FilePath), $exitCode)
+    }
+}
+
+function Invoke-ImpactIQNativeProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory = (Get-Location).ProviderPath,
+        [switch]$PassThru
+    )
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = $ArgumentList -join ' '
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $returnedProcess = $false
+    try {
+        $null = $process.Start()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        foreach ($line in ($stdout.GetAwaiter().GetResult() -split '\r?\n')) {
+            if (-not $line) { continue }
+            $level = Get-ImpactIQDiagnosticLevel $line
+            if ($level) { Write-ImpactIQDiagnostic -Level $level -Message $line }
+            else { Microsoft.PowerShell.Utility\Write-Host $line }
+        }
+        foreach ($line in ($stderr.GetAwaiter().GetResult() -split '\r?\n')) {
+            if (-not $line) { continue }
+            $level = Get-ImpactIQDiagnosticLevel $line
+            if (-not $level) { $level = 'ERROR' }
+            Write-ImpactIQDiagnostic -Level $level -Message $line
+        }
+        $global:LASTEXITCODE = $process.ExitCode
+        if ($process.ExitCode -ne 0) {
+            Write-ImpactIQDiagnostic -Level ERROR -Message ("Native process '{0}' exited with code {1}." -f [IO.Path]::GetFileName($FilePath), $process.ExitCode)
+        }
+        if ($PassThru) { $returnedProcess = $true; $process }
+    }
+    finally {
+        if (-not $returnedProcess) { $process.Dispose() }
+    }
+}
+
+# Dot-sourced sections execute as they are pasted and retain state for later sections.
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -StartSession -KeepOpen -Action {
+# Resume later extraction sections without bypassing local retry and validation handlers.
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 # =============================
 # Config
 # =============================
@@ -23,7 +276,8 @@ if (-not (Test-Path $configFolder)) {
 
 # Token is now managed via MSAL session (Get-PowerBIAccessToken) — no file needed
 
-$ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
+$ErrorActionPreference = 'SilentlyContinue'
+$WarningPreference = 'Continue'
 
 # Temporarily set execution policy to Bypass for this session
 if ((Get-ExecutionPolicy) -ne 'Bypass') {
@@ -132,7 +386,7 @@ try {
         Set-Content -Path $teTestScriptPath -Value 'Info("Tabular Editor preflight OK");' -Encoding UTF8
 
         $teTestArgs = "`"$blankModelPath`" -S `"$teTestScriptPath`""
-        $teProcess = Start-Process -FilePath $TabularEditor2Path -Wait -NoNewWindow -PassThru -ArgumentList $teTestArgs -ErrorAction Stop
+        $teProcess = Invoke-ImpactIQNativeProcess -FilePath $TabularEditor2Path -PassThru -ArgumentList $teTestArgs -ErrorAction Stop
 
         if ($teProcess.ExitCode -eq 0) {
             $tabularEditorWorks = $true
@@ -168,13 +422,19 @@ if ($psGetVer -lt [version]'2.0.0') {
     Import-Module PowerShellGet -Force
 }
 
-# Ensure required modules are installed, and imports them. If import fails, error and exit early
+# A missing module must not prevent the remaining prerequisites from being attempted.
 $requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt', 'Az.Accounts' )
 foreach ($module in $requiredModules) {
-    if (-not (Import-Module $module -PassThru -EA Ignore)) {
-        Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck
+    try {
+        if (-not (Import-Module $module -PassThru -ErrorAction SilentlyContinue)) {
+            Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction SilentlyContinue
+        }
+        Import-Module $module -ErrorAction SilentlyContinue
     }
-    Import-Module $module -ErrorAction 'Stop'
+    catch {
+        Write-ImpactIQContinuingError -Record $_ -Context "Required module '$module'"
+    }
+}
 }
 
 
@@ -339,6 +599,12 @@ function Show-EnvironmentSelectionDialog {
 # ============================================
 # Prompt for Power BI Environment + Validation
 # ============================================
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 if (-not (Get-Variable -Name LoginEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
 
     $selectedEnv = Show-EnvironmentSelectionDialog -TimeoutSeconds 60
@@ -378,6 +644,8 @@ if ($LoginEnvironment -eq 'Public') {
 
 # If LoginEnvironment is explicitly set to Public, use $null so Connect-PowerBIServiceAccount uses default 'Public' endpoint.
 if ($LoginEnvironment -eq 'Public') { $LoginEnvironment = $null }
+}
+
 # Function to get environment-specific API endpoints
 function Get-PowerBIEndpoints {
     param(
@@ -448,8 +716,15 @@ function Get-PowerBIEndpoints {
 }
 
 # Initialize endpoints based on selected environment (store for later, before it becomes $null for Public)
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 $EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { 'Public' }
 $global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
+}
 
 # Connect to the Power BI Service
 function Connect-PowerBI {
@@ -469,13 +744,13 @@ function Connect-PowerBI {
                 Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints" -ForegroundColor Cyan
 
                 if ($Environment) {
-                    Connect-PowerBIServiceAccount -Environment $Environment -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+                    Connect-PowerBIServiceAccount -Environment $Environment -ErrorAction Stop -WarningAction Continue | Out-Null
                 }
                 else {
-                    Connect-PowerBIServiceAccount -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+                    Connect-PowerBIServiceAccount -ErrorAction Stop -WarningAction Continue | Out-Null
                 }
 
-                $token = Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null
+                $token = Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue
                 if ($token -and $token.Authorization) {
                     Write-Host "[INFO] Connected to Power BI." -ForegroundColor Green
                     return
@@ -520,7 +795,7 @@ function Get-FabricAccessToken {
         if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
             Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction SilentlyContinue | Out-Null
         }
-        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction SilentlyContinue 3>$null | Out-Null
+        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction Continue | Out-Null
     }
 
     try {
@@ -549,24 +824,31 @@ function Get-FabricAccessToken {
 }
 
 # Track script start time
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 $scriptStartTime = Get-Date
 
 Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
 $fabricAccessToken = Get-FabricAccessToken
 Write-Host "[INFO] Connected to Microsoft Fabric." -ForegroundColor Green
+}
 
 
 # Function to get the current access token — MSAL auto-refreshes silently via the session cache
 function Get-CurrentAccessToken {
     try {
-        return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
+        return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue).Authorization -replace 'Bearer ', ''
     }
     catch {
         # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
         Write-Host "[WARN] Token fetch failed, re-connecting..."
         try {
             Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
-            return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction SilentlyContinue 3>$null).Authorization -replace 'Bearer ', ''
+            return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue).Authorization -replace 'Bearer ', ''
         }
         catch {
             Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
@@ -610,6 +892,12 @@ function Invoke-FabricPagedGet {
 }
 
 # Create a variable date
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 $date = (Get-Date -UFormat "%Y-%m-%d")
 
 
@@ -630,6 +918,7 @@ $date = (Get-Date -UFormat "%Y-%m-%d")
 
 # Define the Information Extract Excel file path
 $excelFile = "$baseFolderPath\Power BI Environment Detail.xlsx"
+}
 
 # Function to rename properties in objects and handle duplicates
 function Rename-Properties {
@@ -1408,6 +1697,12 @@ function Show-ModelPicker {
 
 
 # Define renaming maps for each type of object
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 $workspaceRenameMap = @{
     "id" = "WorkspaceId";
     "name" = "WorkspaceName";
@@ -1547,6 +1842,7 @@ $fabricItemsRenameMap = @{
     "displayName" = "FabricItemName";
     "description" = "FabricItemDescription"
 }
+}
 
 
 function Get-FabricDataAgentInventory {
@@ -1597,17 +1893,17 @@ function Get-FabricDataAgentToken {
     # The CLI client can carry delegated scopes that the Azure PowerShell client lacks.
     if ($azCommand) {
         try {
-            $cloud = (& az cloud show --query name -o tsv 2>$null)
+            $cloud = Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('cloud', 'show', '--query', 'name', '-o', 'tsv')
             if ($LASTEXITCODE -ne 0 -or $cloud -ne $context.Environment.Name) {
                 throw "Azure CLI cloud does not match the current Fabric sign-in."
             }
             $tenantId = $context.Tenant.Id
-            $token = (& az account get-access-token --resource $resource --tenant $tenantId --query accessToken -o tsv 2>$null)
+            $token = Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('account', 'get-access-token', '--resource', $resource, '--tenant', $tenantId, '--query', 'accessToken', '-o', 'tsv')
             if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
                 Write-Host "[INFO] Signing in to Azure CLI for Data Agent definitions..." -ForegroundColor Cyan
-                & az login --tenant $tenantId --allow-no-subscriptions --output none
+                Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('login', '--tenant', $tenantId, '--allow-no-subscriptions', '--output', 'none')
                 if ($LASTEXITCODE -ne 0) { throw "Azure CLI sign-in failed." }
-                $token = (& az account get-access-token --resource $resource --tenant $tenantId --query accessToken -o tsv 2>$null)
+                $token = Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('account', 'get-access-token', '--resource', $resource, '--tenant', $tenantId, '--query', 'accessToken', '-o', 'tsv')
             }
             if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
                 throw "Azure CLI did not return a Fabric access token."
@@ -2796,7 +3092,7 @@ function Initialize-FabricAppDaxParser {
     $ErrorActionPreference = 'Stop'
     if ($Engine -eq 'PowerShell') { return [PSCustomObject]@{ Engine = 'PowerShell' } }
     $node = Get-Command node -ErrorAction Stop
-    $nodeVersion = & $node.Source --version
+    $nodeVersion = Invoke-ImpactIQNativeCommand -FilePath $node.Source -ArgumentList @('--version')
     if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.' -or [int]$Matches[1] -lt 18) {
         throw 'Fabric app query extraction requires Node.js 18 or newer.'
     }
@@ -2807,7 +3103,7 @@ function Initialize-FabricAppDaxParser {
     }
     if ($installedVersion -ne '8.15.0') {
         $npm = Get-Command npm.cmd -ErrorAction Stop
-        & $npm.Source install --prefix $RuntimePath --ignore-scripts --no-audit --no-fund --package-lock=false acorn@8.15.0 | Out-Host
+        Invoke-ImpactIQNativeCommand -FilePath $npm.Source -ArgumentList @('install', '--prefix', $RuntimePath, '--ignore-scripts', '--no-audit', '--no-fund', '--package-lock=false', 'acorn@8.15.0') | Out-Host
         if ($LASTEXITCODE -ne 0) { throw 'Could not install the pinned Acorn parser.' }
     }
     $parserSource = @'
@@ -2996,7 +3292,7 @@ function Assert-FabricAppDaxHostingUri {
 function Get-FabricAppDaxToken {
     param([Parameter(Mandatory)][string]$ResourceUrl)
     try {
-        $token = (Get-AzAccessToken -ResourceUrl $ResourceUrl -ErrorAction Stop -WarningAction SilentlyContinue).Token
+        $token = (Get-AzAccessToken -ResourceUrl $ResourceUrl -ErrorAction Stop -WarningAction Continue).Token
         if ($token -is [Security.SecureString]) {
             return [Net.NetworkCredential]::new('', $token).Password
         }
@@ -3294,7 +3590,7 @@ function Get-FabricAppDaxCapture {
                     $null = New-Item -ItemType Directory -Path $assetFolder -Force
                     $bundlePath = Join-Path $assetFolder 'bundle.js'
                     [IO.File]::WriteAllText($bundlePath, $content, [Text.UTF8Encoding]::new($false))
-                    $null = & $ParserRuntime.NodePath $parserPath $bundlePath $assetFolder 2>&1
+                    Invoke-ImpactIQNativeCommand -FilePath $ParserRuntime.NodePath -ArgumentList @($parserPath, $bundlePath, $assetFolder) -DiscardOutput
                     if ($LASTEXITCODE -ne 0) { throw 'JavaScript parsing failed.' }
                     $catalog = Get-Content -LiteralPath (Join-Path $assetFolder 'queries.json') -Raw | ConvertFrom-Json
                 }
@@ -3562,7 +3858,7 @@ function Export-FabricAppQueryWorkbook {
                 @{
                     Name = 'QueryDependencyStatus'
                     Rows = $DependencyStatus
-                    Headers = @('QueryId', 'AppId', 'AppName', 'QuerySymbol', 'ModelId', 'Status', 'DirectObjectCount', 'RelatedObjectCount', 'UnresolvedCount', 'Coverage')
+                    Headers = @('QueryId', 'AppId', 'AppName', 'QuerySymbol', 'ModelId', 'Status', 'DirectObjectCount', 'UnresolvedCount', 'Coverage')
                 }
             )
         }
@@ -3841,8 +4137,7 @@ function Get-FabricAppQueryDependencies {
     [CmdletBinding()]
     param(
         [AllowEmptyCollection()][object[]]$Queries = @(),
-        [AllowEmptyCollection()][object[]]$ModelObjects = @(),
-        [AllowEmptyCollection()][object[]]$ModelDependencies = @()
+        [AllowEmptyCollection()][object[]]$ModelObjects = @()
     )
 
     $ErrorActionPreference = 'Stop'
@@ -3856,13 +4151,13 @@ function Get-FabricAppQueryDependencies {
     $models = @{}
     foreach ($row in $ModelObjects) {
         $type = Get-ObjectType ([string]$row.Type)
-        if ($type -notin @('Table', 'Column', 'Measure', 'CalculationItem') -or -not $row.ModelID) { continue }
+        if ($type -notin @('Table', 'Column', 'Measure') -or -not $row.ModelID) { continue }
         $id = [string]$row.ModelID
-        if (-not $models.ContainsKey($id)) { $models[$id] = @{ Objects = @{}; Fields = @{}; Names = @{}; Graph = @{} } }
+        if (-not $models.ContainsKey($id)) { $models[$id] = @{ Objects = @{}; Fields = @{}; Names = @{} } }
         $model = $models[$id]
         $key = Get-ObjectKey $type $row.Table $row.Name
-        if ($model.Objects.ContainsKey($key) -and -not $row.Expression) { continue }
-        $object = [PSCustomObject]@{ Key = $key; Type = $type; Table = [string]$row.Table; Name = [string]$row.Name; Expression = [string]$row.Expression; Calculated = $row.Type -eq 'CalculatedColumn' }
+        if ($model.Objects.ContainsKey($key)) { continue }
+        $object = [PSCustomObject]@{ Key = $key; Type = $type; Table = [string]$row.Table; Name = [string]$row.Name }
         $model.Objects[$key] = $object
         if ($type -in @('Column', 'Measure')) { $model.Fields[([string]$row.Table + [char]0 + [string]$row.Name)] = $key }
         $nameKey = $type + [char]0 + [string]$row.Name
@@ -3891,32 +4186,9 @@ function Get-FabricAppQueryDependencies {
         }
         if ($keys.Count -eq 1) { return $Model.Objects[$keys[0]] }
     }
-    foreach ($row in $ModelDependencies) {
-        $id = [string]$row.ModelID
-        if (-not $models.ContainsKey($id)) { continue }
-        $model = $models[$id]
-        $nameKey = (Get-ObjectType ([string]$row.ObjectType)) + [char]0 + [string]$row.ObjectName
-        if (-not $model.Names.ContainsKey($nameKey)) { continue }
-        $parents = @($model.Names[$nameKey])
-        if ($row.ObjectTable) { $parents = @($parents | Where-Object { $model.Objects[$_].Table -eq $row.ObjectTable }) }
-        if ($parents.Count -ne 1) { continue }
-        $key = $parents[0]
-        if (-not $model.Graph.ContainsKey($key)) { $model.Graph[$key] = [Collections.Generic.List[object]]::new() }
-        try {
-            $references = @(Get-FabricAppDaxReferences -Text ([string]$row.DependsOn))
-            $fields = @($references | Where-Object { $_.Kind -eq 'Field' })
-            $targets = if ($fields.Count) { $fields } else { @($references | Where-Object { $_.Kind -in @('Table', 'PossibleTable') }) }
-            if ($targets.Count -eq 0) { throw [FormatException]::new("Unrecognized model dependency: $($row.DependsOn)") }
-            foreach ($target in $targets) { $model.Graph[$key].Add($target) }
-        }
-        catch [FormatException] {
-            $model.Graph[$key].Add([PSCustomObject]@{ Kind = 'Invalid'; Table = ''; Name = [string]$row.DependsOn; Error = $_.Exception.Message })
-        }
-    }
     $edges = [Collections.Generic.List[object]]::new()
     $statuses = [Collections.Generic.List[object]]::new()
     $queryRows = [Collections.Generic.List[object]]::new()
-    $formulaCache = @{}
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         foreach ($query in $Queries) {
@@ -3929,9 +4201,7 @@ function Get-FabricAppQueryDependencies {
             $exportQuery | Add-Member -NotePropertyName QueryId -NotePropertyValue $queryId -Force
             $queryRows.Add($exportQuery)
             $seenEdges = @{}
-            $seenObjects = @{}
             $directObjects = @{}
-            $queue = [Collections.Generic.Queue[object]]::new()
             $queryState = @{ Unresolved = 0 }
             $model = $models[[string]$query.ModelId]
             function Add-QueryEdge($Parent, $Target, [string]$Kind, [int]$Depth, [string]$Detail = '') {
@@ -3951,10 +4221,6 @@ function Get-FabricAppQueryDependencies {
                     DependencyKind = $Kind; DependencyDepth = $Depth
                     Resolution = $(if ($resolved) { 'Resolved' } else { 'Unresolved' }); Detail = $Detail
                 })
-                if ($resolved -and -not $seenObjects.ContainsKey($targetKey)) {
-                    $seenObjects[$targetKey] = $true
-                    $queue.Enqueue(@{ Object = $Target; Depth = $Depth })
-                }
                 if ($resolved -and $Kind -eq 'Direct query reference') { $directObjects[$targetKey] = $true }
             }
             function Add-QueryReferences($Parent, [object[]]$References, [string]$Kind, [int]$Depth, [string]$ResolutionError = '') {
@@ -4008,43 +4274,13 @@ function Get-FabricAppQueryDependencies {
                 catch [FormatException] {
                     Add-QueryEdge $root ([PSCustomObject]@{ Type = 'Unknown'; Table = ''; Name = '' }) 'Direct query reference' 1 $_.Exception.Message
                 }
-                while ($queue.Count) {
-                    $entry = $queue.Dequeue()
-                    $object = $entry.Object
-                    if ($object.Type -ne 'Table') {
-                        $tableKey = Get-ObjectKey 'Table' $object.Table $object.Table
-                        if ($model.Objects.ContainsKey($tableKey)) {
-                            Add-QueryEdge $object $model.Objects[$tableKey] 'Object table' ($entry.Depth + 1)
-                        }
-                        else {
-                            Add-QueryEdge $object ([PSCustomObject]@{ Type = 'Table'; Table = $object.Table; Name = $object.Table }) 'Object table' ($entry.Depth + 1) 'The containing table is missing from model metadata.'
-                        }
-                    }
-                    $cacheKey = [string]$query.ModelId + [char]1 + $object.Key
-                    if (-not $formulaCache.ContainsKey($cacheKey)) {
-                        if ($model.Graph.ContainsKey($object.Key)) {
-                            $formulaCache[$cacheKey] = @($model.Graph[$object.Key].ToArray())
-                        }
-                        elseif ($object.Expression) {
-                            try {
-                                $context = if ($object.Calculated) { $object.Table } else { '' }
-                                $formulaCache[$cacheKey] = @(Get-FabricAppDaxReferences -Text $object.Expression -DefaultTable $context)
-                            }
-                            catch [FormatException] {
-                                $formulaCache[$cacheKey] = @([PSCustomObject]@{ Kind = 'Invalid'; Table = ''; Name = $object.Name; Error = $_.Exception.Message })
-                            }
-                        }
-                        else { $formulaCache[$cacheKey] = @() }
-                    }
-                    Add-QueryReferences $object @($formulaCache[$cacheKey]) 'Model object dependency' ($entry.Depth + 1)
-                }
                 if ($queryState.Unresolved) { $status = 'UnresolvedReferences' }
                 elseif ($query.Evidence -eq 'DynamicTemplate') { $status = 'PartialDynamicTemplate' }
             }
             $statuses.Add([PSCustomObject][ordered]@{
                 QueryId = $queryId; AppId = $query.AppId; AppName = $query.AppName; QuerySymbol = $query.QuerySymbol; ModelId = $query.ModelId
-                Status = $status; DirectObjectCount = $directObjects.Count; RelatedObjectCount = $seenObjects.Count; UnresolvedCount = $queryState.Unresolved
-                Coverage = 'Metadata-matched static references and reachable model dependencies only. Runtime JavaScript, unvisited assets, implicit relationships, RLS and calculation-group execution are not proven by this extract.'
+                Status = $status; DirectObjectCount = $directObjects.Count; UnresolvedCount = $queryState.Unresolved
+                Coverage = 'Direct metadata-matched query references only. Measure/formula dependencies and inferred home tables are excluded. Runtime JavaScript and unvisited assets are not proven by this extract.'
             })
         }
     }
@@ -4059,12 +4295,11 @@ function Export-FabricAppQueryDependencyDetail {
         [AllowEmptyCollection()][object[]]$Queries = @(),
         [AllowEmptyCollection()][object[]]$Models = @(),
         [AllowEmptyCollection()][object[]]$Captures = @(),
-        [AllowEmptyCollection()][object[]]$ModelObjects = @(),
-        [AllowEmptyCollection()][object[]]$ModelDependencies = @()
+        [AllowEmptyCollection()][object[]]$ModelObjects = @()
     )
 
     $ErrorActionPreference = 'Stop'
-    $result = Get-FabricAppQueryDependencies -Queries $Queries -ModelObjects $ModelObjects -ModelDependencies $ModelDependencies
+    $result = Get-FabricAppQueryDependencies -Queries $Queries -ModelObjects $ModelObjects
     $path = Join-Path $BaseFolderPath 'Fabric App Detail.xlsx'
     $temporaryPath = Join-Path $BaseFolderPath ('AppQueryDependencies-' + [guid]::NewGuid().ToString('N') + '.xlsx')
     try {
@@ -4090,8 +4325,7 @@ function Export-FabricAppDaxEnvironment {
         [AllowEmptyCollection()][object[]]$Datasets = @(),
         [AllowEmptyCollection()][object[]]$Workspaces = @(),
         [ValidateSet('PowerShell', 'Acorn')][string]$ParserEngine = 'PowerShell',
-        [AllowEmptyCollection()][object[]]$ModelObjects = @(),
-        [AllowEmptyCollection()][object[]]$ModelDependencies = @()
+        [AllowEmptyCollection()][object[]]$ModelObjects = @()
     )
 
     $ErrorActionPreference = 'Stop'
@@ -4136,20 +4370,36 @@ function Export-FabricAppDaxEnvironment {
         $appQueryCaptures += $appCapture.Capture
     }
     Export-FabricAppQueryWorkbook -Path $environmentWorkbook -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ErrorAction Stop
-    Export-FabricAppQueryDependencyDetail -BaseFolderPath $BaseFolderPath -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ModelObjects $ModelObjects -ModelDependencies $ModelDependencies -ErrorAction Stop
+    Export-FabricAppQueryDependencyDetail -BaseFolderPath $BaseFolderPath -Queries $appQueryRows -Models $appModelRows -Captures $appQueryCaptures -ModelObjects $ModelObjects -ErrorAction Stop
     Write-Host "[INFO] Exported $($appQueryRows.Count) queries and $($appModelRows.Count) configured models to $environmentWorkbook."
 }
 
 # Fetch and filter workspaces
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
 $workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
 $workspacesInfo = @()
+$IncludeMyWorkspace = $false
+$selection = $null
+$global:RunMode = $null
+$global:SelectedDatasetIds = @{}
+$global:SelectedReportIds = @{}
+$script:SelectedFabricApps = @{}
+$script:FabricAppCaptures = @{}
+$script:SelectedDataAgents = @{}
+$script:DataAgentDefinitions = @{}
 
 # --- Show Run Mode Dialog (loop back on Cancel from report picker) ---
 $reportPickerCancelled = $true
 while ($reportPickerCancelled) {
     $reportPickerCancelled = $false
     $runMode = Show-RunModeDialog
+    $global:RunMode = $runMode
 
 if ($runMode -eq 'Cancel') {
     Write-Host "[INFO] Run cancelled by user." -ForegroundColor Yellow
@@ -4226,22 +4476,27 @@ if ($runMode -eq 'FabricApps') {
     $appRuntime = Initialize-FabricAppDaxParser -Engine PowerShell -ErrorAction Stop
     $appModelNameCache = @{}
     foreach ($pickedApp in $pickedApps) {
-        $choice = $appChoices | Where-Object { $_.DatasetId -eq $pickedApp.DatasetId } | Select-Object -First 1
-        $key = $choice.DatasetId
-        $script:SelectedFabricApps[$key] = $choice.App
-        $neededWorkspaceIds[$choice.WorkspaceId] = $true
-        Write-Host "Extracting $($choice.App.displayName) Fabric App detail"
-        $capture = Get-FabricAppDaxCapture -WorkspaceId $choice.WorkspaceId -WorkspaceName $choice.WorkspaceName -AppId $choice.App.id -AppName $choice.App.displayName -ParserRuntime $appRuntime -Environment $EnvironmentForEndpoints -ModelNameCache $appModelNameCache
-        if ($capture.Error -or @($capture.Models).Count -eq 0) {
-            throw "Cannot reliably scope connected Models for Fabric App '$($choice.App.displayName)': $($capture.Error)"
-        }
-        $script:FabricAppCaptures[$key] = $capture
-        foreach ($model in $capture.Models) {
-            $global:SelectedDatasetIds[$model.ModelId] = $true
-            $neededWorkspaceIds[$model.ModelWorkspaceId] = $true
-            if ($workspacesResponse.value.id -notcontains $model.ModelWorkspaceId) {
-                Write-Host "[WARN] Connected Model $($model.ModelId) is in inaccessible workspace $($model.ModelWorkspaceId); it cannot be extracted." -ForegroundColor Yellow
+        try {
+            $choice = $appChoices | Where-Object { $_.DatasetId -eq $pickedApp.DatasetId } | Select-Object -First 1
+            $key = $choice.DatasetId
+            $script:SelectedFabricApps[$key] = $choice.App
+            $neededWorkspaceIds[$choice.WorkspaceId] = $true
+            Write-Host "Extracting $($choice.App.displayName) Fabric App detail"
+            $capture = Get-FabricAppDaxCapture -WorkspaceId $choice.WorkspaceId -WorkspaceName $choice.WorkspaceName -AppId $choice.App.id -AppName $choice.App.displayName -ParserRuntime $appRuntime -Environment $EnvironmentForEndpoints -ModelNameCache $appModelNameCache
+            $script:FabricAppCaptures[$key] = $capture
+            if ($capture.Error -or @($capture.Models).Count -eq 0) {
+                throw "Cannot reliably scope connected Models for Fabric App '$($choice.App.displayName)': $($capture.Error)"
             }
+            foreach ($model in $capture.Models) {
+                $global:SelectedDatasetIds[$model.ModelId] = $true
+                $neededWorkspaceIds[$model.ModelWorkspaceId] = $true
+                if ($workspacesResponse.value.id -notcontains $model.ModelWorkspaceId) {
+                    Write-Host "[WARN] Connected Model $($model.ModelId) is in inaccessible workspace $($model.ModelWorkspaceId); it cannot be extracted." -ForegroundColor Yellow
+                }
+            }
+        }
+        catch {
+            Write-ImpactIQContinuingError -Record $_ -Context "Fabric App '$($pickedApp.DatasetId)'"
         }
     }
     $workspacesInfo = @($workspacesResponse.value | Where-Object { $neededWorkspaceIds.ContainsKey($_.id) } |
@@ -4303,21 +4558,26 @@ if ($runMode -eq 'FabricApps') {
     $neededWorkspaceIds = @{}
     $script:DataAgentDefinitionToken = Get-FabricDataAgentToken
     foreach ($pickedAgent in $pickedAgents) {
-        $key = $pickedAgent.DatasetId
-        $choice = $agentChoices | Where-Object { $_.DatasetId -eq $key } | Select-Object -First 1
-        $script:SelectedDataAgents[$key] = $choice.Agent
-        $neededWorkspaceIds[$choice.WorkspaceId] = $true
-        $definition = Get-FabricDataAgentDefinition -WorkspaceId $choice.WorkspaceId -DataAgentId $choice.Agent.id -AccessToken $script:DataAgentDefinitionToken
-        if (-not $definition) {
-            throw "Cannot scope connected semantic models for '$($choice.Agent.displayName)' without its definition. Check the reported permissions/authentication failure and rerun."
-        }
-        $script:DataAgentDefinitions[$key] = $definition
-        foreach ($target in (Get-FabricDataAgentModelTargets -Definition $definition)) {
-            $global:SelectedDatasetIds[$target.DatasetId] = $true
-            $neededWorkspaceIds[$target.WorkspaceId] = $true
-            if ($workspacesResponse.value.id -notcontains $target.WorkspaceId) {
-                Write-Host "[WARN] Connected model $($target.DatasetId) is in inaccessible workspace $($target.WorkspaceId); it cannot be extracted." -ForegroundColor Yellow
+        try {
+            $key = $pickedAgent.DatasetId
+            $choice = $agentChoices | Where-Object { $_.DatasetId -eq $key } | Select-Object -First 1
+            $script:SelectedDataAgents[$key] = $choice.Agent
+            $neededWorkspaceIds[$choice.WorkspaceId] = $true
+            $definition = Get-FabricDataAgentDefinition -WorkspaceId $choice.WorkspaceId -DataAgentId $choice.Agent.id -AccessToken $script:DataAgentDefinitionToken
+            if (-not $definition) {
+                throw "Cannot scope connected semantic models for '$($choice.Agent.displayName)' without its definition. Check the reported permissions/authentication failure and rerun."
             }
+            $script:DataAgentDefinitions[$key] = $definition
+            foreach ($target in (Get-FabricDataAgentModelTargets -Definition $definition)) {
+                $global:SelectedDatasetIds[$target.DatasetId] = $true
+                $neededWorkspaceIds[$target.WorkspaceId] = $true
+                if ($workspacesResponse.value.id -notcontains $target.WorkspaceId) {
+                    Write-Host "[WARN] Connected model $($target.DatasetId) is in inaccessible workspace $($target.WorkspaceId); it cannot be extracted." -ForegroundColor Yellow
+                }
+            }
+        }
+        catch {
+            Write-ImpactIQContinuingError -Record $_ -Context "Data Agent '$($pickedAgent.DatasetId)'"
         }
     }
     $workspacesInfo = @($workspacesResponse.value | Where-Object { $neededWorkspaceIds.ContainsKey($_.id) } |
@@ -4734,11 +4994,12 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
     # Fetch datasets
     $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets"
-    if ($global:RunMode -in @('Agents', 'FabricApps')) {
-        $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl -ErrorAction Stop | ConvertFrom-Json
+    try {
+        $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl -ErrorAction SilentlyContinue | ConvertFrom-Json
     }
-    else {
-        $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
+    catch {
+        Write-ImpactIQContinuingError -Record $_ -Context "Workspace '$workspaceName' model metadata"
+        continue
     }
 
     foreach ($dataset in $datasets.value) {
@@ -5432,7 +5693,7 @@ Model.Database.Name = `"$newModelDatabaseName`";
         
         # Start the Tabular Editor process for model export and renaming
 		Write-Host "**Exporting $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
-        Start-Process -FilePath "$TabularEditor2Path" -Wait -NoNewWindow -ArgumentList $modelExportArgs
+        Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -ArgumentList $modelExportArgs
 
         # Clean up the temporary script file
         Remove-Item -Path $tempScriptPath
@@ -5443,6 +5704,7 @@ Model.Database.Name = `"$newModelDatabaseName`";
 }
 
 Write-Output "Model Backup Process Completed"
+}
 
 function Export-EmptyDetailWorkbook {
     [CmdletBinding()]
@@ -5480,6 +5742,12 @@ function Export-EmptyDetailWorkbook {
 
 
 #### Start of Report Backup ####
+
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
 
 if ($global:RunMode -notin @('Agents', 'FabricApps')) {
 
@@ -5811,17 +6079,15 @@ function Export-ReportDefinitionAsPbix {
 		    Write-Host "Extracting $cleanWorkspaceName ~ $cleanReportName"
 		
 		    $driveLetter = Get-FreeDriveLetter
-		    $quotedExtractFolder = "`"$extractFolder`""
 		
 		    # ✅ Make sure the extract folder exists before subst
 		    if (-not (Test-Path $extractFolder)) {
 		        New-Item -ItemType Directory -Path $extractFolder -Force | Out-Null
 		    }
 		
-		    if (Test-Path $driveLetter) { subst $driveLetter /D }
+		    if (Test-Path $driveLetter) { Invoke-ImpactIQNativeCommand -FilePath 'subst.exe' -ArgumentList @($driveLetter, '/D') -DiscardOutput }
 		
-		    $substCommand = "subst $driveLetter $quotedExtractFolder"
-		    cmd.exe /c $substCommand
+		    Invoke-ImpactIQNativeCommand -FilePath 'subst.exe' -ArgumentList @($driveLetter, $extractFolder) -DiscardOutput
 		
 		    if (-not (Test-Path $driveLetter)) {
 		        Write-Error "Failed to map $extractFolder to $driveLetter"
@@ -5831,9 +6097,9 @@ function Export-ReportDefinitionAsPbix {
 		    try {
 		        # Extract into subst drive
 				Write-Host "If available, extracting Model from $cleanWorkspaceName ~ $cleanReportName"
-		        & $pbiToolsPath extract $filepath -extractFolder $driveLetter -modelSerialization Raw *> $null
+		        Invoke-ImpactIQNativeCommand -FilePath $pbiToolsPath -ArgumentList @('extract', $filepath, '-extractFolder', $driveLetter, '-modelSerialization', 'Raw') -DiscardOutput
 		
-		        & $pbiToolsPath generate-bim $driveLetter -transforms RemovePBIDataSourceVersion *> $null
+		        Invoke-ImpactIQNativeCommand -FilePath $pbiToolsPath -ArgumentList @('generate-bim', $driveLetter, '-transforms', 'RemovePBIDataSourceVersion') -DiscardOutput
 		
 		        $bimFilesGenerated = Get-ChildItem -Path $extractFolder -Filter *.bim
 		        foreach ($bimFile in $bimFilesGenerated) {
@@ -5845,7 +6111,7 @@ function Export-ReportDefinitionAsPbix {
 		    }
 		    finally {
 		        # ✅ Always clean up subst drive, even if extract/generate fails
-		        subst $driveLetter /D 2>$null
+		        Invoke-ImpactIQNativeCommand -FilePath 'subst.exe' -ArgumentList @($driveLetter, '/D') -DiscardOutput
 		    }
 		}
 	}
@@ -5871,7 +6137,7 @@ Model.Database.ID = "$fileName";
 
     # Run Tabular Editor CLI to update BIM
     $args = "`"$($bimFile.FullName)`" -S `"$tempScriptPath`" -B `"$($bimFile.FullName)`""
-    Start-Process -FilePath $TabularEditor2Path -Wait -NoNewWindow -ArgumentList $args
+    Invoke-ImpactIQNativeProcess -FilePath $TabularEditor2Path -ArgumentList $args
 
     # Remove temp script
     Remove-Item -Path $tempScriptPath -Force
@@ -5908,10 +6174,10 @@ Write-Output "Report Backup Process Completed"
 Write-Output "Report Detail Extraction Process Started"
 
 # Start Tabular Editor process 1
-$p = Start-Process -FilePath "$TabularEditor2Path" -Wait -NoNewWindow -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script1Path`""
+$p = Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script1Path`""
 
 # Start Tabular Editor process 2
-$p = Start-Process -FilePath "$TabularEditor2Path" -Wait -NoNewWindow -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script2Path`""
+$p = Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script2Path`""
 
 # Define the output Excel file path in the parent folder
 $outputExcelFile = Join-Path -Path $baseFolderPath -ChildPath "Report Detail.xlsx"
@@ -6071,7 +6337,7 @@ foreach ($dataset in $datasetsInfo) {
     
     # Start the Tabular Editor process to run the first model script
 	Write-Host "**Extracting Model Detail for $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
-    Start-Process -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -Wait -NoNewWindow -ArgumentList $modelScriptArgs
+    Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList $modelScriptArgs
 }
 
 Write-Host "First model export and script run completed."
@@ -6138,7 +6404,7 @@ foreach ($dataset in $datasetsInfo) {
     
     # Start the Tabular Editor process to run the second model script
 	Write-Host "**Extracting Measure Dependency Detail for $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
-    Start-Process -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -Wait -NoNewWindow -ArgumentList $modelScriptArgs
+    Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList $modelScriptArgs
 }
 
 Write-Host "Second model export and script run completed."
@@ -6367,9 +6633,7 @@ if ($latestDataflowDateFolder) {
     $folderPath = $latestDataflowDateFolder.FullName
     Write-Host "Using the latest dated folder: $baseOutputFilePath"
 } else {
-    # Throw an error if no valid dated folders are found
-    Write-Error "No valid dated folders found in 'Dataflow Backups'."
-    exit
+    throw "No valid dated folders found in 'Dataflow Backups'."
 }
 
 # Set the combined Excel output path
@@ -6618,6 +6882,7 @@ else {
     Export-EmptyDetailWorkbook -Path (Join-Path $baseFolderPath 'Dataflow Detail.xlsx') -Worksheets $dataflowDetailWorksheets -ErrorAction Stop
 }
 #### Start of Power BI Data Agent Detail Extract ####
+}
 
 function Export-FabricDataAgentDetail {
     param(
@@ -6786,6 +7051,12 @@ function Export-FabricDataAgentDetail {
     Write-Output "Data Agent Detail Extraction Process Completed. Excel output saved to $outputPath"
 }
 
+. Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -Action {
+trap {
+    Write-ImpactIQContinuingError -Record $_
+    continue
+}
+
 if ($global:RunMode -ne 'FabricApps') {
     Export-FabricDataAgentDetail -BaseFolderPath $baseFolderPath -ReportDate $date -Workspaces $workspacesInfo -DatasetNames $datasetNameLookup
 }
@@ -6797,10 +7068,10 @@ if ($EnableFabricAppDax) {
         if ($global:RunMode -eq 'FabricApps') {
             $captures = @($script:FabricAppCaptures.Values)
             Export-FabricAppQueryWorkbook -Path (Join-Path $baseFolderPath 'Power BI Environment Detail.xlsx') -Queries @($captures | ForEach-Object { $_.Queries }) -Models @($captures | ForEach-Object { $_.Models }) -Captures @($captures | ForEach-Object { $_.Capture }) -ErrorAction Stop
-            Export-FabricAppQueryDependencyDetail -BaseFolderPath $baseFolderPath -Queries @($captures | ForEach-Object { $_.Queries }) -Models @($captures | ForEach-Object { $_.Models }) -Captures @($captures | ForEach-Object { $_.Capture }) -ModelObjects @($semanticModelsCsvData) -ModelDependencies @($measureDependenciesCsvData) -ErrorAction Stop
+            Export-FabricAppQueryDependencyDetail -BaseFolderPath $baseFolderPath -Queries @($captures | ForEach-Object { $_.Queries }) -Models @($captures | ForEach-Object { $_.Models }) -Captures @($captures | ForEach-Object { $_.Capture }) -ModelObjects @($semanticModelsCsvData) -ErrorAction Stop
         }
         else {
-            Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ModelObjects @($semanticModelsCsvData) -ModelDependencies @($measureDependenciesCsvData) -ErrorAction Stop
+            Export-FabricAppDaxEnvironment -Items @($fabricItemsInfo) -BaseFolderPath $baseFolderPath -Environment $EnvironmentForEndpoints -Datasets @($datasetsInfo) -Workspaces @($workspacesInfo) -ParserEngine $FabricAppDaxParser -ModelObjects @($semanticModelsCsvData) -ErrorAction Stop
         }
     }
     catch {
@@ -6811,8 +7082,11 @@ if ($EnableFabricAppDax) {
 else {
 }
 
-Write-Output "All Excel files processed and combined successfully."
+Write-Output "Extraction processing finished."
 
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
+}
+
+if ($script:ImpactIQLogUnavailable) { exit 1 }

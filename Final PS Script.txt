@@ -3991,7 +3991,7 @@ function Export-FabricAppQueryWorkbook {
                 @{
                     Name = 'QueryDependencies'
                     Rows = $Dependencies
-                    Headers = @('QueryId', 'WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelId', 'ModelName', 'ObjectName', 'ObjectType', 'ObjectTable', 'DependsOn', 'DependsOnType', 'DependsOnTable', 'DependencyKind', 'DependencyDepth', 'Resolution', 'Detail')
+                    Headers = @('QueryId', 'WorkspaceId', 'WorkspaceName', 'AppId', 'AppName', 'QuerySymbol', 'ConnectionAlias', 'ModelWorkspaceId', 'ModelWorkspaceName', 'ModelId', 'ModelName', 'ObjectName', 'ObjectType', 'ObjectTable', 'DependsOn', 'DependsOnType', 'DependsOnTable', 'DependencyKind', 'DependencyDepth', 'Resolution', 'Detail')
                 },
                 @{
                     Name = 'QueryDependencyStatus'
@@ -4531,6 +4531,7 @@ function Get-FabricAppQueryDependencies {
                     QueryId = $queryId; WorkspaceId = $query.WorkspaceId; WorkspaceName = $query.WorkspaceName
                     AppId = $query.AppId; AppName = $query.AppName; QuerySymbol = $query.QuerySymbol
                     ConnectionAlias = $query.ConnectionAlias; ModelWorkspaceId = $query.ModelWorkspaceId
+                    ModelWorkspaceName = $query.ModelWorkspaceName
                     ModelId = $query.ModelId; ModelName = $query.ModelName
                     ObjectName = $Parent.Name; ObjectType = $Parent.Type; ObjectTable = $Parent.Table
                     DependsOn = $Target.Name; DependsOnType = $Target.Type; DependsOnTable = $Target.Table

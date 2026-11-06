@@ -215,7 +215,8 @@ function Invoke-ImpactIQNativeProcess {
         [Parameter(Mandatory)][string]$FilePath,
         [string[]]$ArgumentList = @(),
         [string]$WorkingDirectory = (Get-Location).ProviderPath,
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$StartOnly
     )
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -229,31 +230,126 @@ function Invoke-ImpactIQNativeProcess {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     $returnedProcess = $false
+    $started = $false
     try {
         $null = $process.Start()
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
+        $started = $true
+        $run = [PSCustomObject]@{
+            Process = $process
+            FilePath = $FilePath
+            StandardOutput = $process.StandardOutput.ReadToEndAsync()
+            StandardError = $process.StandardError.ReadToEndAsync()
+        }
+        if ($StartOnly) {
+            $returnedProcess = $true
+            return $run
+        }
         $process.WaitForExit()
-        foreach ($line in ($stdout.GetAwaiter().GetResult() -split '\r?\n')) {
-            if (-not $line) { continue }
-            $level = Get-ImpactIQDiagnosticLevel $line
-            if ($level) { Write-ImpactIQDiagnostic -Level $level -Message $line }
-            else { Microsoft.PowerShell.Utility\Write-Host $line }
-        }
-        foreach ($line in ($stderr.GetAwaiter().GetResult() -split '\r?\n')) {
-            if (-not $line) { continue }
-            $level = Get-ImpactIQDiagnosticLevel $line
-            if (-not $level) { $level = 'ERROR' }
-            Write-ImpactIQDiagnostic -Level $level -Message $line
-        }
-        $global:LASTEXITCODE = $process.ExitCode
-        if ($process.ExitCode -ne 0) {
-            Write-ImpactIQDiagnostic -Level ERROR -Message ("Native process '{0}' exited with code {1}." -f [IO.Path]::GetFileName($FilePath), $process.ExitCode)
-        }
+        Write-ImpactIQNativeProcessResult -Run $run
         if ($PassThru) { $returnedProcess = $true; $process }
     }
     finally {
-        if (-not $returnedProcess) { $process.Dispose() }
+        if (-not $returnedProcess) {
+            try {
+                if ($StartOnly -and $started -and -not $process.HasExited) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                    $process.WaitForExit()
+                }
+            }
+            finally { $process.Dispose() }
+        }
+    }
+}
+
+function Write-ImpactIQNativeProcessResult {
+    param([Parameter(Mandatory)]$Run)
+
+    foreach ($line in ($Run.StandardOutput.GetAwaiter().GetResult() -split '\r?\n')) {
+        if (-not $line) { continue }
+        $level = Get-ImpactIQDiagnosticLevel $line
+        if ($level) { Write-ImpactIQDiagnostic -Level $level -Message $line }
+        else { Microsoft.PowerShell.Utility\Write-Host $line }
+    }
+    foreach ($line in ($Run.StandardError.GetAwaiter().GetResult() -split '\r?\n')) {
+        if (-not $line) { continue }
+        $level = Get-ImpactIQDiagnosticLevel $line
+        if (-not $level) { $level = 'ERROR' }
+        Write-ImpactIQDiagnostic -Level $level -Message $line
+    }
+    $global:LASTEXITCODE = $Run.Process.ExitCode
+    if ($Run.Process.ExitCode -ne 0) {
+        Write-ImpactIQDiagnostic -Level ERROR -Message ("Native process '{0}' exited with code {1}." -f [IO.Path]::GetFileName($Run.FilePath), $Run.Process.ExitCode)
+    }
+}
+
+function Get-ImpactIQToolVersion {
+    param([Parameter(Mandatory)][string]$Version)
+
+    $match = [regex]::Match($Version.Trim(), '^v?(?<core>\d+\.\d+(?:\.\d+){0,2})(?<suffix>-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')
+    if (-not $match.Success) { throw "Cannot compare tool version '$Version'." }
+    $number = [version]$match.Groups['core'].Value
+    $normalized = '{0}.{1}.{2}' -f $number.Major, $number.Minor, [Math]::Max(0, $number.Build)
+    if ($number.Revision -gt 0) { $normalized += '.' + $number.Revision }
+    $normalized + $match.Groups['suffix'].Value
+}
+
+function Invoke-ImpactIQToolUpdate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string]$FolderPath,
+        [Parameter(Mandatory)][string]$ExecutableName,
+        [Parameter(Mandatory)][string]$AssetPattern
+    )
+
+    $ErrorActionPreference = 'Stop'
+    Write-Host "[INFO] Checking latest $Name release..."
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repository/releases/latest" -TimeoutSec 30 -ErrorAction Stop
+    $latestVersion = Get-ImpactIQToolVersion -Version $release.tag_name
+    $executablePath = Join-Path $FolderPath $ExecutableName
+    if (Test-Path -LiteralPath $executablePath -PathType Leaf) {
+        try {
+            # FileVersion contains build numbers; ProductVersion matches the release tag.
+            $installedVersion = Get-ImpactIQToolVersion -Version (Get-Item -LiteralPath $executablePath -ErrorAction Stop).VersionInfo.ProductVersion
+        }
+        catch {
+            $installedVersion = $null
+            Write-Warning "Cannot read the installed $Name release version: $($_.Exception.Message). Attempting an update."
+        }
+        if ($installedVersion -ceq $latestVersion) {
+            Write-Host "[INFO] $Name $latestVersion is already installed; skipping download and extraction."
+            return
+        }
+    }
+
+    $assets = @($release.assets | Where-Object { $_.name -like $AssetPattern })
+    if ($assets.Count -ne 1 -or -not $assets[0].browser_download_url) {
+        throw "Cannot find exactly one $Name release asset matching '$AssetPattern'."
+    }
+    $temporaryPath = Join-Path ([IO.Path]::GetTempPath()) ('ImpactIQ-Tool-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = [IO.Directory]::CreateDirectory($temporaryPath)
+        $archivePath = Join-Path $temporaryPath 'download.zip'
+        $extractPath = Join-Path $temporaryPath 'extracted'
+        Write-Host "[INFO] Downloading $Name $latestVersion..."
+        Invoke-WebRequest -Uri $assets[0].browser_download_url -OutFile $archivePath -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        [IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $extractPath)
+        $executables = @(Get-ChildItem -LiteralPath $extractPath -Filter $ExecutableName -File -Recurse -ErrorAction Stop)
+        if ($executables.Count -ne 1) { throw "$Name archive must contain exactly one $ExecutableName." }
+        $downloadedVersion = Get-ImpactIQToolVersion -Version $executables[0].VersionInfo.ProductVersion
+        if ($downloadedVersion -cne $latestVersion) {
+            throw "$Name archive version '$downloadedVersion' does not match release '$latestVersion'."
+        }
+        $null = [IO.Directory]::CreateDirectory($FolderPath)
+        Copy-Item -Path (Join-Path $executables[0].DirectoryName '*') -Destination $FolderPath -Recurse -Force -ErrorAction Stop
+        $installedVersion = Get-ImpactIQToolVersion -Version (Get-Item -LiteralPath $executablePath -ErrorAction Stop).VersionInfo.ProductVersion
+        if ($installedVersion -cne $latestVersion) { throw "$Name installed version does not match the downloaded release." }
+        Write-Host "[INFO] Updated $Name to $latestVersion."
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Recurse -Force -ErrorAction Stop }
     }
 }
 
@@ -285,92 +381,19 @@ if ((Get-ExecutionPolicy) -ne 'Bypass') {
 }
 
 # =============================
-# Download latest pbi-tools
+# Update bundled tools only when their release versions differ from the latest
 # =============================
 
-$pbiToolsZip = Join-Path $configFolder "PBI Tools.zip"
-
-Write-Host "[INFO] Fetching latest pbi-tools release..."
-$pbiRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pbi-tools/pbi-tools/releases/latest"
-$pbiAsset   = $pbiRelease.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
-
-if ($pbiAsset -and $pbiAsset.browser_download_url) {
-    if (Test-Path $pbiToolsZip) { Remove-Item $pbiToolsZip -Force }
-    Invoke-WebRequest -Uri $pbiAsset.browser_download_url -OutFile $pbiToolsZip -UseBasicParsing
-    Write-Host "[INFO] Downloaded latest pbi-tools to $pbiToolsZip"
-} else {
-    Write-Warning "[WARN] Could not find a valid pbi-tools zip asset."
-}
-
-# =============================
-# Download latest Tabular Editor 2 Portable
-# =============================
-
-$teZip = Join-Path $configFolder "TabularEditor.zip"
-$teDownloadUrl = "https://github.com/TabularEditor/TabularEditor/releases/latest/download/TabularEditor.Portable.zip"
-
-Write-Host "[INFO] Downloading latest Tabular Editor 2 Portable..."
-if (Test-Path $teZip) { Remove-Item $teZip -Force }
-Invoke-WebRequest -Uri $teDownloadUrl -OutFile $teZip -UseBasicParsing
-Write-Host "[INFO] Downloaded Tabular Editor 2 Portable to $teZip"
-
-$PBIToolsFolderPath = Join-Path -Path $baseFolderPath\Config -ChildPath "PBI Tools"
-$PBIToolsZipPattern = "PBI Tools*.zip"
-
-$zipFile = Get-ChildItem -Path $baseFolderPath\Config -Filter $PBIToolsZipPattern | Select-Object -First 1
-if ($zipFile) {
-
-    $tempExtractPath = Join-Path $env:TEMP ("PBITools_" + [guid]::NewGuid().ToString())
-
+$bundledTools = @(
+    @{ Name = 'pbi-tools'; Repository = 'pbi-tools/pbi-tools'; FolderPath = (Join-Path $configFolder 'PBI Tools'); ExecutableName = 'pbi-tools.exe'; AssetPattern = 'pbi-tools.[0-9]*.zip' },
+    @{ Name = 'Tabular Editor 2'; Repository = 'TabularEditor/TabularEditor'; FolderPath = (Join-Path $configFolder 'TabularEditor'); ExecutableName = 'TabularEditor.exe'; AssetPattern = 'TabularEditor.Portable.zip' }
+)
+foreach ($tool in $bundledTools) {
     try {
-        # Extract to temp location first
-        New-Item -Path $tempExtractPath -ItemType Directory -Force | Out-Null
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $tempExtractPath)
-
-        # Ensure target folder exists
-        if (-not (Test-Path $PBIToolsFolderPath)) {
-            New-Item -Path $PBIToolsFolderPath -ItemType Directory -Force | Out-Null
-        }
-
-        # Overwrite files
-        Copy-Item -Path "$tempExtractPath\*" -Destination $PBIToolsFolderPath -Recurse -Force
-
-        Write-Output "Updated PBI Tools at $PBIToolsFolderPath"
+        Invoke-ImpactIQToolUpdate @tool
     }
-    finally {
-        if (Test-Path $tempExtractPath) {
-            Remove-Item $tempExtractPath -Recurse -Force
-        }
-    }
-}
-
-# Repeat for Tabular Editor
-$TabularEditorFolderPath = Join-Path -Path $baseFolderPath\Config -ChildPath "TabularEditor"
-$TabularEditorZipPattern = "TabularEditor*.zip"
-
-$zipFile = Get-ChildItem -Path $baseFolderPath\Config -Filter $TabularEditorZipPattern | Select-Object -First 1
-if ($zipFile) {
-
-    $tempExtractPath = Join-Path $env:TEMP ("TabularEditor_" + [guid]::NewGuid().ToString())
-
-    try {
-        New-Item -Path $tempExtractPath -ItemType Directory -Force | Out-Null
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $tempExtractPath)
-
-        if (-not (Test-Path $TabularEditorFolderPath)) {
-            New-Item -Path $TabularEditorFolderPath -ItemType Directory -Force | Out-Null
-        }
-
-        Copy-Item -Path "$tempExtractPath\*" -Destination $TabularEditorFolderPath -Recurse -Force
-
-        Write-Output "Updated Tabular Editor at $TabularEditorFolderPath"
-    }
-    finally {
-        if (Test-Path $tempExtractPath) {
-            Remove-Item $tempExtractPath -Recurse -Force
-        }
+    catch {
+        Write-ImpactIQContinuingError -Record $_ -Context "$($tool.Name) update"
     }
 }
 
@@ -4696,6 +4719,108 @@ function Export-FabricAppDaxEnvironment {
     Write-Host "[INFO] Exported $($appQueryRows.Count) queries and $($appModelRows.Count) configured models to $environmentWorkbook."
 }
 
+function Invoke-ImpactIQTabularEditorJobs {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Jobs,
+        [Parameter(Mandatory)][string]$TabularEditorPath,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $ErrorActionPreference = 'Stop'
+    function Remove-ImpactIQJobScript($Job) {
+        if ($Job.PSObject.Properties['ScriptPath']) {
+            try {
+                if (Test-Path -LiteralPath $Job.ScriptPath) {
+                    Remove-Item -LiteralPath $Job.ScriptPath -Force -ErrorAction Stop
+                }
+            }
+            catch {
+                Write-ImpactIQContinuingError -Record $_ -Context "Cleaning up $Context '$($Job.Name)'"
+            }
+        }
+    }
+
+    $active = [Collections.Generic.List[object]]::new()
+    $activeOutputs = @{}
+    $nextJob = 0
+    try {
+        while ($nextJob -lt $Jobs.Count -or $active.Count) {
+            while ($nextJob -lt $Jobs.Count -and $active.Count -lt 4) {
+                $job = $Jobs[$nextJob]
+                $conflict = $false
+                foreach ($outputPath in $job.Outputs) {
+                    if ($activeOutputs.ContainsKey($outputPath)) { $conflict = $true; break }
+                }
+                if ($conflict) { break }
+                $nextJob++
+                try {
+                    if ($job.PSObject.Properties['ScriptPath']) {
+                        Set-Content -LiteralPath $job.ScriptPath -Value $job.ScriptContent -Encoding UTF8 -ErrorAction Stop
+                    }
+                    Write-Host $job.Message
+                    $arguments = if ($job.Arguments -is [scriptblock]) { & $job.Arguments $job } else { $job.Arguments }
+                    $run = Invoke-ImpactIQNativeProcess -FilePath $TabularEditorPath -WorkingDirectory $WorkingDirectory -ArgumentList $arguments -StartOnly -ErrorAction Stop
+                    $active.Add([PSCustomObject]@{ Job = $job; Run = $run })
+                    foreach ($outputPath in $job.Outputs) { $activeOutputs[$outputPath] = $true }
+                }
+                catch {
+                    Write-ImpactIQContinuingError -Record $_ -Context "$Context '$($job.Name)'"
+                    Remove-ImpactIQJobScript $job
+                }
+            }
+            for ($index = $active.Count - 1; $index -ge 0; $index--) {
+                $item = $active[$index]
+                if (-not $item.Run.Process.HasExited) { continue }
+                try {
+                    $item.Run.Process.WaitForExit()
+                    Write-ImpactIQNativeProcessResult -Run $item.Run
+                    if ($item.Run.Process.ExitCode -ne 0) {
+                        $script:ImpactIQRunFailed = $true
+                        Write-ImpactIQDiagnostic -Level WARN -Message "$Context '$($item.Job.Name)' could not complete; continuing with the remaining models."
+                    }
+                    elseif ($item.Job.PSObject.Properties['RequiredOutputs']) {
+                        foreach ($outputPath in $item.Job.RequiredOutputs) {
+                            if (-not (Test-Path -LiteralPath $outputPath -PathType Leaf) -or
+                                (Get-Item -LiteralPath $outputPath -ErrorAction Stop).Length -eq 0) {
+                                throw "$Context '$($item.Job.Name)' did not create a non-empty model backup."
+                            }
+                        }
+                    }
+                }
+                catch {
+                    Write-ImpactIQContinuingError -Record $_ -Context "$Context '$($item.Job.Name)'"
+                }
+                finally {
+                    $item.Run.Process.Dispose()
+                    Remove-ImpactIQJobScript $item.Job
+                    foreach ($outputPath in $item.Job.Outputs) { $activeOutputs.Remove($outputPath) }
+                    $active.RemoveAt($index)
+                }
+            }
+            if ($active.Count) { Start-Sleep -Milliseconds 50 }
+        }
+    }
+    finally {
+        foreach ($item in $active) {
+            try {
+                if (-not $item.Run.Process.HasExited) {
+                    Stop-Process -Id $item.Run.Process.Id -Force -ErrorAction Stop
+                    $item.Run.Process.WaitForExit()
+                }
+            }
+            catch {
+                Write-ImpactIQContinuingError -Record $_ -Context "Stopping $Context '$($item.Job.Name)'"
+            }
+            finally {
+                $item.Run.Process.Dispose()
+                Remove-ImpactIQJobScript $item.Job
+            }
+        }
+    }
+}
+
 # Fetch and filter workspaces
 . Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
 trap {
@@ -5984,7 +6109,9 @@ if (Test-Path $folderPath) {
 New-Item -ItemType Directory -Force -Path $folderPath | Out-Null
 
 # Loop through datasetsInfo collection to perform model export
+$modelExportJobs = [Collections.Generic.List[object]]::new()
 foreach ($dataset in $datasetsInfo) {
+    try {
     # Get workspace details
     $workspace = $workspacesInfo | Where-Object { $_.WorkspaceId -eq $dataset.WorkspaceId }
 
@@ -6013,25 +6140,38 @@ foreach ($dataset in $datasetsInfo) {
 Model.Database.Name = `"$newModelDatabaseName`";
 "@
 
-        # Save the C# script to a temporary file	
-	$tempScriptPath = Join-Path $env:TEMP "TabularEditor_RenameModel.cs"
-	Set-Content -Path $tempScriptPath -Value $csharpScript -Encoding UTF8
+        $tempScriptPath = Join-Path $env:TEMP ('ImpactIQ-ModelRename-' + [guid]::NewGuid().ToString('N') + '.cs')
 
 
         # Construct the argument list for the model export with renaming
-        $modelExportArgs = "`"Provider=MSOLAP;Data Source=$($global:PowerBIEndpoints.XmlaPrefix)/v1.0/myorg/$workspaceName;Password=$(Get-CurrentAccessToken)`" `"$datasetName`" -S `"$tempScriptPath`" -B `"$folderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`""
+        $modelExportArgs = {
+            param($job)
+            "`"Provider=MSOLAP;Data Source=$($global:PowerBIEndpoints.XmlaPrefix)/v1.0/myorg/$($job.WorkspaceName);Password=$(Get-CurrentAccessToken)`" `"$($job.DatasetName)`" -S `"$($job.ScriptPath)`" -B `"$($job.Outputs[0])`""
+        }
         
-        # Start the Tabular Editor process for model export and renaming
-		Write-Host "**Exporting $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
-        Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -ArgumentList $modelExportArgs
-
-        # Clean up the temporary script file
-        Remove-Item -Path $tempScriptPath
+        $outputPath = [IO.Path]::GetFullPath((Join-Path $folderPath ($newModelDatabaseName + '.bim')))
+        $modelExportJobs.Add([PSCustomObject]@{
+            Name = $newModelDatabaseName
+            Message = "**Exporting $newModelDatabaseName**"
+            WorkspaceName = $workspaceName
+            DatasetName = $datasetName
+            Arguments = $modelExportArgs
+            Outputs = @($outputPath)
+            RequiredOutputs = @($outputPath)
+            ScriptPath = $tempScriptPath
+            ScriptContent = $csharpScript
+        })
     }
     elseif ($global:RunMode -in @('Agents', 'FabricApps')) {
         Write-Host "[WARN] Model '$($dataset.DatasetName)' has no dedicated capacity XMLA export. Metadata is included, but model detail cannot be extracted without downloading a report (disabled in this run mode)." -ForegroundColor Yellow
     }
+    }
+    catch {
+        Write-ImpactIQContinuingError -Record $_ -Context "Model backup '$($dataset.DatasetName)'"
+    }
 }
+
+Invoke-ImpactIQTabularEditorJobs -Jobs @($modelExportJobs.ToArray()) -TabularEditorPath $TabularEditor2Path -WorkingDirectory $baseFolderPath -Context 'Model backup'
 
 Write-Output "Model Backup Process Completed"
 }
@@ -6063,6 +6203,51 @@ function Export-EmptyDetailWorkbook {
         $package.Dispose()
     }
     Write-Output "Empty detail workbook saved to $Path"
+}
+
+function Invoke-ImpactIQModelDetailExtraction {
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][object[]]$Datasets,
+        [Parameter(Mandatory)][string]$SourceFolderPath,
+        [Parameter(Mandatory)][string]$OutputFolderPath,
+        [Parameter(Mandatory)][string]$BaseFolderPath,
+        [Parameter(Mandatory)][string]$TabularEditorPath,
+        [Parameter(Mandatory)][string]$ModelDetailScriptPath,
+        [Parameter(Mandatory)][string]$DependencyScriptPath,
+        [string]$RunMode
+    )
+
+    $ErrorActionPreference = 'Stop'
+    $jobs = [Collections.Generic.List[object]]::new()
+    foreach ($dataset in $Datasets) {
+        try {
+            $workspaceName = ($dataset.WorkspaceName -replace '\[', '(' -replace '\]', ')' -replace '[^a-zA-Z0-9\(\)&,.-]', ' ').TrimStart()
+            $datasetName = ($dataset.DatasetName -replace '\[', '(' -replace '\]', ')' -replace '[^a-zA-Z0-9\(\)&,.-]', ' ').TrimStart()
+            $inputPath = Join-Path $SourceFolderPath "$workspaceName ~ $datasetName.bim"
+            if ($RunMode -in @('Agents', 'FabricApps') -and -not (Test-Path -LiteralPath $inputPath)) {
+                Write-Host "[WARN] Model backup unavailable for '$($dataset.DatasetName)'; skipping model detail." -ForegroundColor Yellow
+                continue
+            }
+            # The C# scripts name their CSVs from the database, not the BIM filename.
+            $databaseName = [string]((Get-Content -LiteralPath $inputPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).name)
+            if ([string]::IsNullOrWhiteSpace($databaseName)) { throw "Model backup '$inputPath' has no database name." }
+            $jobs.Add([PSCustomObject]@{
+                Name = "$workspaceName ~ $datasetName"
+                Message = "**Extracting Model Detail and Measure Dependencies for $workspaceName ~ $datasetName**"
+                Arguments = "`"$inputPath`" -S `"$ModelDetailScriptPath`" `"$DependencyScriptPath`""
+                Outputs = @(
+                    [IO.Path]::GetFullPath((Join-Path $OutputFolderPath ($databaseName + '.csv')))
+                    [IO.Path]::GetFullPath((Join-Path $OutputFolderPath ($databaseName + '_MD.csv')))
+                )
+            })
+        }
+        catch {
+            Write-ImpactIQContinuingError -Record $_ -Context "Model detail '$($dataset.DatasetName)'"
+        }
+    }
+
+    Invoke-ImpactIQTabularEditorJobs -Jobs @($jobs.ToArray()) -TabularEditorPath $TabularEditorPath -WorkingDirectory $BaseFolderPath -Context 'Model detail'
 }
 
 
@@ -6610,7 +6795,7 @@ else {
 
 
 
-#### Start of Model Detail Script Run with Script3Path ####
+#### Start of Combined Model Detail and Measure Dependency Script Run ####
 
 
 
@@ -6643,34 +6828,9 @@ if ($folderPathBimFiles.Count -eq 0) {
 }
 
 
-# Loop through datasetsInfo collection to run the first model script
-foreach ($dataset in $datasetsInfo) {
-    $workspaceName = $dataset.WorkspaceName
-    $datasetName = $dataset.DatasetName
+Invoke-ImpactIQModelDetailExtraction -Datasets @($datasetsInfo) -SourceFolderPath $sourceFolderPath -OutputFolderPath $folderPath -BaseFolderPath $baseFolderPath -TabularEditorPath $TabularEditor2Path -ModelDetailScriptPath $Script3Path -DependencyScriptPath $Script4Path -RunMode $global:RunMode
 
-    # Clean up workspace name
-    $cleanDatasetWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
-    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
-    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName.TrimStart()
-
-    # Clean up dataset name
-    $cleanDatasetName = $datasetName -replace '\[', '(' -replace '\]', ')'
-    $cleanDatasetName = $cleanDatasetName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
-    $cleanDatasetName = $cleanDatasetName.TrimStart()
-
-    # Construct the argument list for the first model script run
-    if ($global:RunMode -in @('Agents', 'FabricApps') -and -not (Test-Path -LiteralPath "$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim")) {
-        Write-Host "[WARN] Model backup unavailable for '$($dataset.DatasetName)'; skipping model detail." -ForegroundColor Yellow
-        continue
-    }
-    $modelScriptArgs = "`"$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`" -S `"$Script3Path`""
-    
-    # Start the Tabular Editor process to run the first model script
-	Write-Host "**Extracting Model Detail for $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
-    Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList $modelScriptArgs
-}
-
-Write-Host "First model export and script run completed."
+Write-Host "Model detail and measure dependency script runs completed."
 
 
 #### Start of PowerShell Combining to Semantic Models Worksheet ####
@@ -6707,37 +6867,11 @@ Write-Output "Model Detail Extraction Process Completed"
 
 
 
-#### Start of Model Detail Script Run with Script4Path ####
+#### Start of Measure Dependency Worksheet Assembly ####
 
 
 
 Write-Output "Measure Dependency Detail Extraction Process Started"
-
-# Loop through datasetsInfo collection to run the second model script
-foreach ($dataset in $datasetsInfo) {
-    $workspaceName = $dataset.WorkspaceName
-    $datasetName = $dataset.DatasetName
-
-    # Clean up workspace name
-    $cleanDatasetWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
-    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
-    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName.TrimStart()
-
-    # Clean up dataset name
-    $cleanDatasetName = $datasetName -replace '\[', '(' -replace '\]', ')'
-    $cleanDatasetName = $cleanDatasetName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
-    $cleanDatasetName = $cleanDatasetName.TrimStart()
-
-    # Construct the argument list for the second model script run
-    if ($global:RunMode -in @('Agents', 'FabricApps') -and -not (Test-Path -LiteralPath "$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim")) { continue }
-    $modelScriptArgs = "`"$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`" -S `"$Script4Path`""
-    
-    # Start the Tabular Editor process to run the second model script
-	Write-Host "**Extracting Measure Dependency Detail for $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
-    Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList $modelScriptArgs
-}
-
-Write-Host "Second model export and script run completed."
 
 #### Start of PowerShell Combining to Measure Dependencies Worksheet ####
 
@@ -7412,11 +7546,14 @@ if ($EnableFabricAppDax) {
 else {
 }
 
+}
+
+. {
+if ($script:ImpactIQLogUnavailable) { exit 1 }
+
 Write-Output "Extraction processing finished."
 
 $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
 }
-
-if ($script:ImpactIQLogUnavailable) { exit 1 }

@@ -7338,6 +7338,13 @@ else {
 #### Start of Power BI Data Agent Detail Extract ####
 }
 
+function Get-DataAgentDetailWorksheetHeaders {
+    [ordered]@{
+        'Data Agents' = @('Data Agent ID', 'Data Agent Name', 'Description', 'Workspace ID', 'Workspace Name', 'Schema Version', 'AI Instructions', 'Connected Source Count', 'Definition Retrieved', 'Sensitivity Label ID', 'Report Date', 'Workspace Name - Data Agent Name')
+        'Data Agent Sources' = @('Data Agent ID', 'Data Agent Name', 'Workspace ID', 'Workspace Name', 'Stage', 'Source Type', 'Source Type (Raw)', 'Source Display Name', 'Connected Item ID', 'Connected Item Name', 'Source Workspace ID', 'Source Workspace Name', 'Source Instructions', 'Source Description', 'Selected Top-Level Elements', 'Report Date', 'Workspace Name - Data Agent Name')
+    }
+}
+
 function Export-FabricDataAgentDetail {
     param(
         [string]$BaseFolderPath,
@@ -7483,20 +7490,16 @@ function Export-FabricDataAgentDetail {
     }
 
     Write-Host "[INFO] Data Agent extraction complete. Agents found: $($agentsInfo.Count); connected sources: $($sourcesInfo.Count)." -ForegroundColor Cyan
+    $worksheetHeaders = Get-DataAgentDetailWorksheetHeaders
     if ($agentsInfo.Count -eq 0) {
-        $agentsInfo += [PSCustomObject][ordered]@{
-            "Data Agent ID" = ""; "Data Agent Name" = ""; "Description" = ""; "Workspace ID" = ""; "Workspace Name" = ""
-            "Schema Version" = ""; "AI Instructions" = ""; "Connected Source Count" = ""; "Definition Retrieved" = ""; "Sensitivity Label ID" = ""
-            "Report Date" = ""; "Workspace Name - Data Agent Name" = ""
-        }
+        $emptyAgent = [ordered]@{}
+        foreach ($header in $worksheetHeaders['Data Agents']) { $emptyAgent[$header] = '' }
+        $agentsInfo += [PSCustomObject]$emptyAgent
     }
     if ($sourcesInfo.Count -eq 0) {
-        $sourcesInfo += [PSCustomObject][ordered]@{
-            "Data Agent ID" = ""; "Data Agent Name" = ""; "Workspace ID" = ""; "Workspace Name" = ""; "Stage" = ""
-            "Source Type" = ""; "Source Type (Raw)" = ""; "Source Display Name" = ""; "Connected Item ID" = ""
-            "Connected Item Name" = ""; "Source Workspace ID" = ""; "Source Workspace Name" = ""; "Source Instructions" = ""
-            "Source Description" = ""; "Selected Top-Level Elements" = ""; "Report Date" = ""; "Workspace Name - Data Agent Name" = ""
-        }
+        $emptySource = [ordered]@{}
+        foreach ($header in $worksheetHeaders['Data Agent Sources']) { $emptySource[$header] = '' }
+        $sourcesInfo += [PSCustomObject]$emptySource
     }
     $outputPath = Join-Path $BaseFolderPath "Data Agent Detail.xlsx"
     if (Test-Path -LiteralPath $outputPath) { Remove-Item -LiteralPath $outputPath -Force }
@@ -7513,6 +7516,9 @@ trap {
 
 if ($global:RunMode -in @('Workspaces', 'Agents')) {
     Export-FabricDataAgentDetail -BaseFolderPath $baseFolderPath -ReportDate $date -Workspaces $workspacesInfo -DatasetNames $datasetNameLookup
+}
+else {
+    Export-EmptyDetailWorkbook -Path (Join-Path $baseFolderPath 'Data Agent Detail.xlsx') -Worksheets (Get-DataAgentDetailWorksheetHeaders) -ErrorAction Stop
 }
 
 $EnableFabricAppDax = $true
@@ -7534,6 +7540,8 @@ if ($EnableFabricAppDax -and $global:RunMode -in @('Workspaces', 'FabricApps')) 
     }
 }
 else {
+    Export-FabricAppQueryWorkbook -Path (Join-Path $baseFolderPath 'Power BI Environment Detail.xlsx') -ErrorAction Stop
+    Export-FabricAppQueryDependencyDetail -BaseFolderPath $baseFolderPath -ErrorAction Stop
 }
 
 }

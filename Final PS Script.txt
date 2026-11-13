@@ -13,23 +13,13 @@ $Script4Path = Join-Path $configFolder "Measure Dependency Extract Script.csx"
 $TabularEditor2Path = Join-Path (Join-Path $configFolder "TabularEditor") "TabularEditor.exe"
 
 
-function Protect-ImpactIQLogText {
-    param([AllowEmptyString()][string]$Text)
-
-    $Text = [regex]::Replace($Text, '(?i)\b(Bearer|MwcToken)\s+\S+', '$1 [REDACTED]')
-    $Text = [regex]::Replace($Text, '\beyJ[\w-]+\.[\w-]+\.[\w-]+\b', '[REDACTED]')
-    $Text = [regex]::Replace($Text, '(?i)(["'']?(?:access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|password|pwd|handoffCode|codeVerifier|authorization)["'']?\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|''(?:''''|[^''])*''|[^;\r\n,}]+)', '$1[REDACTED]')
-    [regex]::Replace($Text, '(?i)([?&](?:_hc|code|code_verifier|access_token|token|sig)=)[^&\s"'']+', '$1[REDACTED]')
-}
-
 function Write-ImpactIQDiagnostic {
     param(
         [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level,
         [AllowEmptyString()][string]$Message
     )
 
-    $text = Protect-ImpactIQLogText $Message
-    $script:ImpactIQDiagnostics.Writer.WriteLine(('[{0:O}] [{1}] {2}' -f [DateTime]::UtcNow, $Level, $text))
+    $script:ImpactIQDiagnostics.Writer.WriteLine(('[{0:O}] [{1}] {2}' -f [DateTime]::UtcNow, $Level, $Message))
 }
 
 function Get-ImpactIQDiagnosticLevel {
@@ -165,7 +155,7 @@ function Invoke-ImpactIQLoggedRun {
         $script:ImpactIQLogUnavailable = $true
         $impactIQCloseWriter = $true
         $impactIQFallbackPath = Join-Path ([IO.Path]::GetTempPath()) 'ImpactIQ-errorlog.txt'
-        $impactIQLogMessage = Protect-ImpactIQLogText ("Cannot write diagnostics to '$ImpactIQLogPath': " + $_.Exception.Message)
+        $impactIQLogMessage = "Cannot write diagnostics to '$ImpactIQLogPath': " + $_.Exception.Message
         try {
             [IO.File]::AppendAllText($impactIQFallbackPath, ('[{0:O}] [ERROR] {1}{2}' -f [DateTime]::UtcNow, $impactIQLogMessage, [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
         }
@@ -3674,7 +3664,7 @@ function Get-FabricAppDaxCapture {
             }
         }
         catch {
-            Write-Warning "Fabric App '$AppName' backend connector discovery failed: $(Protect-ImpactIQLogText $_.Exception.Message) Model connections must be resolved from app scripts instead."
+            Write-Warning "Fabric App '$AppName' backend connector discovery failed: $($_.Exception.Message) Model connections must be resolved from app scripts instead."
         }
         finally { $runtimeSettings = $null }
 
@@ -3754,7 +3744,7 @@ function Get-FabricAppDaxCapture {
             }
             catch {
                 $failedAssets++
-                Write-Warning "Fabric App '$AppName' script '$($asset.GetLeftPart([UriPartial]::Path))' could not be inspected: $(Protect-ImpactIQLogText $_.Exception.Message)"
+                Write-Warning "Fabric App '$AppName' script '$($asset.GetLeftPart([UriPartial]::Path))' could not be inspected: $($_.Exception.Message)"
             }
         }
         if ($failedAssets -gt 0 -or $pending.Count -gt 0) {
@@ -3765,7 +3755,7 @@ function Get-FabricAppDaxCapture {
         }
     }
     catch {
-        $captureError = "$stage failed: $(Protect-ImpactIQLogText $_.Exception.Message)"
+        $captureError = "$stage failed: $($_.Exception.Message)"
         Write-Host "[WARN] Fabric App '$AppName': $captureError" -ForegroundColor Yellow
     }
     finally {

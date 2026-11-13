@@ -343,6 +343,71 @@ function Invoke-ImpactIQToolUpdate {
     }
 }
 
+function Initialize-ImpactIQExecutionPolicy {
+    [CmdletBinding()]
+    param()
+
+    $ErrorActionPreference = 'Stop'
+    if ((Get-ExecutionPolicy -ErrorAction Stop) -eq 'Bypass') { return }
+    foreach ($scope in @('MachinePolicy', 'UserPolicy')) {
+        $policy = Get-ExecutionPolicy -Scope $scope -ErrorAction Stop
+        if ($policy -ne 'Undefined') {
+            Write-ImpactIQDiagnostic -Level WARN -Message "$scope enforces execution policy '$policy'. Process Bypass cannot override Group Policy; continuing under the enforced policy."
+            return
+        }
+    }
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop
+    if ((Get-ExecutionPolicy -ErrorAction Stop) -ne 'Bypass') {
+        throw 'Process-scoped Bypass could not be enabled. Check the effective execution policy.'
+    }
+}
+
+function Initialize-ImpactIQModules {
+    [CmdletBinding()]
+    param()
+
+    $ErrorActionPreference = 'Stop'
+    $installationReady = $false
+    $previousSecurityProtocol = $null
+    $requiredModules = @('ImportExcel', 'Az.Accounts')
+    try {
+        foreach ($module in $requiredModules) {
+            try {
+                $moduleInfo = Import-Module -Name $module -PassThru -ErrorAction Stop
+                if (-not $moduleInfo) { throw "Import did not confirm that $module was loaded." }
+                continue
+            }
+            catch {
+                Write-ImpactIQDiagnostic -Level WARN -Message "Required module '$module' could not be imported: $($_.Exception.Message). Attempting one CurrentUser installation from PSGallery."
+            }
+
+            try {
+                if (-not $installationReady) {
+                    Get-Command Install-Module -ErrorAction Stop | Out-Null
+                    $previousSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+                    [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                    if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue |
+                              Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+                        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force -ErrorAction Stop | Out-Null
+                    }
+                    $installationReady = $true
+                }
+                Install-Module -Name $module -Repository PSGallery -Scope CurrentUser -Force -ErrorAction Stop
+                $moduleInfo = Import-Module -Name $module -PassThru -Force -ErrorAction Stop
+                if (-not $moduleInfo) { throw "Import did not confirm that $module was loaded." }
+            }
+            catch {
+                throw "Required module '$module' could not be installed and imported after one retry. $($_.Exception.Message) Check PSGallery access and organizational policy; for loaded-assembly conflicts, retry in a fresh PowerShell process."
+            }
+        }
+    }
+    finally {
+        if ($null -ne $previousSecurityProtocol) {
+            [Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol
+        }
+    }
+}
+
 # Dot-sourced sections execute as they are pasted and retain state for later sections.
 . Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -StartSession -KeepOpen -Action {
 # Resume later extraction sections without bypassing local retry and validation handlers.
@@ -360,14 +425,20 @@ if (-not (Test-Path $configFolder)) {
     New-Item -Path $configFolder -ItemType Directory -Force | Out-Null
 }
 
-# Token is now managed via MSAL session (Get-PowerBIAccessToken) — no file needed
+# Tokens are acquired from the single Az.Accounts session; no token file is used.
 
 $ErrorActionPreference = 'SilentlyContinue'
 $WarningPreference = 'Continue'
 
-# Temporarily set execution policy to Bypass for this session
-if ((Get-ExecutionPolicy) -ne 'Bypass') {
-    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+Write-Host "[INFO] Getting things ready - checking required modules before environment selection and sign-in..." -ForegroundColor Cyan
+try {
+    Initialize-ImpactIQExecutionPolicy -ErrorAction Stop
+    Initialize-ImpactIQModules -ErrorAction Stop
+}
+catch {
+    $script:ImpactIQRunFailed = $true
+    Write-ImpactIQRunRecord -Record $_
+    exit 1
 }
 
 # =============================
@@ -416,40 +487,8 @@ if (-not $tabularEditorWorks) {
     Write-Host "[ERROR] Tabular Editor is not able to run - this will cause blank outputs for Model Detail and Report Detail" -ForegroundColor Red
 }
 
-Write-Host "[INFO] Getting things ready - checking required modules before environment selection and sign-in..." -ForegroundColor Cyan
-
 $pbiToolsPath = Join-Path -Path $baseFolderPath -ChildPath "Config\PBI Tools\pbi-tools.exe"
 
-# Force TLS 1.2 (required for PSGallery on older systems)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# Ensure NuGet provider is available (non-admin, current user)
-if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue |
-          Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
-}
-
-# Update PowerShellGet if stuck on 1.0.0.1 (fixes authenticode signature errors)
-$psGetVer = (Get-Module PowerShellGet -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1).Version
-if ($psGetVer -lt [version]'2.0.0') {
-    Install-Module -Name PowerShellGet -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck
-    Remove-Module PowerShellGet -Force -ErrorAction SilentlyContinue
-    Import-Module PowerShellGet -Force
-}
-
-# A missing module must not prevent the remaining prerequisites from being attempted.
-$requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt', 'Az.Accounts' )
-foreach ($module in $requiredModules) {
-    try {
-        if (-not (Import-Module $module -PassThru -ErrorAction SilentlyContinue)) {
-            Install-Module -Name $module -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction SilentlyContinue
-        }
-        Import-Module $module -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-ImpactIQContinuingError -Record $_ -Context "Required module '$module'"
-    }
-}
 }
 
 
@@ -652,14 +691,6 @@ if (-not (Test-Path Variable:\script:LoginEnvironment)) {
     }
 }
 
-# If explicitly 'Public', set to $null for Connect-PowerBIServiceAccount default
-if ($LoginEnvironment -eq 'Public') { 
-    $LoginEnvironment = $null 
-}
-
-
-# If LoginEnvironment is explicitly set to Public, use $null so Connect-PowerBIServiceAccount uses default 'Public' endpoint.
-if ($LoginEnvironment -eq 'Public') { $LoginEnvironment = $null }
 }
 
 # Function to get environment-specific API endpoints
@@ -742,61 +773,13 @@ $EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { '
 $global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
 }
 
-# Connect to the Power BI Service
-function Connect-PowerBI {
+# Connect once for both Power BI and Fabric.
+function Connect-ImpactIQ {
     [CmdletBinding()]
-    param(
-        [string]$Environment,
-        [int]$MaxAttempts = 2
-    )
+    param()
 
-    $previousErrorActionPreference = $ErrorActionPreference
-
-    try {
-        $ErrorActionPreference = 'Stop'
-
-        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-            try {
-                Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints" -ForegroundColor Cyan
-
-                if ($Environment) {
-                    Connect-PowerBIServiceAccount -Environment $Environment -ErrorAction Stop -WarningAction Continue | Out-Null
-                }
-                else {
-                    Connect-PowerBIServiceAccount -ErrorAction Stop -WarningAction Continue | Out-Null
-                }
-
-                $token = Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue
-                if ($token -and $token.Authorization) {
-                    Write-Host "[INFO] Connected to Power BI." -ForegroundColor Green
-                    return
-                }
-
-                throw "Power BI sign-in completed without returning an access token."
-            }
-            catch {
-                Disconnect-PowerBIServiceAccount -ErrorAction SilentlyContinue | Out-Null
-
-                if ($attempt -ge $MaxAttempts) {
-                    Write-Host "[ERROR] Power BI sign-in failed: $($_.Exception.Message)" -ForegroundColor Red
-                    throw
-                }
-
-                Write-Warning "Power BI sign-in attempt $attempt failed: $($_.Exception.Message). Retrying..."
-                Start-Sleep -Seconds 2
-            }
-        }
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-}
-
-function Get-FabricAccessToken {
-    param(
-        [switch]$ForceLogin
-    )
-
+    $ErrorActionPreference = 'Stop'
+    $script:ImpactIQAzContext = $null
     $azEnvironment = switch ($EnvironmentForEndpoints) {
         'China' { 'AzureChinaCloud' }
         'USGov' { 'AzureUSGovernment' }
@@ -804,94 +787,113 @@ function Get-FabricAccessToken {
         'USGovMil' { 'AzureUSGovernment' }
         default { 'AzureCloud' }
     }
-
-    $azContext = Get-AzContext -ErrorAction SilentlyContinue
-    if ($ForceLogin -or -not $azContext -or $azContext.Environment.Name -ne $azEnvironment) {
-        Write-Host "[INFO] Connecting to Microsoft Fabric..." -ForegroundColor Cyan
-        if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
-            Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction SilentlyContinue | Out-Null
-        }
-        Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction Continue | Out-Null
+    Disable-AzContextAutosave -Scope Process -ErrorAction Stop | Out-Null
+    if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
+        Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction Stop | Out-Null
     }
+    Write-Host "[INFO] Connecting to Power BI and Microsoft Fabric through Az.Accounts..." -ForegroundColor Cyan
+    Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction Continue | Out-Null
+    $context = Get-AzContext -ErrorAction Stop
+    if (-not $context -or $context.Environment.Name -ne $azEnvironment -or
+        -not $context.Tenant.Id -or -not $context.Account.Id) {
+        throw 'Azure sign-in did not return a valid account and tenant for the selected cloud.'
+    }
+    $script:ImpactIQAzContext = $context
+}
 
+function Get-ImpactIQAccessToken {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ResourceUrl
+    )
+
+    $ErrorActionPreference = 'Stop'
+    if ($ResourceUrl -notin @($global:PowerBIEndpoints.ResourceUrl, $global:PowerBIEndpoints.FabricApiPrefix)) {
+        throw 'Token resource does not match the selected Power BI or Fabric cloud.'
+    }
+    if (-not $script:ImpactIQAzContext) {
+        throw 'No Azure session is available. Restart the run and complete the Az.Accounts sign-in.'
+    }
     try {
-        $tokenValue = (Get-AzAccessToken -ResourceUrl $global:PowerBIEndpoints.FabricApiPrefix -ErrorAction Stop).Token
-    }
-    catch {
-        if ($ForceLogin) {
-            throw
+        $tokenValue = (Get-AzAccessToken -ResourceUrl $ResourceUrl -TenantId $script:ImpactIQAzContext.Tenant.Id -DefaultProfile $script:ImpactIQAzContext -ErrorAction Stop -WarningAction Continue).Token
+        if ($tokenValue -is [Security.SecureString]) {
+            $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenValue)
+            try { $tokenValue = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer) }
         }
-
-        return Get-FabricAccessToken -ForceLogin
-    }
-
-    if ($tokenValue -is [System.Security.SecureString]) {
-        $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenValue)
-    } else {
+        if ([string]::IsNullOrWhiteSpace([string]$tokenValue)) {
+            throw "Azure authentication returned an empty token for $ResourceUrl."
+        }
         return [string]$tokenValue
     }
+    finally { $tokenValue = $null }
+}
 
+function Get-FabricAccessToken {
+    Get-ImpactIQAccessToken -ResourceUrl $global:PowerBIEndpoints.FabricApiPrefix -ErrorAction Stop
+}
+
+function Get-CurrentAccessToken {
+    Get-ImpactIQAccessToken -ResourceUrl $global:PowerBIEndpoints.ResourceUrl -ErrorAction Stop
+}
+
+function Invoke-ImpactIQRestMethod {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][uri]$Url,
+        [ValidateSet('GET')][string]$Method = 'GET'
+    )
+
+    $ErrorActionPreference = 'Stop'
+    if ($Url.Scheme -ne 'https' -or $Url.Port -ne 443 -or $Url.UserInfo -or $Url.Fragment) {
+        throw 'Metadata API requests require an HTTPS URL without user information or a fragment.'
+    }
+    $powerBiHost = ([uri]$global:PowerBIEndpoints.ApiPrefix).DnsSafeHost
+    $fabricHost = ([uri]$global:PowerBIEndpoints.FabricApiPrefix).DnsSafeHost
+    $resource = if ($Url.DnsSafeHost -ieq $powerBiHost) { $global:PowerBIEndpoints.ResourceUrl }
+        elseif ($Url.DnsSafeHost -ieq $fabricHost) { $global:PowerBIEndpoints.FabricApiPrefix }
+        else { throw "Unsupported metadata API host: $($Url.DnsSafeHost)" }
+    $headers = @{ Authorization = ('Bearer ' + (Get-ImpactIQAccessToken -ResourceUrl $resource -ErrorAction Stop)) }
     try {
-        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
+        $response = Invoke-WebRequest -Uri $Url -Method $Method -Headers $headers -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 100 -ErrorAction Stop
+        if ($response.Content -is [byte[]]) { return [Text.Encoding]::UTF8.GetString($response.Content) }
+        return [string]$response.Content
     }
-    finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
-    }
+    finally { $headers = $null }
 }
 
 # Track script start time
+$script:ImpactIQAuthenticationReady = $false
 . Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
-trap {
-    Write-ImpactIQContinuingError -Record $_
-    continue
-}
-
 $scriptStartTime = Get-Date
 
-Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
-$fabricAccessToken = Get-FabricAccessToken
-Write-Host "[INFO] Connected to Microsoft Fabric." -ForegroundColor Green
+Connect-ImpactIQ -ErrorAction Stop
+$null = Get-CurrentAccessToken
+$null = Get-FabricAccessToken
+$script:ImpactIQAuthenticationReady = $true
+Write-Host "[INFO] Connected to Power BI and Microsoft Fabric using one Azure session." -ForegroundColor Green
 }
-
-
-# Function to get the current access token — MSAL auto-refreshes silently via the session cache
-function Get-CurrentAccessToken {
-    try {
-        return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue).Authorization -replace 'Bearer ', ''
-    }
-    catch {
-        # MSAL cache may be corrupt or refresh token revoked — re-connect and retry
-        Write-Host "[WARN] Token fetch failed, re-connecting..."
-        try {
-            Connect-PowerBI -Environment $LoginEnvironment -MaxAttempts 2 -ErrorAction Stop
-            return (Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue).Authorization -replace 'Bearer ', ''
-        }
-        catch {
-            Write-Host "[ERROR] Re-connect also failed: $($_.Exception.Message)"
-            throw "Cannot obtain Power BI access token."
-        }
-    }
+if (-not $script:ImpactIQAuthenticationReady) {
+    exit 1
 }
 
 function Invoke-FabricPagedGet {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Url,
-        [string]$AccessToken
+        [string]$Url
     )
 
     $results = @()
     $nextUrl = $Url
+    $seenUrls = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 
     while ($nextUrl) {
-        if (-not $AccessToken) {
-            $AccessToken = Get-CurrentAccessToken
+        $uri = [uri]$nextUrl
+        if ($uri.DnsSafeHost -ine ([uri]$global:PowerBIEndpoints.FabricApiPrefix).DnsSafeHost -or -not $seenUrls.Add($uri.AbsoluteUri)) {
+            throw 'Unexpected or repeated Fabric pagination URL.'
         }
-        $headers = @{
-            Authorization = "Bearer $AccessToken"
-            'Content-Type' = 'application/json'
-        }
-        $response = Invoke-RestMethod -Uri $nextUrl -Headers $headers -Method GET -ErrorAction Stop
+        $response = Invoke-ImpactIQRestMethod -Url $uri -Method GET -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
 
         if ($response.value) {
             $results += @($response.value)
@@ -899,6 +901,12 @@ function Invoke-FabricPagedGet {
 
         $nextUrl = if ($response.continuationUri) {
             $response.continuationUri
+        } elseif ($response.continuationToken) {
+            $builder = [UriBuilder]::new($uri)
+            $queryParts = @($uri.Query.TrimStart('?') -split '&' |
+                Where-Object { $_ -and $_ -notmatch '^continuationToken=' })
+            $builder.Query = ($queryParts + ('continuationToken=' + [uri]::EscapeDataString([string]$response.continuationToken))) -join '&'
+            $builder.Uri.AbsoluteUri
         } else {
             $null
         }
@@ -1870,11 +1878,10 @@ function Get-FabricDataAgentInventory {
     $agents = @()
     $failures = @()
     if ($Workspaces.Count -eq 0) { return @() }
-    $accessToken = Get-FabricAccessToken
     foreach ($workspace in $Workspaces) {
         try {
             $url = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$($workspace.id)/items?type=DataAgent"
-            foreach ($agent in (Invoke-FabricPagedGet -Url $url -AccessToken $accessToken)) {
+            foreach ($agent in (Invoke-FabricPagedGet -Url $url)) {
                 $agents += [PSCustomObject]@{
                     WorkspaceId = $workspace.id
                     WorkspaceName = $workspace.name
@@ -1901,40 +1908,7 @@ function Get-FabricDataAgentInventory {
 }
 
 function Get-FabricDataAgentToken {
-    $ErrorActionPreference = 'Stop'
-    $resource = $global:PowerBIEndpoints.FabricApiPrefix
-    $context = Get-AzContext -ErrorAction Stop
-    $azCommand = Get-Command az -ErrorAction SilentlyContinue
-
-    # The CLI client can carry delegated scopes that the Azure PowerShell client lacks.
-    if ($azCommand) {
-        try {
-            $cloud = Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('cloud', 'show', '--query', 'name', '-o', 'tsv')
-            if ($LASTEXITCODE -ne 0 -or $cloud -ne $context.Environment.Name) {
-                throw "Azure CLI cloud does not match the current Fabric sign-in."
-            }
-            $tenantId = $context.Tenant.Id
-            $token = Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('account', 'get-access-token', '--resource', $resource, '--tenant', $tenantId, '--query', 'accessToken', '-o', 'tsv')
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
-                Write-Host "[INFO] Signing in to Azure CLI for Data Agent definitions..." -ForegroundColor Cyan
-                Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('login', '--tenant', $tenantId, '--allow-no-subscriptions', '--output', 'none')
-                if ($LASTEXITCODE -ne 0) { throw "Azure CLI sign-in failed." }
-                $token = Invoke-ImpactIQNativeCommand -FilePath 'az' -ArgumentList @('account', 'get-access-token', '--resource', $resource, '--tenant', $tenantId, '--query', 'accessToken', '-o', 'tsv')
-            }
-            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($token)) {
-                throw "Azure CLI did not return a Fabric access token."
-            }
-            return $token.Trim()
-        }
-        catch {
-            Write-Host "[WARN] Azure CLI token acquisition failed: $($_.Exception.Message). Trying the existing Fabric sign-in." -ForegroundColor Yellow
-        }
-    }
-    else {
-        Write-Host "[WARN] Azure CLI is not installed. Using the existing Fabric sign-in; if definitions return 403, install Azure CLI and grant the required Fabric permissions." -ForegroundColor Yellow
-    }
-
-    return Get-FabricAccessToken
+    Get-FabricAccessToken
 }
 
 function Get-FabricDataAgentDefinition {
@@ -1990,7 +1964,11 @@ function Get-FabricDataAgentDefinition {
         return $definition
     }
     catch {
-        Write-Host "[WARN] Could not retrieve definition for Data Agent $DataAgentId in workspace $WorkspaceId : $($_.Exception.Message)" -ForegroundColor Yellow
+        $permissionHint = ''
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 403) {
+            $permissionHint = ' Check delegated Item.ReadWrite.All consent for the Azure PowerShell application and read/write access to the agent. No alternate sign-in will be attempted.'
+        }
+        Write-Host "[WARN] Could not retrieve definition for Data Agent $DataAgentId in workspace $WorkspaceId : $($_.Exception.Message)$permissionHint" -ForegroundColor Yellow
         return $null
     }
 }
@@ -3416,14 +3394,7 @@ function Assert-FabricAppDaxHostingUri {
 
 function Get-FabricAppDaxToken {
     param([Parameter(Mandatory)][string]$ResourceUrl)
-    try {
-        $token = (Get-AzAccessToken -ResourceUrl $ResourceUrl -ErrorAction Stop -WarningAction Continue).Token
-        if ($token -is [Security.SecureString]) {
-            return [Net.NetworkCredential]::new('', $token).Password
-        }
-        return [string]$token
-    }
-    catch { throw 'Azure authentication unavailable. Run Connect-AzAccount for the app tenant and retry.' }
+    Get-ImpactIQAccessToken -ResourceUrl $ResourceUrl -ErrorAction Stop
 }
 
 function Invoke-FabricAppDaxRequest {
@@ -4819,7 +4790,7 @@ trap {
 }
 
 $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
-$workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
+$workspacesResponse = Invoke-ImpactIQRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
 $workspacesInfo = @()
 $IncludeMyWorkspace = $false
 $selection = $null
@@ -4872,11 +4843,10 @@ if ($runMode -eq 'FabricApps') {
         }
         $appChoices = @()
         $appDiscoveryFailures = @()
-        $appDiscoveryToken = Get-FabricAccessToken
         foreach ($ws in $appWorkspacesToScan) {
             try {
                 $url = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$($ws.id)/items?type=AppBackend"
-                foreach ($app in (Invoke-FabricPagedGet -Url $url -AccessToken $appDiscoveryToken)) {
+                foreach ($app in (Invoke-FabricPagedGet -Url $url)) {
                     $appChoices += [PSCustomObject]@{
                         DatasetId = "$($ws.id)|$($app.id)"
                         DatasetName = $app.displayName
@@ -5086,7 +5056,7 @@ if ($runMode -eq 'FabricApps') {
             Write-Host "`r[INFO] Scanning workspace $wsCount of $($wsTotal): $($ws.name)" -NoNewline
             $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/reports"
             try {
-                $reportsResp = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+                $reportsResp = Invoke-ImpactIQRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
                 foreach ($rpt in $reportsResp.value) {
                     $allReportsForPicker += [pscustomobject]@{
                         ReportId           = $rpt.id
@@ -5211,7 +5181,7 @@ if ($runMode -eq 'FabricApps') {
             Write-Host "`r[INFO] Scanning workspace $wsCount of $($wsTotal): $($ws.name)" -NoNewline
             $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/datasets"
             try {
-                $datasetsResp = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
+                $datasetsResp = Invoke-ImpactIQRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
                 foreach ($ds in $datasetsResp.value) {
                     $allModelsForPicker += [pscustomobject]@{
                         DatasetId     = $ds.id
@@ -5266,7 +5236,7 @@ if ($runMode -eq 'FabricApps') {
             Write-Host "`r[INFO] Scanning workspace $wsCount of $($wsTotal): $($ws.name)" -NoNewline
             $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($ws.id)/reports"
             try {
-                $reportsResp = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+                $reportsResp = Invoke-ImpactIQRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
                 foreach ($rpt in $reportsResp.value) {
                     if ($rpt.datasetId -and $global:SelectedDatasetIds.ContainsKey($rpt.datasetId)) {
                         $global:SelectedReportIds[$rpt.id] = $true
@@ -5368,9 +5338,8 @@ $dataflowRefreshHistory = @()
 try {
     Write-Output "Fabric connection metadata extraction process started."
     $connectionsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/connections"
-    $fabricAccessToken = Get-FabricAccessToken
 
-    foreach ($connection in (Invoke-FabricPagedGet -Url $connectionsUrl -AccessToken $fabricAccessToken)) {
+    foreach ($connection in (Invoke-FabricPagedGet -Url $connectionsUrl)) {
         $connectionsInfo += [PSCustomObject]@{
             ConnectionId                   = $connection.id
             ConnectionName                 = $connection.displayName
@@ -5401,11 +5370,8 @@ try {
 try {
     Write-Output "Fabric gateway metadata extraction process started."
     $gatewaysUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/gateways"
-    if (-not $fabricAccessToken) {
-        $fabricAccessToken = Get-FabricAccessToken
-    }
 
-    foreach ($gateway in (Invoke-FabricPagedGet -Url $gatewaysUrl -AccessToken $fabricAccessToken)) {
+    foreach ($gateway in (Invoke-FabricPagedGet -Url $gatewaysUrl)) {
         $gatewaysInfo += [PSCustomObject]@{
             GatewayId                   = $gateway.id
             GatewayName                 = $gateway.displayName
@@ -5440,7 +5406,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
     # Fetch datasets
     $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets"
     try {
-        $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl -ErrorAction SilentlyContinue | ConvertFrom-Json
+        $datasets = Invoke-ImpactIQRestMethod -Method GET -Url $datasetsUrl -ErrorAction SilentlyContinue | ConvertFrom-Json
     }
     catch {
         Write-ImpactIQContinuingError -Record $_ -Context "Workspace '$workspaceName' model metadata"
@@ -5459,7 +5425,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
         # Fetch dataset sources
         $datasourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.id)/datasources"
-        $datasources = Invoke-PowerBIRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
+        $datasources = Invoke-ImpactIQRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
 
         foreach ($datasource in $datasources.value) {
             $renamedDatasource = Rename-Properties -object $datasource -renameMap $datasetDatasourceRenameMap
@@ -5478,7 +5444,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
     $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports"
     $reports = $null
     if ($global:RunMode -notin @('Agents', 'FabricApps')) {
-        $reports = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+        $reports = Invoke-ImpactIQRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
     }
 
 	# Create a hash set to store Report IDs
@@ -5502,7 +5468,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
         # Fetch report pages
         $pagesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports/$($report.id)/pages"
-        $pages = Invoke-PowerBIRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
+        $pages = Invoke-ImpactIQRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
         foreach ($page in $pages.value) {
             $renamedPage = Rename-Properties -object $page -renameMap $pageRenameMap
             $renamedPage | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
@@ -5550,7 +5516,7 @@ if ($global:RunMode -eq 'Models') {
 $appsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps"
 $apps = $null
 if ($global:RunMode -notin @('Agents', 'FabricApps')) {
-    $apps = Invoke-PowerBIRestMethod -Method GET -Url $appsUrl | ConvertFrom-Json
+    $apps = Invoke-ImpactIQRestMethod -Method GET -Url $appsUrl | ConvertFrom-Json
 }
 
 # Create a hash set to store App Report IDs
@@ -5564,7 +5530,7 @@ foreach ($app in $apps.value) {
 
         # Fetch reports within each app
         $appReportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps/$($app.id)/reports"
-        $appReports = Invoke-PowerBIRestMethod -Method GET -Url $appReportsUrl | ConvertFrom-Json
+        $appReports = Invoke-ImpactIQRestMethod -Method GET -Url $appReportsUrl | ConvertFrom-Json
 
         foreach ($report in $appReports.value) {
             $renamedAppReport = Rename-Properties -object $report -renameMap $appReportRenameMap
@@ -5586,7 +5552,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh History extr
 
     foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
         $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.DatasetId)/refreshes"
-        $refreshHistoryResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+        $refreshHistoryResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
 
         foreach ($refresh in $refreshHistoryResponse.value) {
             $renamedRefreshRecord = Rename-Properties -object $refresh -renameMap $datasetRefreshRenameMap
@@ -5611,7 +5577,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh Schedule ext
         $refreshScheduleUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.DatasetId)/refreshSchedule"
         
         try {
-            $refreshScheduleResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshScheduleUrl | ConvertFrom-Json
+            $refreshScheduleResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshScheduleUrl | ConvertFrom-Json
             
             # Get base properties that apply to all rows
             $renamedScheduleRecord = Rename-Properties -object $refreshScheduleResponse -renameMap $datasetRefreshScheduleRenameMap
@@ -5650,7 +5616,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 
     # Fetch Gen 1 and Gen 2 dataflows using Power BI API
     $dataflowsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows"
-    $dataflowsResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowsUrl | ConvertFrom-Json
+    $dataflowsResponse = Invoke-ImpactIQRestMethod -Method GET -Url $dataflowsUrl | ConvertFrom-Json
 
     # Ensure response is not null before looping
     if ($dataflowsResponse.value) {
@@ -5668,7 +5634,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 
             # Fetch Dataflow Datasources
             $dataflowSourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows/$($dataflow.objectId)/datasources"
-            $dataflowSourcesResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowSourcesUrl | ConvertFrom-Json
+            $dataflowSourcesResponse = Invoke-ImpactIQRestMethod -Method GET -Url $dataflowSourcesUrl | ConvertFrom-Json
 
             # Ensure response is not null before looping
             if ($dataflowSourcesResponse.value) {
@@ -5700,9 +5666,9 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 
     # Fetch Gen 2 CICD dataflows using Fabric API
     try {
-        $fabricDataflowsUrl = "https://api.fabric.microsoft.com/v1/workspaces/$($workspace.WorkspaceId)/dataflows"
+        $fabricDataflowsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$($workspace.WorkspaceId)/dataflows"
         $fabricHeaders = @{
-            'Authorization' = "Bearer $(Get-CurrentAccessToken)"
+            'Authorization' = "Bearer $(Get-FabricAccessToken)"
             'Content-Type' = 'application/json'
         }
         $fabricDataflowsResponse = Invoke-RestMethod -Uri $fabricDataflowsUrl -Headers $fabricHeaders -Method GET -ErrorAction Stop
@@ -5738,7 +5704,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 foreach ($workspace in $workspacesInfo) {
 
         $dataflowLineageUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/upstreamDataflows"
-        $dataflowLineageResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowLineageUrl | ConvertFrom-Json
+        $dataflowLineageResponse = Invoke-ImpactIQRestMethod -Method GET -Url $dataflowLineageUrl | ConvertFrom-Json
 
         # Ensure response is not null before looping
         if ($dataflowLineageResponse.value) {
@@ -5772,7 +5738,7 @@ foreach ($workspace in $workspacesInfo) {
 Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow Refresh History extraction process started."
     foreach ($dataflow in $dataflowsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
         $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows/$($dataflow.DataflowId)/transactions"
-        $refreshHistoryResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+        $refreshHistoryResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
 
         # Ensure response is not null before looping
         if ($refreshHistoryResponse.value) {
@@ -5814,8 +5780,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extra
     $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items"
 
     try {
-        if (-not $fabricAccessToken) { $fabricAccessToken = Get-FabricAccessToken }
-        $fabricItems = @(Invoke-FabricPagedGet -Url $fabricItemsUrl -AccessToken $fabricAccessToken)
+        $fabricItems = @(Invoke-FabricPagedGet -Url $fabricItemsUrl)
         if ($global:RunMode -eq 'Agents') {
             $fabricItems = @($fabricItems | Where-Object {
                 ($_.type -eq 'DataAgent' -and $script:SelectedDataAgents.ContainsKey("$workspaceId|$($_.id)")) -or
@@ -5837,7 +5802,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extra
 
             $itemConnectionsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items/$($fabricItem.id)/connections"
             try {
-                foreach ($connection in (Invoke-FabricPagedGet -Url $itemConnectionsUrl -AccessToken $fabricAccessToken)) {
+                foreach ($connection in (Invoke-FabricPagedGet -Url $itemConnectionsUrl)) {
                     $itemConnectionsInfo += [PSCustomObject]@{
                         WorkspaceId      = $workspaceId
                         WorkspaceName    = $workspaceName
@@ -5904,7 +5869,7 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
 
     # Fetch datasets from "My Workspace"
     $myWorkspaceDatasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets"
-    $myWorkspaceDatasets = Invoke-PowerBIRestMethod -Method GET -Url $myWorkspaceDatasetsUrl | ConvertFrom-Json
+    $myWorkspaceDatasets = Invoke-ImpactIQRestMethod -Method GET -Url $myWorkspaceDatasetsUrl | ConvertFrom-Json
     foreach ($dataset in $myWorkspaceDatasets.value) {
         $renamedDataset = Rename-Properties -object $dataset -renameMap $datasetRenameMap
         $renamedDataset | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
@@ -5913,7 +5878,7 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
         $datasetsInfo += $renamedDataset
 
         $datasourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets/$($dataset.id)/datasources"
-        $datasources = Invoke-PowerBIRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
+        $datasources = Invoke-ImpactIQRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
         foreach ($datasource in $datasources.value) {
             $renamedDatasource = Rename-Properties -object $datasource -renameMap $datasetDatasourceRenameMap
             $renamedDatasource | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
@@ -5929,7 +5894,7 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
 
     # Fetch reports from "My Workspace"
     $myWorkspaceReportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/reports"
-    $myWorkspaceReports = Invoke-PowerBIRestMethod -Method GET -Url $myWorkspaceReportsUrl | ConvertFrom-Json
+    $myWorkspaceReports = Invoke-ImpactIQRestMethod -Method GET -Url $myWorkspaceReportsUrl | ConvertFrom-Json
 
     $sharedReportExists = $false
     foreach ($report in $myWorkspaceReports.value) {
@@ -5965,7 +5930,7 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
         $reportsInfo += $renamedReport
 
         $pagesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/reports/$($report.id)/pages"
-        $pages = Invoke-PowerBIRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
+        $pages = Invoke-ImpactIQRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
         foreach ($page in $pages.value) {
             $renamedPage = Rename-Properties -object $page -renameMap $pageRenameMap
             $renamedPage | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspaceIdValue -Force
@@ -5990,7 +5955,7 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
     # Dataset refresh history for My Workspace
     foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $myWorkspaceId }) {
         $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets/$($dataset.DatasetId)/refreshes"
-        $refreshHistoryResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+        $refreshHistoryResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
         foreach ($refresh in $refreshHistoryResponse.value) {
             $renamedRefreshRecord = Rename-Properties -object $refresh -renameMap $datasetRefreshRenameMap
             $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
@@ -6006,7 +5971,7 @@ if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
         $refreshScheduleUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets/$($dataset.DatasetId)/refreshSchedule"
         
         try {
-            $refreshScheduleResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshScheduleUrl | ConvertFrom-Json
+            $refreshScheduleResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshScheduleUrl | ConvertFrom-Json
             
             # Get base properties that apply to all rows
             $renamedScheduleRecord = Rename-Properties -object $refreshScheduleResponse -renameMap $datasetRefreshScheduleRenameMap
@@ -6334,7 +6299,7 @@ function Export-ReportDefinitionAsPbix {
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 
-    $accessToken = Get-CurrentAccessToken
+    $accessToken = Get-FabricAccessToken
     $headers = @{ Authorization = "Bearer $accessToken"; 'Content-Type' = 'application/json' }
     $defUrl  = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$WorkspaceId/reports/$ReportId/getDefinition"
 
@@ -7117,7 +7082,7 @@ foreach ($workspace in $workspacesInfo) {
     $dataflowDetailsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$workspaceId/dataflows"
 
     # Get the list of dataflows in the workspace
-    $dataflowsResponse = Invoke-PowerBIRestMethod -Url $dataflowDetailsUrl -Method Get
+    $dataflowsResponse = Invoke-ImpactIQRestMethod -Url $dataflowDetailsUrl -Method Get
 
     # Parse the JSON response
     $dataflows = $dataflowsResponse | ConvertFrom-Json
@@ -7147,7 +7112,7 @@ foreach ($workspace in $workspacesInfo) {
             $apiUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$workspaceId/dataflows/$dataflowId"
             
             # Get the dataflow
-            $response = Invoke-PowerBIRestMethod -Url $apiUrl -Method Get
+            $response = Invoke-ImpactIQRestMethod -Url $apiUrl -Method Get
             
             # Save the original response to text file for backup
             $response | Out-File -FilePath $dataflowOutputFilePath -Encoding UTF8
@@ -7242,7 +7207,7 @@ foreach ($workspace in $workspacesInfo) {
     
     try {
         # Get the list of items in the workspace
-        $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
+        $fabricItemsResponse = Invoke-ImpactIQRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
         
         # Filter for Dataflow items (Gen2 dataflows)
         $gen2Dataflows = $fabricItemsResponse.value | Where-Object { $_.type -eq 'Dataflow' }
@@ -7256,7 +7221,7 @@ foreach ($workspace in $workspacesInfo) {
                 
                 
                 # Get current access token
-                $currentAccessToken = Get-CurrentAccessToken
+                $currentAccessToken = Get-FabricAccessToken
                 
                 # Download and extract Fabric dataflow
                 $fabricResult = Export-FabricDataflow -WorkspaceId $workspaceId `
@@ -7555,3 +7520,4 @@ $scriptEndTime = Get-Date
 $elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
 Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
 }
+ 

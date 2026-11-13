@@ -7511,13 +7511,13 @@ trap {
     continue
 }
 
-if ($global:RunMode -ne 'FabricApps') {
+if ($global:RunMode -in @('Workspaces', 'Agents')) {
     Export-FabricDataAgentDetail -BaseFolderPath $baseFolderPath -ReportDate $date -Workspaces $workspacesInfo -DatasetNames $datasetNameLookup
 }
 
 $EnableFabricAppDax = $true
 $FabricAppDaxParser = 'PowerShell'
-if ($EnableFabricAppDax) {
+if ($EnableFabricAppDax -and $global:RunMode -in @('Workspaces', 'FabricApps')) {
     try {
         if ($global:RunMode -eq 'FabricApps') {
             $captures = @($script:FabricAppCaptures.Values)

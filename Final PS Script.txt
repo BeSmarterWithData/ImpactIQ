@@ -865,14 +865,16 @@ function Get-ImpactIQAccessToken {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$ResourceUrl
+        [string]$ResourceUrl,
+        # Fabric App hosting needs the Azure-issued Power BI-audience token; XMLA needs the Power BI client token.
+        [switch]$Azure
     )
 
     $ErrorActionPreference = 'Stop'
     if ($ResourceUrl -notin @($global:PowerBIEndpoints.ResourceUrl, $global:PowerBIEndpoints.FabricApiPrefix)) {
         throw 'Token resource does not match the selected Power BI or Fabric cloud.'
     }
-    if ($ResourceUrl -eq $global:PowerBIEndpoints.ResourceUrl) {
+    if ($ResourceUrl -eq $global:PowerBIEndpoints.ResourceUrl -and -not $Azure) {
         return Get-ImpactIQPowerBIToken -ErrorAction Stop
     }
     if (-not $script:ImpactIQAzContext) {
@@ -3458,7 +3460,7 @@ function Assert-FabricAppDaxHostingUri {
 
 function Get-FabricAppDaxToken {
     param([Parameter(Mandatory)][string]$ResourceUrl)
-    Get-ImpactIQAccessToken -ResourceUrl $ResourceUrl -ErrorAction Stop
+    Get-ImpactIQAccessToken -ResourceUrl $ResourceUrl -Azure -ErrorAction Stop
 }
 
 function Invoke-FabricAppDaxRequest {

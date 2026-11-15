@@ -369,7 +369,7 @@ function Initialize-ImpactIQModules {
     $ErrorActionPreference = 'Stop'
     $installationReady = $false
     $previousSecurityProtocol = $null
-    $requiredModules = @('ImportExcel', 'Az.Accounts')
+    $requiredModules = @('ImportExcel', 'Az.Accounts', 'MicrosoftPowerBIMgmt.Profile')
     try {
         foreach ($module in $requiredModules) {
             try {
@@ -425,7 +425,7 @@ if (-not (Test-Path $configFolder)) {
     New-Item -Path $configFolder -ItemType Directory -Force | Out-Null
 }
 
-# Tokens are acquired from the single Az.Accounts session; no token file is used.
+# Fabric tokens come from Az.Accounts; Power BI/XMLA tokens come from the Power BI Mgmt session. No token file is used.
 
 $ErrorActionPreference = 'SilentlyContinue'
 $WarningPreference = 'Continue'
@@ -773,7 +773,7 @@ $EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { '
 $global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
 }
 
-# Connect once for both Power BI and Fabric.
+# Azure sign-in (Fabric). Power BI signs in separately through Connect-PowerBI.
 function Connect-ImpactIQ {
     [CmdletBinding()]
     param()
@@ -791,7 +791,7 @@ function Connect-ImpactIQ {
     if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
         Update-AzConfig -LoginExperienceV2 Off -Scope Process -ErrorAction Stop | Out-Null
     }
-    Write-Host "[INFO] Connecting to Power BI and Microsoft Fabric through Az.Accounts..." -ForegroundColor Cyan
+    Write-Host "[INFO] Connecting to Microsoft Fabric through Az.Accounts..." -ForegroundColor Cyan
     Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction Continue | Out-Null
     $context = Get-AzContext -ErrorAction Stop
     if (-not $context -or $context.Environment.Name -ne $azEnvironment -or
@@ -799,6 +799,66 @@ function Connect-ImpactIQ {
         throw 'Azure sign-in did not return a valid account and tenant for the selected cloud.'
     }
     $script:ImpactIQAzContext = $context
+}
+
+# The Az.Accounts token for the Power BI audience only carries user_impersonation (Azure PowerShell client),
+# which the XMLA endpoint rejects. Power BI/XMLA tokens must come from the Power BI Mgmt client instead.
+function Connect-PowerBI {
+    [CmdletBinding()]
+    param(
+        [int]$MaxAttempts = 2
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Stop'
+        if (-not $script:ImpactIQAzContext) {
+            throw 'Power BI sign-in requires a completed Azure sign-in first.'
+        }
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            try {
+                Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints" -ForegroundColor Cyan
+                Connect-PowerBIServiceAccount -Tenant $script:ImpactIQAzContext.Tenant.Id -Environment $EnvironmentForEndpoints -ErrorAction Stop -WarningAction Continue | Out-Null
+                $authorization = [string](Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue).Authorization
+                if ([string]::IsNullOrWhiteSpace(($authorization -replace '^Bearer\s*', ''))) {
+                    throw 'Power BI sign-in returned an empty access token.'
+                }
+                Write-Host "[INFO] Connected to Power BI." -ForegroundColor Green
+                return
+            }
+            catch {
+                Disconnect-PowerBIServiceAccount -ErrorAction SilentlyContinue | Out-Null
+                if ($attempt -ge $MaxAttempts) {
+                    Write-Host "[ERROR] Power BI sign-in failed: $($_.Exception.Message)" -ForegroundColor Red
+                    throw
+                }
+                Write-Warning "Power BI sign-in attempt $attempt failed: $($_.Exception.Message). Retrying..."
+                Start-Sleep -Seconds 2
+            }
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
+# MSAL renews the Power BI token silently; reconnect only Power BI if renewal fails.
+function Get-ImpactIQPowerBIToken {
+    [CmdletBinding()]
+    param()
+
+    $ErrorActionPreference = 'Stop'
+    $readToken = {
+        $value = ([string](Get-PowerBIAccessToken -ErrorAction Stop -WarningAction Continue).Authorization) -replace '^Bearer\s*', ''
+        if ([string]::IsNullOrWhiteSpace($value)) { throw 'Power BI authentication returned an empty access token.' }
+        $value
+    }
+    try { return (& $readToken) }
+    catch {
+        Write-Warning "Power BI token fetch failed ($($_.Exception.Message)); reconnecting Power BI."
+        Connect-PowerBI -MaxAttempts 2 -ErrorAction Stop
+        return (& $readToken)
+    }
 }
 
 function Get-ImpactIQAccessToken {
@@ -811,6 +871,9 @@ function Get-ImpactIQAccessToken {
     $ErrorActionPreference = 'Stop'
     if ($ResourceUrl -notin @($global:PowerBIEndpoints.ResourceUrl, $global:PowerBIEndpoints.FabricApiPrefix)) {
         throw 'Token resource does not match the selected Power BI or Fabric cloud.'
+    }
+    if ($ResourceUrl -eq $global:PowerBIEndpoints.ResourceUrl) {
+        return Get-ImpactIQPowerBIToken -ErrorAction Stop
     }
     if (-not $script:ImpactIQAzContext) {
         throw 'No Azure session is available. Restart the run and complete the Az.Accounts sign-in.'
@@ -869,10 +932,11 @@ $script:ImpactIQAuthenticationReady = $false
 $scriptStartTime = Get-Date
 
 Connect-ImpactIQ -ErrorAction Stop
-$null = Get-CurrentAccessToken
 $null = Get-FabricAccessToken
+Connect-PowerBI -ErrorAction Stop
+$null = Get-CurrentAccessToken
 $script:ImpactIQAuthenticationReady = $true
-Write-Host "[INFO] Connected to Power BI and Microsoft Fabric using one Azure session." -ForegroundColor Green
+Write-Host "[INFO] Connected to Microsoft Fabric (Azure) and Power BI." -ForegroundColor Green
 }
 if (-not $script:ImpactIQAuthenticationReady) {
     exit 1

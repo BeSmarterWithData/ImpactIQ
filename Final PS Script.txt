@@ -4955,7 +4955,9 @@ if ($runMode -eq 'FabricApps') {
             $script:SelectedFabricApps[$key] = $choice.App
             $neededWorkspaceIds[$choice.WorkspaceId] = $true
             Write-Host "Extracting $($choice.App.displayName) Fabric App detail"
-            $capture = Get-FabricAppDaxCapture -WorkspaceId $choice.WorkspaceId -WorkspaceName $choice.WorkspaceName -AppId $choice.App.id -AppName $choice.App.displayName -ParserRuntime $appRuntime -Environment $EnvironmentForEndpoints -ModelNameCache $appModelNameCache
+            $capture = Get-FabricAppDaxCapture -WorkspaceId $choice.WorkspaceId -WorkspaceName $choice.WorkspaceName -AppId $choice.App.id -AppName $choice.App.displayName -ParserRuntime $appRuntime -Environment $EnvironmentForEndpoints -ModelNameCache $appModelNameCache -Workspaces @(
+                $workspacesResponse.value | Select-Object @{ Name = 'WorkspaceId'; Expression = { $_.id } }, @{ Name = 'WorkspaceName'; Expression = { $_.name } }
+            )
             $script:FabricAppCaptures[$key] = $capture
             if (@($capture.Models).Count -eq 0) {
                 throw "Cannot reliably scope connected Models for Fabric App '$($choice.App.displayName)': $($capture.Error)"

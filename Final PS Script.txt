@@ -36,11 +36,12 @@ function Write-ImpactIQRunRecord {
         [switch]$DiscardOutput
     )
 
-    if ($Record -is [Management.Automation.ErrorRecord]) {
+    if ($Record -is [Management.Automation.ErrorRecord] -or $Record -is [Exception]) {
+        $exception = if ($Record -is [Exception]) { $Record } else { $Record.Exception }
         # Redirection can clone an ErrorRecord while retaining the same exception.
-        if ($script:ImpactIQDiagnostics.SeenExceptions.Add($Record.Exception)) {
-            $message = $Record.Exception.Message
-            if ($Record.InvocationInfo.ScriptLineNumber) {
+        if ($script:ImpactIQDiagnostics.SeenExceptions.Add($exception)) {
+            $message = $exception.Message
+            if ($Record -is [Management.Automation.ErrorRecord] -and $Record.InvocationInfo.ScriptLineNumber) {
                 $message += " (line $($Record.InvocationInfo.ScriptLineNumber), $($Record.FullyQualifiedErrorId))"
             }
             Write-ImpactIQDiagnostic -Level ERROR -Message $message
@@ -347,17 +348,11 @@ function Initialize-ImpactIQExecutionPolicy {
     param()
 
     $ErrorActionPreference = 'Stop'
-    if ((Get-ExecutionPolicy -ErrorAction Stop) -eq 'Bypass') { return }
-    foreach ($scope in @('MachinePolicy', 'UserPolicy')) {
-        $policy = Get-ExecutionPolicy -Scope $scope -ErrorAction Stop
-        if ($policy -ne 'Undefined') {
-            Write-ImpactIQDiagnostic -Level WARN -Message "$scope enforces execution policy '$policy'. Process Bypass cannot override Group Policy; continuing under the enforced policy."
-            return
-        }
+    try {
+        Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop
     }
-    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force -ErrorAction Stop
-    if ((Get-ExecutionPolicy -ErrorAction Stop) -ne 'Bypass') {
-        throw 'Process-scoped Bypass could not be enabled. Check the effective execution policy.'
+    catch {
+        Write-ImpactIQDiagnostic -Level WARN -Message "Could not apply process-scoped execution policy Bypass: $($_.Exception.Message). Continuing under the existing execution policy."
     }
 }
 
@@ -396,7 +391,7 @@ function Initialize-ImpactIQModules {
                 if (-not $moduleInfo) { throw "Import did not confirm that $module was loaded." }
             }
             catch {
-                throw "Required module '$module' could not be installed and imported after one retry. $($_.Exception.Message) Check PSGallery access and organizational policy; for loaded-assembly conflicts, retry in a fresh PowerShell process."
+                Write-ImpactIQContinuingError -Record $_ -Context "Required module '$module' preparation after one retry"
             }
         }
     }
@@ -435,9 +430,7 @@ try {
     Initialize-ImpactIQModules -ErrorAction Stop
 }
 catch {
-    $script:ImpactIQRunFailed = $true
-    Write-ImpactIQRunRecord -Record $_
-    exit 1
+    Write-ImpactIQContinuingError -Record $_ -Context 'Startup preparation'
 }
 
 # Install pinned tool versions from Config\tool-manifest.json when the installed version differs.

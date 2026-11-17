@@ -1,0 +1,20 @@
+{
+  "tools": [
+    {
+      "name": "Tabular Editor",
+      "version": "2.29.0",
+      "url": "https://github.com/TabularEditor/TabularEditor/releases/download/2.29.0/TabularEditor.Portable.zip",
+      "archiveFile": "TabularEditor.Portable.zip",
+      "destination": "TabularEditor",
+      "executable": "TabularEditor.exe"
+    },
+    {
+      "name": "pbi-tools",
+      "version": "1.2.0",
+      "url": "https://github.com/pbi-tools/pbi-tools/releases/download/1.2.0/pbi-tools.1.2.0.zip",
+      "archiveFile": "pbi-tools.1.2.0.zip",
+      "destination": "PBI Tools",
+      "executable": "pbi-tools.exe"
+    }
+  ]
+}

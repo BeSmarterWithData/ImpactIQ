@@ -2089,8 +2089,7 @@ function Get-FabricAppBackupPath {
         [Parameter(Mandatory)][string]$BaseFolderPath,
         [Parameter(Mandatory)][string]$ReportDate,
         [AllowEmptyString()][string]$WorkspaceName,
-        [AllowEmptyString()][string]$AppName,
-        [Parameter(Mandatory)][guid]$AppId
+        [AllowEmptyString()][string]$AppName
     )
 
     $labels = foreach ($name in @($WorkspaceName, $AppName)) {
@@ -2099,7 +2098,7 @@ function Get-FabricAppBackupPath {
         $label
     }
     $root = Join-Path (Join-Path $BaseFolderPath 'Fabric App Backups') $ReportDate
-    Join-Path $root (($labels -join ' ~ ') + ' ~ ' + $AppId.ToString())
+    Join-Path $root ($labels -join ' ~ ')
 }
 
 function Get-FabricAppConfiguredModels {
@@ -2283,7 +2282,10 @@ function Export-FabricAppBackups {
                 [IO.File]::WriteAllBytes($partPath, $bytes)
             }
             Expand-FabricAppFrontend -FilesRoot $filesRoot -ErrorAction Stop
-            $destination = Get-FabricAppBackupPath -BaseFolderPath $BaseFolderPath -ReportDate $ReportDate -WorkspaceName $app.WorkspaceName -AppName $app.FabricItemName -AppId $appId
+            $destination = Get-FabricAppBackupPath -BaseFolderPath $BaseFolderPath -ReportDate $ReportDate -WorkspaceName $app.WorkspaceName -AppName $app.FabricItemName
+            # Apps that share a workspace and name (or truncate to the same label) get a numbered suffix instead of overwriting each other.
+            $baseDestination = $destination
+            for ($copy = 2; Test-Path -LiteralPath $destination; $copy++) { $destination = "$baseDestination ($copy)" }
             [IO.Directory]::Move($stagePath, $destination)
             $stagePath = $null
             $BackupPaths["$workspaceId|$appId"] = $destination
@@ -3816,7 +3818,7 @@ function Export-FabricAppDaxEnvironment {
     $appQueryCaptures = @()
     $appContexts = [Collections.Generic.List[object]]::new()
     foreach ($appItem in $appItems) {
-        $backupPath = Get-FabricAppBackupPath -BaseFolderPath $BaseFolderPath -ReportDate $ReportDate -WorkspaceName $appItem.WorkspaceName -AppName $appItem.FabricItemName -AppId $appItem.FabricItemID
+        $backupPath = Get-FabricAppBackupPath -BaseFolderPath $BaseFolderPath -ReportDate $ReportDate -WorkspaceName $appItem.WorkspaceName -AppName $appItem.FabricItemName
         $key = "$($appItem.WorkspaceId)|$($appItem.FabricItemID)"
         $connections = $ConnectionCache[$key]
         $configuredModels = @()

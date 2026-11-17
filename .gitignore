@@ -1,0 +1,13 @@
+# Backup output folders
+Report Backups/
+Model Backups/
+
+# Excel outputs
+*.xlsx
+
+# Runtime completion marker
+.impactiq_complete
+
+# Local diagnostics
+Config/errorlog.txt
+Config/Error Log.txt

@@ -766,6 +766,66 @@ $EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { '
 $global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
 }
 
+function Show-ImpactIQTenantSelectionDialog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Tenants
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    $form = New-Object System.Windows.Forms.Form
+    try {
+        $form.Text = 'Select your Fabric organization'
+        $form.StartPosition = 'CenterScreen'
+        $form.Size = New-Object System.Drawing.Size(650, 300)
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = 'Sign-in did not identify a tenant. Select the organization to use:'
+        $label.AutoSize = $true
+        $label.Location = New-Object System.Drawing.Point(15, 15)
+        $form.Controls.Add($label)
+
+        $listBox = New-Object System.Windows.Forms.ListBox
+        $listBox.Location = New-Object System.Drawing.Point(15, 45)
+        $listBox.Size = New-Object System.Drawing.Size(600, 150)
+        $listBox.HorizontalScrollbar = $true
+        foreach ($tenant in $Tenants) {
+            $name = if ([string]::IsNullOrWhiteSpace([string]$tenant.Name)) { 'Organization' } else { $tenant.Name }
+            [void]$listBox.Items.Add(('{0} ({1}) [{2}]' -f $name, ($tenant.Domains -join ', '), $tenant.Id))
+        }
+        $listBox.SelectedIndex = -1
+        $form.Controls.Add($listBox)
+
+        $okButton = New-Object System.Windows.Forms.Button
+        $okButton.Text = 'OK'
+        $okButton.Location = New-Object System.Drawing.Point(450, 215)
+        $okButton.Enabled = $false
+        $listBox.Add_SelectedIndexChanged({ $okButton.Enabled = $listBox.SelectedIndex -ge 0 })
+        $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Controls.Add($okButton)
+
+        $cancelButton = New-Object System.Windows.Forms.Button
+        $cancelButton.Text = 'Cancel'
+        $cancelButton.Location = New-Object System.Drawing.Point(540, 215)
+        $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $form.Controls.Add($cancelButton)
+        $form.AcceptButton = $okButton
+        $form.CancelButton = $cancelButton
+
+        if ($form.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK -or $listBox.SelectedIndex -lt 0) {
+            throw 'Organization selection was cancelled.'
+        }
+        return [string]$Tenants[$listBox.SelectedIndex].Id
+    }
+    finally {
+        $form.Dispose()
+    }
+}
+
 # Azure sign-in (Fabric). Power BI signs in separately through Connect-PowerBI.
 function Connect-ImpactIQ {
     [CmdletBinding()]
@@ -787,6 +847,37 @@ function Connect-ImpactIQ {
     Write-Host "[INFO] Connecting to Microsoft Fabric through Az.Accounts..." -ForegroundColor Cyan
     Connect-AzAccount -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction Continue | Out-Null
     $context = Get-AzContext -ErrorAction Stop
+    if ($context -and $context.Environment.Name -eq $azEnvironment -and
+        $context.Account.Id -and [string]::IsNullOrWhiteSpace([string]$context.Tenant.Id)) {
+        Write-ImpactIQDiagnostic -Level WARN -Message 'Azure sign-in returned no tenant. Attempting organization discovery and one tenant-specific sign-in.'
+        try {
+            $accountId = [string]$context.Account.Id
+            $tenants = @(Get-AzTenant -DefaultProfile $context -ErrorAction Stop -WarningAction Continue)
+            if ($tenants.Count -eq 0) { throw 'No organizations were returned for the signed-in account.' }
+            foreach ($tenant in $tenants) {
+                if ([string]::IsNullOrWhiteSpace([string]$tenant.Id)) {
+                    throw 'Organization discovery returned a tenant without an ID.'
+                }
+            }
+            $tenants = @($tenants | Sort-Object -Property Id -Unique)
+            $tenantId = if ($tenants.Count -eq 1) { [string]$tenants[0].Id }
+                else { Show-ImpactIQTenantSelectionDialog -Tenants $tenants -ErrorAction Stop }
+            if ([string]::IsNullOrWhiteSpace($tenantId) -or $tenantId -notin @($tenants | ForEach-Object { [string]$_.Id })) {
+                throw 'Organization selection did not return an authorized tenant.'
+            }
+            Connect-AzAccount -Tenant $tenantId -AccountId $accountId -Environment $azEnvironment -Scope Process -SkipContextPopulation -ErrorAction Stop -WarningAction Continue | Out-Null
+            $context = Get-AzContext -ErrorAction Stop
+            if (-not $context -or $context.Environment.Name -ne $azEnvironment -or
+                $context.Account.Id -ne $accountId -or $context.Tenant.Id -ne $tenantId) {
+                throw 'Tenant-specific sign-in did not return the selected organization and original account in the selected cloud.'
+            }
+        }
+        catch {
+            throw [InvalidOperationException]::new(
+                "Azure tenant recovery failed: $($_.Exception.Message) Confirm your organization access with your administrator; explicit tenant sign-in may be required.",
+                $_.Exception)
+        }
+    }
     if (-not $context -or $context.Environment.Name -ne $azEnvironment -or
         -not $context.Tenant.Id -or -not $context.Account.Id) {
         throw 'Azure sign-in did not return a valid account and tenant for the selected cloud.'

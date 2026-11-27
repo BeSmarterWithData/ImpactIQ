@@ -151,7 +151,8 @@ public struct RECT { public int Left, Top, Right, Bottom; }
         <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" MaxWidth="600">
           <TextBlock Text="FINISHED" Foreground="#5EEAD4" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center"/>
           <TextBlock Text="Open the Governance Report / Model to view your environment" FontSize="24" FontWeight="SemiBold"
-                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,10,0,26"/>
+                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,10,0,8"/>
+          <TextBlock x:Name="DoneElapsed" Foreground="#A9B9CF" FontSize="14" TextAlignment="Center" Margin="0,0,0,26"/>
           <Button x:Name="DoneOpenModel" Content="Open Governance Report / Model" Background="#087F75"
                   FontWeight="SemiBold" FontSize="16" Padding="28,16" Margin="0,0,0,16"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
@@ -178,7 +179,7 @@ $controls = @{}
 foreach ($name in @('Browse', 'Folder', 'Run', 'OpenFolder', 'OpenModel', 'Status', 'Detail', 'Progress', 'Log', 'OpenLog',
     'Setup', 'SelectionPanel', 'SelectionTitle', 'SelectionDescription', 'Search', 'ChoiceList', 'CheckedList',
     'MultiActions', 'SelectAll', 'ClearAll', 'IncludeMy', 'SelectionCount', 'SelectionDeadline', 'Continue', 'Back', 'LogPanel', 'Header', 'Intro',
-    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneNote', 'Eyebrow', 'LogoCard')) {
+    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneNote', 'DoneElapsed', 'Eyebrow', 'LogoCard')) {
     $controls[$name] = $window.FindName($name)
     if ($null -eq $controls[$name]) { throw "GUI control is missing: $name" }
 }
@@ -227,6 +228,7 @@ $state = @{
     SignInWatch = $false
     SignInBaseline = @{}
     SignInRaised = @{}
+    Stopwatch = $null
 }
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(500)
@@ -449,13 +451,20 @@ $controls.OpenLog.Add_Click({
     catch { Show-LauncherError $_.Exception.Message }
 })
 
+function Format-Elapsed {
+    param([TimeSpan]$Span)
+    return '{0}h {1}m {2}s' -f [int][Math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds
+}
+
 # Most environments produce notes and warnings, so a finished run replaces the log with the next step.
 function Show-GuiFinished {
-    param([bool]$HadIssues)
+    param([bool]$HadIssues, [string]$Elapsed = '')
     $controls.Log.Clear()
     $controls.LogPanel.Visibility = 'Collapsed'
     $controls.Setup.Visibility = 'Collapsed'
     $controls.StatusPanel.Visibility = 'Collapsed'
+    $controls.DoneElapsed.Text = if ($Elapsed) { "Total elapsed time: $Elapsed" } else { '' }
+    $controls.DoneElapsed.Visibility = if ($Elapsed) { 'Visible' } else { 'Collapsed' }
     $controls.DoneNote.Text = 'Some steps reported notes, which is normal for most environments. Details are in the full log.'
     $controls.DoneNote.Visibility = if ($HadIssues) { 'Visible' } else { 'Collapsed' }
     $controls.DonePanel.Visibility = 'Visible'
@@ -507,6 +516,7 @@ $controls.Run.Add_Click({
         $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
         $state.Process = [Diagnostics.Process]::Start($startInfo)
         $state.Issues = $false
+        $state.Stopwatch = [Diagnostics.Stopwatch]::StartNew()
         $state.ErrorLogPath = Join-Path $state.Folder 'Config\Error Log.txt'
         $state.ErrorLogOffset = if (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf) { (Get-Item -LiteralPath $state.ErrorLogPath).Length } else { 0 }
         $controls.Log.Text = "Starting analysis. Everything is shown in this window.`r`n"
@@ -600,6 +610,9 @@ $timer.Add_Tick({
                 if ($finalText) { $controls.Log.AppendText($finalText); $controls.Log.ScrollToEnd() }
                 $state.Reader.Dispose(); $state.Reader = $null
             }
+            $elapsedText = ''
+            if ($null -ne $state.Stopwatch) { $state.Stopwatch.Stop(); $elapsedText = Format-Elapsed $state.Stopwatch.Elapsed }
+            $elapsedSuffix = if ($elapsedText) { " Elapsed: $elapsedText." } else { '' }
             $controls.Progress.IsIndeterminate = $false
             $controls.Run.IsEnabled = $true
             $controls.Browse.IsEnabled = $true
@@ -615,22 +628,22 @@ $timer.Add_Tick({
             if (Test-Path -LiteralPath $state.ResultPath -PathType Leaf) {
                 $result = Get-Content -LiteralPath $state.ResultPath -Raw | ConvertFrom-Json
                 if ($result.State -in @('Finished', 'FinishedWithIssues') -and $state.Process.ExitCode -eq 0) {
-                    Show-GuiFinished -HadIssues ($result.State -eq 'FinishedWithIssues' -or $state.Issues)
+                    Show-GuiFinished -HadIssues ($result.State -eq 'FinishedWithIssues' -or $state.Issues) -Elapsed $elapsedText
                 }
                 else {
                     $controls.Status.Text = if ($result.State -eq 'Failed' -or $state.Process.ExitCode -ne 0) { 'Analysis failed' }
                         elseif ($result.State -eq 'Cancelled') { 'Analysis cancelled' }
                         else { 'Analysis stopped before completion' }
-                    $controls.Detail.Text = $result.Message
+                    $controls.Detail.Text = $result.Message + $elapsedSuffix
                 }
             }
             elseif ($state.Process.ExitCode -ne 0) {
                 $controls.Status.Text = 'Analysis failed'
-                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, the saved log, and 'Config\Error Log.txt' in your backup folder."
+                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, the saved log, and 'Config\Error Log.txt' in your backup folder." + $elapsedSuffix
             }
             else {
                 $controls.Status.Text = 'Analysis stopped before completion'
-                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and log; no completion was confirmed.'
+                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and log; no completion was confirmed.' + $elapsedSuffix
             }
             if ($state.BridgePath -and (Test-Path -LiteralPath $state.BridgePath -PathType Container)) {
                 Remove-Item -LiteralPath $state.BridgePath -Recurse -Force -ErrorAction SilentlyContinue

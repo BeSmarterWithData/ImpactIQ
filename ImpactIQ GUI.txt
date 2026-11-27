@@ -1,0 +1,662 @@
+param(
+    [string]$LauncherRoot = $PSScriptRoot,
+    [switch]$ValidateOnly
+)
+
+$ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($LauncherRoot)) {
+    throw 'Use ImpactIQ GUI.bat to open the text-based GUI launcher.'
+}
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    throw 'This GUI requires FullLanguage PowerShell. Ask IT for an approved deployment; the launcher does not bypass policy.'
+}
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
+    throw 'Start this GUI using the supplied batch launcher or powershell.exe -STA.'
+}
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName System.Windows.Forms
+if (-not ('ImpactIQ.NativeWindows' -as [type])) {
+    Add-Type -Namespace ImpactIQ -Name NativeWindows -MemberDefinition @'
+public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+public struct RECT { public int Left, Top, Right, Bottom; }
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder text, int count);
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
+[DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out int value, int size);
+'@
+}
+
+[xml]$xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Impact IQ" Width="1000" Height="780" MinWidth="800" MinHeight="680"
+        WindowStartupLocation="CenterScreen" Background="#101827" Foreground="#E7EEF8"
+        FontFamily="Segoe UI">
+  <Window.Resources>
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="#26364D"/>
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="Padding" Value="18,10"/>
+      <Setter Property="Margin" Value="0,0,10,0"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Style.Triggers>
+        <Trigger Property="IsEnabled" Value="False">
+          <Setter Property="Opacity" Value="0.45"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+  </Window.Resources>
+  <Grid Margin="32">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <StackPanel x:Name="Header" Margin="0,0,0,24">
+      <TextBlock x:Name="Eyebrow" Text="IMPACT IQ" Foreground="#5EEAD4" FontSize="14" FontWeight="Bold"/>
+      <DockPanel x:Name="Intro" Margin="0,8,0,0">
+        <Border x:Name="LogoCard" DockPanel.Dock="Left" Width="256" Height="144" CornerRadius="12"
+                Margin="0,0,24,0" Visibility="Collapsed"/>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Be smarter with every change." FontSize="30" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6"/>
+          <TextBlock Text="Power BI + Fabric  /  Impact analysis, governance, and backups" Foreground="#A9B9CF" TextWrapping="Wrap"/>
+        </StackPanel>
+      </DockPanel>
+    </StackPanel>
+    <Border x:Name="Setup" Grid.Row="1" Background="#1A2639" CornerRadius="12" Padding="20" Margin="0,0,0,18">
+      <StackPanel>
+        <TextBlock Text="YOUR BACKUP LOCATION" Foreground="#A9B9CF" FontWeight="SemiBold" Margin="0,0,0,10"/>
+        <DockPanel>
+          <Button x:Name="Browse" DockPanel.Dock="Right" Content="Browse..." Margin="12,0,0,0"/>
+          <TextBox x:Name="Folder" Text="C:\Power BI Backups" Background="#101827" Foreground="#FFFFFF"
+                   BorderBrush="#40516B" Padding="12,9" VerticalContentAlignment="Center"/>
+        </DockPanel>
+        <TextBlock Text="Choose your cloud and analysis scope here. Microsoft sign-in may open separately."
+                   Foreground="#A9B9CF" TextWrapping="Wrap" Margin="0,12,0,16"/>
+        <StackPanel Orientation="Horizontal">
+          <Button x:Name="Run" Content="Start analysis" Background="#087F75" FontWeight="SemiBold"/>
+          <Button x:Name="OpenFolder" Content="Open backups"/>
+          <Button x:Name="OpenModel" Content="Open governance template"/>
+        </StackPanel>
+      </StackPanel>
+    </Border>
+    <StackPanel x:Name="StatusPanel" Grid.Row="2" Margin="0,0,0,16">
+      <TextBlock x:Name="Status" Text="Ready when you are." FontSize="17" FontWeight="SemiBold"/>
+      <TextBlock x:Name="Detail" Text="No custom executable or installer. Organization policies still apply."
+                 Foreground="#A9B9CF" TextWrapping="Wrap" Margin="0,6,0,10"/>
+      <ProgressBar x:Name="Progress" Height="4" Minimum="0" Maximum="100" Value="0"
+                   Foreground="#5EEAD4" Background="#26364D" BorderThickness="0"/>
+    </StackPanel>
+    <Grid Grid.Row="3">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="3*"/>
+        <ColumnDefinition Width="2*"/>
+      </Grid.ColumnDefinitions>
+      <Border x:Name="SelectionPanel" Background="#1A2639" CornerRadius="12" Padding="18"
+              Margin="0,0,14,0" Visibility="Collapsed">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <StackPanel Margin="0,0,0,12">
+            <TextBlock x:Name="SelectionTitle" FontSize="20" FontWeight="SemiBold" TextWrapping="Wrap"/>
+            <TextBlock x:Name="SelectionDescription" Foreground="#A9B9CF" TextWrapping="Wrap" Margin="0,8,0,0"/>
+          </StackPanel>
+          <TextBox x:Name="Search" Grid.Row="1" Background="#101827" Foreground="#FFFFFF"
+                   BorderBrush="#40516B" Padding="10,8" Margin="0,0,0,10"
+                   ToolTip="Search by name, workspace or ID"/>
+          <ListBox x:Name="ChoiceList" Grid.Row="2" Background="#101827" Foreground="#FFFFFF"
+                   BorderBrush="#40516B" DisplayMemberPath="Display" Padding="8"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+          <ListBox x:Name="CheckedList" Grid.Row="2" Background="#101827" Foreground="#FFFFFF"
+                   BorderBrush="#40516B" Padding="8" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+          <StackPanel x:Name="MultiActions" Grid.Row="3" Margin="0,10,0,0">
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="SelectAll" Content="Select All" Padding="12,7"/>
+              <Button x:Name="ClearAll" Content="Clear All" Padding="12,7"/>
+            </StackPanel>
+            <CheckBox x:Name="IncludeMy" Content="Include 'My Workspace'" Foreground="#FFFFFF" Margin="0,12,0,0"/>
+          </StackPanel>
+          <StackPanel Grid.Row="4" Margin="0,10,0,12">
+            <TextBlock x:Name="SelectionCount" Foreground="#5EEAD4"/>
+            <TextBlock x:Name="SelectionDeadline" Foreground="#A9B9CF" TextWrapping="Wrap" Margin="0,4,0,0"/>
+          </StackPanel>
+          <StackPanel Grid.Row="5" Orientation="Horizontal">
+            <Button x:Name="Continue" Content="Continue" Background="#087F75" FontWeight="SemiBold"/>
+            <Button x:Name="Back" Content="Back"/>
+          </StackPanel>
+        </Grid>
+      </Border>
+      <Border x:Name="LogPanel" Grid.ColumnSpan="2" Background="#0B1220" CornerRadius="12" Padding="16">
+        <DockPanel>
+          <TextBlock DockPanel.Dock="Top" Text="LIVE ACTIVITY" Foreground="#A9B9CF" FontWeight="SemiBold" Margin="0,0,0,12"/>
+          <TextBox x:Name="Log" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
+                   VerticalScrollBarVisibility="Auto" Background="Transparent" Foreground="#CFDCEE"
+                   BorderThickness="0" FontFamily="Consolas" FontSize="12"/>
+        </DockPanel>
+      </Border>
+      <Border x:Name="DonePanel" Grid.ColumnSpan="2" Background="#1A2639" CornerRadius="12" Padding="32" Visibility="Collapsed">
+        <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" MaxWidth="600">
+          <TextBlock Text="FINISHED" Foreground="#5EEAD4" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center"/>
+          <TextBlock Text="Open the Governance Report / Model to view your environment" FontSize="24" FontWeight="SemiBold"
+                     TextWrapping="Wrap" TextAlignment="Center" Margin="0,10,0,26"/>
+          <Button x:Name="DoneOpenModel" Content="Open Governance Report / Model" Background="#087F75"
+                  FontWeight="SemiBold" FontSize="16" Padding="28,16" Margin="0,0,0,16"/>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+            <Button x:Name="DoneOpenFolder" Content="Open backups"/>
+            <Button x:Name="DoneRunAgain" Content="Run again" Margin="0"/>
+          </StackPanel>
+          <TextBlock x:Name="DoneNote" Foreground="#A9B9CF" TextWrapping="Wrap" TextAlignment="Center"
+                     Margin="0,20,0,0" Visibility="Collapsed"/>
+        </StackPanel>
+      </Border>
+    </Grid>
+    <DockPanel Grid.Row="4" Margin="0,18,0,0">
+      <Button x:Name="OpenLog" DockPanel.Dock="Right" Content="Open full log" Margin="12,0,0,0" IsEnabled="False"/>
+      <TextBlock Text=""
+                 Foreground="#A9B9CF" VerticalAlignment="Center" TextWrapping="Wrap"/>
+    </DockPanel>
+  </Grid>
+</Window>
+'@
+$xmlReader = New-Object System.Xml.XmlNodeReader $xaml
+try { $window = [Windows.Markup.XamlReader]::Load($xmlReader) }
+finally { $xmlReader.Close() }
+$controls = @{}
+foreach ($name in @('Browse', 'Folder', 'Run', 'OpenFolder', 'OpenModel', 'Status', 'Detail', 'Progress', 'Log', 'OpenLog',
+    'Setup', 'SelectionPanel', 'SelectionTitle', 'SelectionDescription', 'Search', 'ChoiceList', 'CheckedList',
+    'MultiActions', 'SelectAll', 'ClearAll', 'IncludeMy', 'SelectionCount', 'SelectionDeadline', 'Continue', 'Back', 'LogPanel', 'Header', 'Intro',
+    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneNote', 'Eyebrow', 'LogoCard')) {
+    $controls[$name] = $window.FindName($name)
+    if ($null -eq $controls[$name]) { throw "GUI control is missing: $name" }
+}
+
+# The logo ships next to the other support files; without it the text header is used.
+$logoLoaded = $false
+$logoPath = Join-Path $LauncherRoot 'Config\ImpactIQ Logo.png'
+if (Test-Path -LiteralPath $logoPath -PathType Leaf) {
+    try {
+        $logo = New-Object Windows.Media.Imaging.BitmapImage
+        $logo.BeginInit()
+        $logo.UriSource = New-Object Uri $logoPath
+        $logo.CacheOption = [Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $logo.EndInit()
+        $logo.Freeze()
+        $logoBrush = New-Object Windows.Media.ImageBrush $logo
+        $logoBrush.Stretch = [Windows.Media.Stretch]::UniformToFill
+        $controls.LogoCard.Background = $logoBrush
+        $controls.LogoCard.Visibility = 'Visible'
+        $controls.Eyebrow.Visibility = 'Collapsed'
+        $window.Icon = $logo
+        $logoLoaded = $true
+    }
+    catch { $logoLoaded = $false }
+}
+if ($ValidateOnly) {
+    $window.Close()
+    Write-Output 'PASS: WPF layout and controls loaded.'
+    return
+}
+
+$state = @{
+    Process = $null
+    Reader = $null
+    LogPath = $null
+    ResultPath = $null
+    Folder = $null
+    Issues = $false
+    BridgePath = $null
+    Request = $null
+    LastRequestId = $null
+    Checked = @{}
+    DisplayItems = @()
+    ErrorLogPath = $null
+    ErrorLogOffset = 0
+    SignInWatch = $false
+    SignInBaseline = @{}
+    SignInRaised = @{}
+}
+$timer = New-Object Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromMilliseconds(500)
+
+function Show-LauncherError {
+    param([string]$Message)
+    $controls.Status.Text = 'Action needs attention.'
+    $controls.Detail.Text = $Message
+    [void][Windows.MessageBox]::Show($window, $Message, 'Impact IQ', 'OK', 'Error')
+}
+
+function Get-BackupFolder {
+    $folder = $controls.Folder.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($folder) -or -not [IO.Path]::IsPathRooted($folder)) {
+        throw 'Choose an absolute backup folder path.'
+    }
+    $folder = [IO.Path]::GetFullPath($folder)
+    if ($folder.Contains('"') -or $folder.Contains("`r") -or $folder.Contains("`n")) {
+        throw 'The backup path contains invalid characters.'
+    }
+    return $folder
+}
+
+function ConvertTo-LauncherLiteral {
+    param([string]$Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+# The Microsoft sign-in window opens under the GUI (or another app) rather than in front, so the GUI raises new ones.
+function Get-SignInWindowHandles {
+    param([string]$ClassPattern = '^ApplicationFrameWindow$')
+    $found = New-Object Collections.ArrayList
+    $callback = [ImpactIQ.NativeWindows+EnumWindowsProc]{
+        param($handle, $parameter)
+        if ([ImpactIQ.NativeWindows]::IsWindowVisible($handle)) {
+            $cloaked = 0
+            [void][ImpactIQ.NativeWindows]::DwmGetWindowAttribute($handle, 14, [ref]$cloaked, 4)
+            $className = New-Object Text.StringBuilder 128
+            [void][ImpactIQ.NativeWindows]::GetClassName($handle, $className, 128)
+            $rect = New-Object ImpactIQ.NativeWindows+RECT
+            [void][ImpactIQ.NativeWindows]::GetWindowRect($handle, [ref]$rect)
+            if ($cloaked -eq 0 -and $className.ToString() -match $ClassPattern -and
+                ($rect.Right - $rect.Left) -ge 300 -and ($rect.Bottom - $rect.Top) -ge 300) {
+                [void]$found.Add($handle.ToInt64())
+            }
+        }
+        return $true
+    }
+    [void][ImpactIQ.NativeWindows]::EnumWindows($callback, [IntPtr]::Zero)
+    return @($found)
+}
+
+function Start-SignInWatch {
+    param([string]$ClassPattern = '^ApplicationFrameWindow$')
+    $state.SignInBaseline = @{}
+    foreach ($handle in (Get-SignInWindowHandles -ClassPattern $ClassPattern)) { $state.SignInBaseline[$handle] = $true }
+    $state.SignInRaised = @{}
+    $state.SignInWatch = $true
+}
+
+function Show-NewSignInWindows {
+    param([string]$ClassPattern = '^ApplicationFrameWindow$')
+    foreach ($handle in (Get-SignInWindowHandles -ClassPattern $ClassPattern)) {
+        if ($state.SignInBaseline.ContainsKey($handle) -or $state.SignInRaised.ContainsKey($handle)) { continue }
+        $state.SignInRaised[$handle] = $true
+        $pointer = [IntPtr]$handle
+        if ([ImpactIQ.NativeWindows]::IsIconic($pointer)) { [void][ImpactIQ.NativeWindows]::ShowWindow($pointer, 9) }
+        [void][ImpactIQ.NativeWindows]::SetForegroundWindow($pointer)
+    }
+}
+
+function Update-SelectionSummary {
+    if ($null -eq $state.Request) { return }
+    if ($state.Request.Kind -eq 'Choice') {
+        $controls.SelectionCount.Text = 'Choose an option, then Continue.'
+        $controls.Continue.IsEnabled = $null -ne $controls.ChoiceList.SelectedItem
+    }
+    else {
+        $controls.SelectionCount.Text = '{0} checked / {1} total / {2} visible' -f
+            $state.Checked.Count, @($state.Request.Items).Count, $controls.CheckedList.Items.Count
+    }
+}
+
+function Update-SelectionFilter {
+    if ($null -eq $state.Request -or $state.Request.Kind -eq 'Choice') { return }
+    $controls.CheckedList.Items.Clear()
+    $search = $controls.Search.Text
+    foreach ($item in $state.DisplayItems) {
+        if (-not [string]::IsNullOrWhiteSpace($search) -and $item.Display -notmatch [regex]::Escape($search)) { continue }
+        $check = New-Object Windows.Controls.CheckBox
+        $label = New-Object Windows.Controls.TextBlock
+        $label.Text = $item.Display
+        $label.TextWrapping = 'Wrap'
+        $check.Content = $label
+        $check.Tag = [string]$item.Id
+        $check.Foreground = [Windows.Media.Brushes]::White
+        $check.Margin = '3,5,3,5'
+        $check.IsChecked = $state.Checked.ContainsKey([string]$item.Id)
+        $check.Add_Checked({
+            param($sender, $eventArgs)
+            $state.Checked[[string]$sender.Tag] = $true
+            Update-SelectionSummary
+        })
+        $check.Add_Unchecked({
+            param($sender, $eventArgs)
+            $state.Checked.Remove([string]$sender.Tag)
+            Update-SelectionSummary
+        })
+        [void]$controls.CheckedList.Items.Add($check)
+    }
+    Update-SelectionSummary
+}
+
+function Show-GuiSelection {
+    param($Request)
+    if ($Request.Kind -notin @('Choice', 'Workspaces', 'Reports', 'Models') -or -not $Request.Id) {
+        throw 'The worker requested an unsupported selection step.'
+    }
+    $state.Request = $Request
+    $state.LastRequestId = $Request.Id
+    $state.Checked = @{}
+    $state.DisplayItems = @($Request.Items | Sort-Object Display)
+    $controls.SelectionTitle.Text = $Request.Title
+    $controls.SelectionDescription.Text = $Request.Description
+    $controls.Search.Text = ''
+    $controls.IncludeMy.IsChecked = $false
+    $controls.IncludeMy.Visibility = if ($Request.Kind -eq 'Workspaces') { 'Visible' } else { 'Collapsed' }
+    $choice = $Request.Kind -eq 'Choice'
+    $controls.Search.Visibility = if ($choice) { 'Collapsed' } else { 'Visible' }
+    $controls.ChoiceList.Visibility = if ($choice) { 'Visible' } else { 'Collapsed' }
+    $controls.CheckedList.Visibility = if ($choice) { 'Collapsed' } else { 'Visible' }
+    $controls.MultiActions.Visibility = if ($choice) { 'Collapsed' } else { 'Visible' }
+    $controls.Back.Content = if ($Request.BackLabel) { $Request.BackLabel } else { 'Cancel' }
+    $controls.Continue.IsEnabled = $true
+    if ($choice) {
+        $controls.ChoiceList.Items.Clear()
+        foreach ($item in @($Request.Items)) { [void]$controls.ChoiceList.Items.Add($item) }
+        $controls.ChoiceList.SelectedIndex = if ($Request.NoDefault) { -1 } else { 0 }
+    }
+    else { Update-SelectionFilter }
+    Update-SelectionSummary
+    $controls.SelectionDeadline.Text = ''
+    $controls.SelectionPanel.Visibility = 'Visible'
+    [Windows.Controls.Grid]::SetColumn($controls.LogPanel, 1)
+    [Windows.Controls.Grid]::SetColumnSpan($controls.LogPanel, 1)
+    $controls.Status.Text = 'Your selection is needed'
+    $controls.Detail.Text = $Request.Title
+    $controls.Progress.IsIndeterminate = $false
+    if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }
+    [void]$window.Activate()
+}
+
+function Submit-GuiSelection {
+    param([ValidateSet('OK', 'Cancel', 'Timeout')][string]$Action)
+    if ($null -eq $state.Request) { throw 'There is no active selection to submit.' }
+    $response = @{
+        Id = $state.Request.Id
+        Action = $Action
+        SelectedIds = @($state.Checked.Keys)
+        IncludeMyWorkspace = [bool]$controls.IncludeMy.IsChecked
+        Value = if ($state.Request.Kind -eq 'Choice') { $controls.ChoiceList.SelectedItem.Id } else { $null }
+    }
+    $temporaryPath = Join-Path $state.BridgePath 'response.tmp'
+    $response | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+    Move-Item -LiteralPath $temporaryPath -Destination (Join-Path $state.BridgePath 'response.json') -Force
+    $state.Request = $null
+    $controls.SelectionPanel.Visibility = 'Collapsed'
+    [Windows.Controls.Grid]::SetColumn($controls.LogPanel, 0)
+    [Windows.Controls.Grid]::SetColumnSpan($controls.LogPanel, 2)
+    $controls.Status.Text = 'Continuing analysis...'
+    $controls.Detail.Text = 'Loading the next step. Watch this window for further selections.'
+    $controls.Progress.IsIndeterminate = $true
+}
+
+$controls.Search.Add_TextChanged({ Update-SelectionFilter })
+$controls.ChoiceList.Add_SelectionChanged({ Update-SelectionSummary })
+$controls.SelectAll.Add_Click({
+    foreach ($check in $controls.CheckedList.Items) { $check.IsChecked = $true }
+})
+$controls.ClearAll.Add_Click({
+    foreach ($check in $controls.CheckedList.Items) { $check.IsChecked = $false }
+})
+$controls.Continue.Add_Click({
+    try { Submit-GuiSelection -Action OK }
+    catch { Show-LauncherError $_.Exception.Message }
+})
+$controls.Back.Add_Click({
+    try { Submit-GuiSelection -Action Cancel }
+    catch { Show-LauncherError $_.Exception.Message }
+})
+
+$controls.Browse.Add_Click({
+    $dialog = New-Object Windows.Forms.FolderBrowserDialog
+    try {
+        $dialog.Description = 'Choose the Impact IQ backup folder'
+        if ($dialog.ShowDialog() -eq [Windows.Forms.DialogResult]::OK) {
+            $controls.Folder.Text = $dialog.SelectedPath
+        }
+    }
+    finally { $dialog.Dispose() }
+})
+$controls.OpenFolder.Add_Click({
+    try {
+        $folder = Get-BackupFolder
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { throw 'The backup folder does not exist yet.' }
+        Start-Process -FilePath explorer.exe -ArgumentList ('"{0}"' -f $folder)
+    }
+    catch { Show-LauncherError $_.Exception.Message }
+})
+$controls.OpenModel.Add_Click({
+    try {
+        $model = Join-Path (Get-BackupFolder) 'Power BI Governance Model.pbit'
+        if (-not (Test-Path -LiteralPath $model -PathType Leaf)) { throw 'Run analysis first to copy the governance template into your backup folder.' }
+        Start-Process -FilePath $model
+    }
+    catch { Show-LauncherError $_.Exception.Message }
+})
+$controls.OpenLog.Add_Click({
+    try { Start-Process -FilePath notepad.exe -ArgumentList ('"{0}"' -f $state.LogPath) }
+    catch { Show-LauncherError $_.Exception.Message }
+})
+
+# Most environments produce notes and warnings, so a finished run replaces the log with the next step.
+function Show-GuiFinished {
+    param([bool]$HadIssues)
+    $controls.Log.Clear()
+    $controls.LogPanel.Visibility = 'Collapsed'
+    $controls.Setup.Visibility = 'Collapsed'
+    $controls.StatusPanel.Visibility = 'Collapsed'
+    $controls.DoneNote.Text = 'Some steps reported notes, which is normal for most environments. Details are in the full log.'
+    $controls.DoneNote.Visibility = if ($HadIssues) { 'Visible' } else { 'Collapsed' }
+    $controls.DonePanel.Visibility = 'Visible'
+}
+$controls.DoneOpenModel.Add_Click({
+    $controls.OpenModel.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
+})
+$controls.DoneOpenFolder.Add_Click({
+    $controls.OpenFolder.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
+})
+$controls.DoneRunAgain.Add_Click({
+    $controls.DonePanel.Visibility = 'Collapsed'
+    $controls.Setup.Visibility = 'Visible'
+    $controls.StatusPanel.Visibility = 'Visible'
+    $controls.LogPanel.Visibility = 'Visible'
+    $controls.Status.Text = 'Ready when you are.'
+    $controls.Detail.Text = 'Choose your backup location and start another analysis.'
+})
+$controls.Run.Add_Click({
+    try {
+        $state.Folder = Get-BackupFolder
+        $scriptPath = Join-Path $LauncherRoot 'Final PS Script.txt'
+        $workerPath = Join-Path $LauncherRoot 'Config\Run ImpactIQ GUI.txt'
+        foreach ($path in @($scriptPath, $workerPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required file is missing: $path" }
+        }
+        $logFolder = Join-Path $state.Folder 'Logs'
+        New-Item -Path $logFolder -ItemType Directory -Force | Out-Null
+        $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $state.LogPath = Join-Path $logFolder "ImpactIQ-$runId.log"
+        $state.ResultPath = Join-Path $logFolder "ImpactIQ-$runId.json"
+        $state.BridgePath = Join-Path $logFolder "ImpactIQ-$runId.selection"
+        New-Item -Path $state.BridgePath -ItemType Directory | Out-Null
+        $state.Request = $null
+        $state.LastRequestId = $null
+        $command = '& ([scriptblock]::Create([IO.File]::ReadAllText({0}))) -ScriptPath {1} -BaseFolderPath {2} -LogPath {3} -ResultPath {4} -BridgePath {5} -GuiProcessId {6}' -f
+            (ConvertTo-LauncherLiteral $workerPath), (ConvertTo-LauncherLiteral $scriptPath),
+            (ConvertTo-LauncherLiteral $state.Folder), (ConvertTo-LauncherLiteral $state.LogPath),
+            (ConvertTo-LauncherLiteral $state.ResultPath), (ConvertTo-LauncherLiteral $state.BridgePath), $PID
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+        $arguments = "-NoProfile -STA -OutputFormat Text -EncodedCommand $encodedCommand"
+        $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        # Shell-launched and hidden: the worker keeps an invisible console window, which Microsoft sign-in needs as its parent
+        # (a console-less process fails with "A window handle must be configured"), without opening a visible window.
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $powershellPath
+        $startInfo.Arguments = $arguments
+        $startInfo.UseShellExecute = $true
+        $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+        $state.Process = [Diagnostics.Process]::Start($startInfo)
+        $state.Issues = $false
+        $state.ErrorLogPath = Join-Path $state.Folder 'Config\Error Log.txt'
+        $state.ErrorLogOffset = if (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf) { (Get-Item -LiteralPath $state.ErrorLogPath).Length } else { 0 }
+        $controls.Log.Text = "Starting analysis. Everything is shown in this window.`r`n"
+        $controls.Status.Text = 'Preparing analysis...'
+        $controls.Detail.Text = 'Tool setup and checks run in the background. Selection steps will appear here.'
+        $controls.Progress.IsIndeterminate = $true
+        $controls.Run.IsEnabled = $false
+        $controls.Browse.IsEnabled = $false
+        $controls.Folder.IsEnabled = $false
+        $controls.OpenLog.IsEnabled = $false
+        $controls.Setup.Visibility = 'Collapsed'
+        $controls.Intro.Visibility = 'Collapsed'
+        $controls.Eyebrow.Visibility = 'Visible'
+        $controls.Header.Margin = '0,0,0,12'
+        $timer.Start()
+    }
+    catch { Show-LauncherError $_.Exception.Message }
+})
+$timer.Add_Tick({
+    try {
+        if ($null -eq $state.Reader -and (Test-Path -LiteralPath $state.LogPath -PathType Leaf)) {
+            $stream = [IO.File]::Open($state.LogPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $state.Reader = New-Object IO.StreamReader $stream
+            $controls.OpenLog.IsEnabled = $true
+        }
+        if ($null -ne $state.Reader) {
+            $text = $state.Reader.ReadToEnd()
+            if ($text) {
+                if ($text -match '(?i)\[ERROR\]|\[WARN(?:ING)?\]|WARNING:') { $state.Issues = $true }
+                $controls.Log.AppendText($text)
+                if ($controls.Log.Text.Length -gt 120000) {
+                    $controls.Log.Text = $controls.Log.Text.Substring($controls.Log.Text.Length - 100000)
+                }
+                $controls.Log.ScrollToEnd()
+                foreach ($step in [regex]::Matches($text, '\[STEP\] ([^\r\n]+)')) {
+                    if ($step.Groups[1].Value -like 'Sign in to Microsoft*') {
+                        Start-SignInWatch
+                        $controls.Detail.Text = "A Microsoft sign-in window will open and come to the front. If you don't see it, check the taskbar."
+                    }
+                    elseif ($step.Groups[1].Value -notlike 'Waiting for selection*') { $state.SignInWatch = $false }
+                }
+                if ($null -eq $state.Request) {
+                    $steps = [regex]::Matches($text, '\[STEP\] ([^\r\n]+)')
+                    if ($steps.Count -gt 0) {
+                        $controls.Status.Text = $steps[$steps.Count - 1].Groups[1].Value
+                    }
+                    elseif ($text -match '\[INFO\] Fetching (reports|models) for selection') {
+                        $controls.Status.Text = "Loading $($Matches[1]) for selection..."
+                    }
+                }
+            }
+        }
+        # Warnings and errors go only to the script's error log, which stays out of the live activity; it just sets the "notes" flag.
+        try {
+            if ($state.ErrorLogPath -and (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf)) {
+                $errorStream = [IO.File]::Open($state.ErrorLogPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                try {
+                    if ($errorStream.Length -lt $state.ErrorLogOffset) { $state.ErrorLogOffset = 0 }
+                    if ($errorStream.Length -gt $state.ErrorLogOffset) {
+                        [void]$errorStream.Seek($state.ErrorLogOffset, [IO.SeekOrigin]::Begin)
+                        $errorReader = New-Object IO.StreamReader($errorStream, [Text.Encoding]::UTF8)
+                        $errorText = $errorReader.ReadToEnd()
+                        $state.ErrorLogOffset = $errorStream.Position
+                        if ($errorText -match '\[(WARN|ERROR)\]') { $state.Issues = $true }
+                    }
+                }
+                finally { $errorStream.Dispose() }
+            }
+        }
+        catch [IO.IOException] { }
+        if ($state.SignInWatch -and -not $state.Process.HasExited) { Show-NewSignInWindows }
+        $requestPath = Join-Path $state.BridgePath 'request.json'
+        $responsePath = Join-Path $state.BridgePath 'response.json'
+        if (-not $state.Process.HasExited -and $null -eq $state.Request -and
+            -not (Test-Path -LiteralPath $responsePath) -and (Test-Path -LiteralPath $requestPath -PathType Leaf)) {
+            $request = Get-Content -LiteralPath $requestPath -Raw | ConvertFrom-Json
+            if ($request.Id -ne $state.LastRequestId) { Show-GuiSelection $request }
+        }
+        if ($null -ne $state.Request -and $state.Request.ExpiresUtc) {
+            $remaining = [Math]::Max(0, [Math]::Ceiling(([DateTime]::Parse($state.Request.ExpiresUtc).ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds))
+            $defaultDescription = if ($state.Request.Kind -eq 'Workspaces') { 'includes My Workspace and retains checks' }
+                elseif ($state.Request.Kind -eq 'Choice') { 'defaults to Public' } else { 'uses checked items' }
+            $controls.SelectionDeadline.Text = "Auto-continue in ${remaining}s ($defaultDescription)."
+            if ($remaining -eq 0) { Submit-GuiSelection -Action Timeout }
+        }
+        if ($state.Process.HasExited) {
+            $timer.Stop()
+            $state.SignInWatch = $false
+            if ($null -ne $state.Reader) {
+                $finalText = $state.Reader.ReadToEnd()
+                if ($finalText) { $controls.Log.AppendText($finalText); $controls.Log.ScrollToEnd() }
+                $state.Reader.Dispose(); $state.Reader = $null
+            }
+            $controls.Progress.IsIndeterminate = $false
+            $controls.Run.IsEnabled = $true
+            $controls.Browse.IsEnabled = $true
+            $controls.Folder.IsEnabled = $true
+            $controls.Setup.Visibility = 'Visible'
+            $controls.Intro.Visibility = 'Visible'
+            $controls.Eyebrow.Visibility = if ($logoLoaded) { 'Collapsed' } else { 'Visible' }
+            $controls.Header.Margin = '0,0,0,24'
+            $controls.SelectionPanel.Visibility = 'Collapsed'
+            $state.Request = $null
+            [Windows.Controls.Grid]::SetColumn($controls.LogPanel, 0)
+            [Windows.Controls.Grid]::SetColumnSpan($controls.LogPanel, 2)
+            if (Test-Path -LiteralPath $state.ResultPath -PathType Leaf) {
+                $result = Get-Content -LiteralPath $state.ResultPath -Raw | ConvertFrom-Json
+                if ($result.State -in @('Finished', 'FinishedWithIssues') -and $state.Process.ExitCode -eq 0) {
+                    Show-GuiFinished -HadIssues ($result.State -eq 'FinishedWithIssues' -or $state.Issues)
+                }
+                else {
+                    $controls.Status.Text = if ($result.State -eq 'Failed' -or $state.Process.ExitCode -ne 0) { 'Analysis failed' }
+                        elseif ($result.State -eq 'Cancelled') { 'Analysis cancelled' }
+                        else { 'Analysis stopped before completion' }
+                    $controls.Detail.Text = $result.Message
+                }
+            }
+            elseif ($state.Process.ExitCode -ne 0) {
+                $controls.Status.Text = 'Analysis failed'
+                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, the saved log, and 'Config\Error Log.txt' in your backup folder."
+            }
+            else {
+                $controls.Status.Text = 'Analysis stopped before completion'
+                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and log; no completion was confirmed.'
+            }
+            if ($state.BridgePath -and (Test-Path -LiteralPath $state.BridgePath -PathType Container)) {
+                Remove-Item -LiteralPath $state.BridgePath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            $state.Process.Dispose()
+            $state.Process = $null
+        }
+    }
+    catch {
+        $timer.Stop()
+        if ($null -ne $state.Reader) { $state.Reader.Dispose(); $state.Reader = $null }
+        Show-LauncherError ("Live monitoring failed. The analysis may still be running in the background; its log is in the Logs folder. " + $_.Exception.Message)
+    }
+})
+$window.Add_Closing({
+    param($sender, $eventArgs)
+    if ($null -ne $state.Process -and -not $state.Process.HasExited) {
+        $answer = [Windows.MessageBox]::Show($window,
+            'Analysis is still running. Stop it and close Impact IQ? Backups already written are kept.',
+            'Impact IQ', 'YesNo', 'Question', 'No')
+        if ($answer -ne 'Yes') { $eventArgs.Cancel = $true; return }
+        & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $state.Process.Id /T /F 2>&1 | Out-Null
+        [void]$state.Process.WaitForExit(5000)
+    }
+    $timer.Stop()
+    if ($null -ne $state.Reader) { $state.Reader.Dispose() }
+    if ($null -ne $state.Process) { $state.Process.Dispose() }
+})
+[void]$window.ShowDialog()

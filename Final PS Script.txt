@@ -1,6 +1,7 @@
 # Define the base folder and script paths at the beginning of the script
 
-$global:BaseFolderPath = "C:\Power BI Backups"
+# The Impact IQ GUI sets ImpactIQBaseFolderPath and ImpactIQSelectionHandler; standalone runs use the defaults.
+$global:BaseFolderPath = if ($global:ImpactIQBaseFolderPath) { $global:ImpactIQBaseFolderPath } else { "C:\Power BI Backups" }
 $global:ConfigFolder   = Join-Path $global:BaseFolderPath "Config"
 
 $baseFolderPath = $global:BaseFolderPath
@@ -424,6 +425,7 @@ if (-not (Test-Path $configFolder)) {
 $ErrorActionPreference = 'SilentlyContinue'
 $WarningPreference = 'Continue'
 
+Write-Host "[STEP] Preparing PowerShell modules and tools..."
 Write-Host "[INFO] Getting things ready - checking required modules before environment selection and sign-in..." -ForegroundColor Cyan
 try {
     Initialize-ImpactIQExecutionPolicy -ErrorAction Stop
@@ -456,6 +458,7 @@ foreach ($tool in $bundledTools) {
 # If it can't (exe blocked/quarantined, missing .NET runtime, etc.), Model Detail and Report
 # Detail outputs would be silently blank — surface a clear error here instead.
 $tabularEditorWorks = $false
+Write-Host "[STEP] Checking Tabular Editor before extraction..."
 try {
     $blankModelPath = Join-Path $configFolder "Blank Model.bim"
     if ((Test-Path $TabularEditor2Path) -and (Test-Path $blankModelPath)) {
@@ -534,6 +537,19 @@ function Show-EnvironmentSelectionDialog {
     param(
         [int]$TimeoutSeconds = 60
     )
+
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Choice'; Title = 'Choose your cloud environment'
+            Description = 'Select your Power BI cloud. Timeout or Cancel keeps the existing Public-cloud default.'
+            Items = @('Public (Commercial)', 'Germany', 'USGov', 'China', 'USGovHigh', 'USGovMil') |
+                ForEach-Object { @{ Id = $_; Display = $_ } }
+            TimeoutSeconds = $TimeoutSeconds
+        }
+        if ($response.Action -eq 'Cancel') { return 'Cancelled' }
+        if ($response.Action -eq 'Timeout') { return 'Timeout' }
+        return $response.Value
+    }
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -771,6 +787,20 @@ function Show-ImpactIQTenantSelectionDialog {
     param(
         [Parameter(Mandatory)][object[]]$Tenants
     )
+
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Choice'; Title = 'Choose your Fabric organization'
+            Description = 'Sign-in did not identify a tenant. Select the organization to use.'
+            Items = @($Tenants | ForEach-Object {
+                $name = if ([string]::IsNullOrWhiteSpace([string]$_.Name)) { 'Organization' } else { $_.Name }
+                @{ Id = [string]$_.Id; Display = ('{0} ({1}) [{2}]' -f $name, ($_.Domains -join ', '), $_.Id) }
+            })
+            TimeoutSeconds = 0; NoDefault = $true; BackLabel = 'Cancel'
+        }
+        if ($response.Action -ne 'OK') { throw 'Organization selection was cancelled.' }
+        return [string]$response.Value
+    }
 
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
@@ -1012,11 +1042,27 @@ function Invoke-ImpactIQRestMethod {
     finally { $headers = $null }
 }
 
+# An error raised inside a nested loop is handled by the section trap, which ends every enclosing loop, so one
+# inaccessible workspace, model or report (403/404/400) would silently skip all remaining ones. Log it and move on.
+function Get-ImpactIQMetadata {
+    param(
+        [Parameter(Mandatory)][uri]$Url,
+        [string]$Context = 'Metadata request'
+    )
+
+    try { return (Invoke-ImpactIQRestMethod -Method GET -Url $Url | ConvertFrom-Json) }
+    catch {
+        Write-ImpactIQContinuingError -Record $_ -Context $Context
+        return $null
+    }
+}
+
 # Track script start time
 $script:ImpactIQAuthenticationReady = $false
 . Invoke-ImpactIQLoggedRun -LogPath (Join-Path $global:ConfigFolder 'Error Log.txt') -KeepOpen -Action {
 $scriptStartTime = Get-Date
 
+Write-Host "[STEP] Sign in to Microsoft - complete any Microsoft sign-in window that opens."
 Connect-ImpactIQ -ErrorAction Stop
 $null = Get-FabricAccessToken
 Connect-PowerBI -ErrorAction Stop
@@ -1118,6 +1164,26 @@ function Show-WorkspacePicker {
         [array]$Workspaces, # array of PSCustomObjects with id + name
         [switch]$RequireSelection
     )
+
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Workspaces'; Title = 'Choose workspaces'
+            Description = $(if ($RequireSelection) { 'Search and check at least one workspace. ' } else { "Search and check workspaces. No checks means all workspaces unless 'My Workspace' is included. " }) +
+                'Select All and Clear All affect the visible results.'
+            Items = @($Workspaces | ForEach-Object { @{ Id = $_.id; Display = '{0} ({1})' -f $_.name, $_.id } })
+            TimeoutSeconds = 600; BackLabel = 'Back'
+        }
+        if ($response.Action -eq 'Cancel') { throw "User cancelled workspace selection." }
+        $selectedIds = @($response.SelectedIds)
+        $timedOut = $response.Action -eq 'Timeout'
+        $includeMy = if ($timedOut) { $true } else { [bool]$response.IncludeMyWorkspace }
+        if ($selectedIds.Count -eq 0 -and -not $includeMy -and -not $RequireSelection) { $selectedIds = $Workspaces.id }
+        return [pscustomobject]@{
+            SelectedWorkspaceIds = $selectedIds
+            IncludeMyWorkspace   = $includeMy
+            TimedOut             = $timedOut
+        }
+    }
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -1310,6 +1376,22 @@ function Show-WorkspacePicker {
 # Show Run Mode Selection Dialog
 # ================================
 function Show-RunModeDialog {
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Choice'; Title = 'Choose how to run your analysis'
+            Description = 'Analyse workspaces, or specific reports, models, data agents or Fabric apps. Cancel stops the run.'
+            Items = @(
+                @{ Id = 'Workspaces'; Display = 'Run against Workspaces' },
+                @{ Id = 'Reports'; Display = 'Run against specific Reports' },
+                @{ Id = 'Models'; Display = 'Run against specific Models' },
+                @{ Id = 'Agents'; Display = 'Run against specific Data Agents' },
+                @{ Id = 'FabricApps'; Display = 'Run against specific Fabric Apps' }
+            )
+            TimeoutSeconds = 0; BackLabel = 'Cancel'; CancelEndsRun = $true
+        }
+        if ($response.Action -eq 'Cancel') { return 'Cancel' }
+        return $response.Value
+    }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
@@ -1400,6 +1482,19 @@ function Show-RunModeDialog {
 # Show Report Scope Selection Dialog
 # ================================
 function Show-ReportScopeDialog {
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Choice'; Title = 'Choose report selection scope'
+            Description = 'Choose which workspaces to search for reports. Back returns to run mode.'
+            Items = @(
+                @{ Id = 'All'; Display = 'Reports from ALL workspaces' },
+                @{ Id = 'Specific'; Display = 'Reports from specific workspace(s)' }
+            )
+            TimeoutSeconds = 0; BackLabel = 'Back'
+        }
+        if ($response.Action -eq 'Cancel') { return 'Cancel' }
+        return $response.Value
+    }
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
@@ -1464,6 +1559,19 @@ function Show-ReportPicker {
         [Parameter(Mandatory)]
         [array]$Reports
     )
+
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Reports'; Title = 'Choose reports'
+            Description = 'Connected models are included automatically. Checks persist across searches; Select All and Clear All affect visible results. Back returns to report scope.'
+            Items = @($Reports | ForEach-Object {
+                @{ Id = $_.ReportId; Display = '{0} - {1} ({2})' -f $_.WorkspaceName, $_.ReportName, $_.ReportId }
+            })
+            TimeoutSeconds = 120; BackLabel = 'Back'
+        }
+        if ($response.Action -eq 'Cancel') { return $null }
+        return @($Reports | Where-Object { $response.SelectedIds -contains $_.ReportId })
+    }
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -1638,6 +1746,20 @@ function Show-ModelScopeDialog {
         [string]$ItemLabel = "Models"
     )
 
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Choice'; Title = "Choose $($ItemLabel.ToLowerInvariant()) selection scope"
+            Description = "Choose which workspaces to search for $($ItemLabel.ToLowerInvariant()). Back returns to run mode."
+            Items = @(
+                @{ Id = 'All'; Display = "$ItemLabel from ALL workspaces" },
+                @{ Id = 'Specific'; Display = "$ItemLabel from specific workspace(s)" }
+            )
+            TimeoutSeconds = 0; BackLabel = 'Back'
+        }
+        if ($response.Action -eq 'Cancel') { return 'Cancel' }
+        return $response.Value
+    }
+
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
@@ -1704,6 +1826,19 @@ function Show-ModelPicker {
         [string]$Title = "Select Models",
         [string]$Prompt = "Select the models to run against (reports using these models will be included automatically):"
     )
+
+    if ($global:ImpactIQSelectionHandler) {
+        $response = & $global:ImpactIQSelectionHandler @{
+            Kind = 'Models'; Title = $Title
+            Description = "$Prompt Checks persist across searches; Select All and Clear All affect visible results. Back returns to the previous step."
+            Items = @($Models | ForEach-Object {
+                @{ Id = $_.DatasetId; Display = '{0} - {1} ({2})' -f $_.WorkspaceName, $_.DatasetName, $_.DatasetId }
+            })
+            TimeoutSeconds = 120; BackLabel = 'Back'
+        }
+        if ($response.Action -eq 'Cancel') { return $null }
+        return @($Models | Where-Object { $response.SelectedIds -contains $_.DatasetId })
+    }
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -4078,6 +4213,7 @@ trap {
 }
 
 $workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
+Write-Host "[STEP] Loading your workspaces..."
 $workspacesResponse = Invoke-ImpactIQRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
 $workspacesInfo = @()
 $IncludeMyWorkspace = $false
@@ -4610,6 +4746,7 @@ if ($runMode -eq 'FabricApps') {
 }
 } # end while (reportPickerCancelled)
 
+Write-Host "[STEP] Extracting Power BI and Fabric details - this can take a while..."
 Write-Output "Power BI Environment Detail Extract Process Started"
 
 # Initialize collections for all necessary information
@@ -4722,7 +4859,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
         # Fetch dataset sources
         $datasourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.id)/datasources"
-        $datasources = Invoke-ImpactIQRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
+        $datasources = Get-ImpactIQMetadata -Url $datasourcesUrl -Context "Workspace '$($workspace.WorkspaceName)' model '$($dataset.name)' data sources"
 
         foreach ($datasource in $datasources.value) {
             $renamedDatasource = Rename-Properties -object $datasource -renameMap $datasetDatasourceRenameMap
@@ -4741,7 +4878,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
     $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports"
     $reports = $null
     if ($global:RunMode -notin @('Agents', 'FabricApps')) {
-        $reports = Invoke-ImpactIQRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+        $reports = Get-ImpactIQMetadata -Url $reportsUrl -Context "Workspace '$($workspace.WorkspaceName)' reports"
     }
 
 	# Create a hash set to store Report IDs
@@ -4765,7 +4902,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata ex
 
         # Fetch report pages
         $pagesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports/$($report.id)/pages"
-        $pages = Invoke-ImpactIQRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
+        $pages = Get-ImpactIQMetadata -Url $pagesUrl -Context "Workspace '$($workspace.WorkspaceName)' report '$($report.name)' pages"
         foreach ($page in $pages.value) {
             $renamedPage = Rename-Properties -object $page -renameMap $pageRenameMap
             $renamedPage | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
@@ -4827,7 +4964,7 @@ foreach ($app in $apps.value) {
 
         # Fetch reports within each app
         $appReportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps/$($app.id)/reports"
-        $appReports = Invoke-ImpactIQRestMethod -Method GET -Url $appReportsUrl | ConvertFrom-Json
+        $appReports = Get-ImpactIQMetadata -Url $appReportsUrl -Context "App '$($app.name)' reports"
 
         foreach ($report in $appReports.value) {
             $renamedAppReport = Rename-Properties -object $report -renameMap $appReportRenameMap
@@ -4849,7 +4986,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh History extr
 
     foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
         $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.DatasetId)/refreshes"
-        $refreshHistoryResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+                $refreshHistoryResponse = Get-ImpactIQMetadata -Url $refreshHistoryUrl -Context "Workspace '$($workspace.WorkspaceName)' model '$($dataset.DatasetName)' refresh history"
 
         foreach ($refresh in $refreshHistoryResponse.value) {
             $renamedRefreshRecord = Rename-Properties -object $refresh -renameMap $datasetRefreshRenameMap
@@ -4913,7 +5050,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 
     # Fetch Gen 1 and Gen 2 dataflows using Power BI API
     $dataflowsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows"
-    $dataflowsResponse = Invoke-ImpactIQRestMethod -Method GET -Url $dataflowsUrl | ConvertFrom-Json
+    $dataflowsResponse = Get-ImpactIQMetadata -Url $dataflowsUrl -Context "Workspace '$($workspace.WorkspaceName)' dataflows"
 
     # Ensure response is not null before looping
     if ($dataflowsResponse.value) {
@@ -4931,7 +5068,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 
             # Fetch Dataflow Datasources
             $dataflowSourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows/$($dataflow.objectId)/datasources"
-            $dataflowSourcesResponse = Invoke-ImpactIQRestMethod -Method GET -Url $dataflowSourcesUrl | ConvertFrom-Json
+            $dataflowSourcesResponse = Get-ImpactIQMetadata -Url $dataflowSourcesUrl -Context "Workspace '$($workspace.WorkspaceName)' dataflow '$($dataflow.name)' data sources"
 
             # Ensure response is not null before looping
             if ($dataflowSourcesResponse.value) {
@@ -5001,7 +5138,7 @@ Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extracti
 foreach ($workspace in $workspacesInfo) {
 
         $dataflowLineageUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/upstreamDataflows"
-        $dataflowLineageResponse = Invoke-ImpactIQRestMethod -Method GET -Url $dataflowLineageUrl | ConvertFrom-Json
+        $dataflowLineageResponse = Get-ImpactIQMetadata -Url $dataflowLineageUrl -Context "Workspace '$($workspace.WorkspaceName)' dataflow lineage"
 
         # Ensure response is not null before looping
         if ($dataflowLineageResponse.value) {
@@ -5035,7 +5172,7 @@ foreach ($workspace in $workspacesInfo) {
 Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow Refresh History extraction process started."
     foreach ($dataflow in $dataflowsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
         $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows/$($dataflow.DataflowId)/transactions"
-        $refreshHistoryResponse = Invoke-ImpactIQRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+                $refreshHistoryResponse = Get-ImpactIQMetadata -Url $refreshHistoryUrl -Context "Workspace '$($workspace.WorkspaceName)' dataflow '$($dataflow.DataflowName)' refresh history"
 
         # Ensure response is not null before looping
         if ($refreshHistoryResponse.value) {

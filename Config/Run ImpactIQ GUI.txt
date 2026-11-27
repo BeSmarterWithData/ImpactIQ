@@ -1,0 +1,185 @@
+param(
+    [Parameter(Mandatory)][string]$ScriptPath,
+    [Parameter(Mandatory)][string]$BaseFolderPath,
+    [Parameter(Mandatory)][string]$LogPath,
+    [Parameter(Mandatory)][string]$ResultPath,
+    [string]$BridgePath,
+    [int]$GuiProcessId
+)
+
+$ErrorActionPreference = 'Stop'
+$logWriter = $null
+$exitCode = 0
+
+# The log mirrors what a plain console shows. A transcript would also record the warnings and errors the script
+# routes to its error log only (and every line twice), so the run's streams are captured instead.
+function Write-GuiLog {
+    param([string]$Text, [switch]$NoNewLine)
+    if ($null -eq $logWriter) { return }
+    if ($NoNewLine) { $logWriter.Write($Text) } else { $logWriter.WriteLine($Text) }
+}
+
+function Write-GuiLogRecord {
+    param($Record)
+    if ($Record -is [Management.Automation.InformationRecord]) {
+        $data = $Record.MessageData
+        if ($data -is [Management.Automation.HostInformationMessage]) { Write-GuiLog -Text $data.Message -NoNewLine:$data.NoNewLine }
+        else { Write-GuiLog -Text ([string]$data) }
+    }
+    elseif ($Record -is [Management.Automation.WarningRecord]) { Write-GuiLog "WARNING: $($Record.Message)" }
+    elseif ($Record -is [Management.Automation.ErrorRecord]) { Write-GuiLog "[ERROR] $($Record.Exception.Message)" }
+    elseif ($Record -is [Management.Automation.VerboseRecord] -or $Record -is [Management.Automation.DebugRecord]) { }
+    elseif ($Record -is [string]) { Write-GuiLog $Record }
+    else {
+        $text = ($Record | Out-String).TrimEnd()
+        if ($text) { Write-GuiLog $text }
+    }
+}
+
+function Write-GuiResult {
+    param([string]$State, [string]$Message)
+    @{ State = $State; Message = $Message } |
+        ConvertTo-Json | Set-Content -LiteralPath $ResultPath -Encoding UTF8
+}
+
+function Remove-GuiBridge {
+    if ($BridgePath -and (Test-Path -LiteralPath $BridgePath -PathType Container)) {
+        foreach ($name in @('request.json', 'response.json', 'request.tmp', 'response.tmp')) {
+            $path = Join-Path $BridgePath $name
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+        Remove-Item -LiteralPath $BridgePath -ErrorAction SilentlyContinue
+    }
+}
+
+# The main script swallows exceptions and uses exit, so cancellation must end the process explicitly.
+function Stop-GuiWorker {
+    param([string]$State, [string]$Message, [int]$Code = 0)
+    Write-GuiLog "[INFO] $Message"
+    Write-GuiResult -State $State -Message $Message
+    Remove-GuiBridge
+    if ($null -ne $logWriter) { $logWriter.Dispose() }
+    [Environment]::Exit($Code)
+}
+
+function Invoke-GuiSelection {
+    param([hashtable]$Request)
+    $ErrorActionPreference = 'Stop'
+    $Request.Id = [guid]::NewGuid().ToString('N')
+    $Request.ExpiresUtc = if ($Request.TimeoutSeconds -gt 0) {
+        [DateTime]::UtcNow.AddSeconds($Request.TimeoutSeconds).ToString('o')
+    } else { $null }
+    $requestPath = Join-Path $BridgePath 'request.json'
+    $responsePath = Join-Path $BridgePath 'response.json'
+    $temporaryPath = Join-Path $BridgePath 'request.tmp'
+    $Request | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+    Move-Item -LiteralPath $temporaryPath -Destination $requestPath -Force
+    Write-GuiLog "[STEP] Waiting for selection: $($Request.Title)"
+    try {
+        while (-not (Test-Path -LiteralPath $responsePath -PathType Leaf)) {
+            $guiRunning = $true
+            try { $owner = [Diagnostics.Process]::GetProcessById($GuiProcessId) }
+            catch [ArgumentException] { $guiRunning = $false }
+            if ($guiRunning) {
+                try { $guiRunning = -not $owner.HasExited }
+                finally { $owner.Dispose() }
+            }
+            if (-not $guiRunning) {
+                Stop-GuiWorker -State Cancelled -Message 'The GUI closed before selections were complete.'
+            }
+            if ($Request.ExpiresUtc -and [DateTime]::UtcNow -gt ([DateTime]::Parse($Request.ExpiresUtc).ToUniversalTime().AddSeconds(5))) {
+                Write-GuiLog '[INFO] The GUI did not answer before the selection deadline. Applying the existing timeout defaults.'
+                return [pscustomobject]@{ Action = 'Timeout'; SelectedIds = @(); IncludeMyWorkspace = $false }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        $response = Get-Content -LiteralPath $responsePath -Raw | ConvertFrom-Json
+        if ($response.Id -ne $Request.Id -or $response.Action -notin @('OK', 'Cancel', 'Timeout')) {
+            throw 'The GUI returned an invalid selection response.'
+        }
+        $validIds = @($Request.Items | ForEach-Object { $_.Id })
+        if ($response.Action -eq 'OK' -and $Request.Kind -eq 'Choice' -and $response.Value -notin $validIds) {
+            throw 'The GUI returned an unknown choice.'
+        }
+        foreach ($selectedId in @($response.SelectedIds)) {
+            if ($selectedId -notin $validIds) { throw 'The GUI returned an unknown selected item.' }
+        }
+        Write-GuiLog "[INFO] Selection complete: $($Request.Title) ($($response.Action))"
+        if ($response.Action -eq 'Cancel' -and $Request.CancelEndsRun) {
+            Stop-GuiWorker -State Cancelled -Message 'Run cancelled by user.'
+        }
+        return $response
+    }
+    finally {
+        foreach ($path in @($requestPath, $responsePath)) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+        }
+    }
+}
+
+try {
+    $logWriter = New-Object IO.StreamWriter($LogPath, $false, (New-Object Text.UTF8Encoding $false))
+    $logWriter.AutoFlush = $true
+    $sourceFolder = Split-Path -Parent $ScriptPath
+    $sourceConfig = Join-Path $sourceFolder 'Config'
+    $destinationConfig = Join-Path $BaseFolderPath 'Config'
+    New-Item -Path $destinationConfig -ItemType Directory -Force | Out-Null
+    Write-GuiLog '[STEP] Preparing local configuration and governance template...'
+    $assets = @(
+        'Blank Model.bim',
+        'Report Detail Extract Script-PBIR.csx',
+        'Report Detail Extract Script.csx',
+        'Model Detail Extract Script.csx',
+        'Measure Dependency Extract Script.csx',
+        'Fabric App Extract Script.csx',
+        'tool-manifest.json'
+    )
+    foreach ($asset in $assets) {
+        $source = Join-Path $sourceConfig $asset
+        $destination = Join-Path $destinationConfig $asset
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Required configuration file is missing: $source"
+        }
+        if ([IO.Path]::GetFullPath($source) -ne [IO.Path]::GetFullPath($destination)) {
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+    }
+    $templateName = 'Power BI Governance Model.pbit'
+    $templateSource = Join-Path $sourceFolder $templateName
+    $templateDestination = Join-Path $BaseFolderPath $templateName
+    if (-not (Test-Path -LiteralPath $templateSource -PathType Leaf)) {
+        throw "The governance template is missing: $templateSource"
+    }
+    if ([IO.Path]::GetFullPath($templateSource) -ne [IO.Path]::GetFullPath($templateDestination)) {
+        Copy-Item -LiteralPath $templateSource -Destination $templateDestination -Force
+    }
+    # The main script reads these globals, so it still pastes and runs standalone.
+    $global:ImpactIQBaseFolderPath = $BaseFolderPath
+    if ($BridgePath) {
+        if ($GuiProcessId -le 0 -or -not (Test-Path -LiteralPath $BridgePath -PathType Container)) {
+            throw 'The GUI selection session is missing or invalid.'
+        }
+        $global:ImpactIQSelectionHandler = ${function:Invoke-GuiSelection}
+    }
+    Write-GuiLog '[INFO] Starting Impact IQ. Watch the GUI for selection steps and authentication instructions.'
+    $ErrorActionPreference = 'Continue'
+    & ([scriptblock]::Create((Get-Content -LiteralPath $ScriptPath -Raw))) *>&1 | ForEach-Object { Write-GuiLogRecord $_ }
+    $ErrorActionPreference = 'Stop'
+    if ($script:ImpactIQRunFailed) {
+        Write-GuiResult -State FinishedWithIssues -Message "Finished, but some steps reported problems. Review 'Config\Error Log.txt' in your backup folder."
+    }
+    else {
+        Write-GuiResult -State Finished -Message 'Workflow returned. Review the log and outputs for errors or missing results.'
+    }
+}
+catch {
+    $ErrorActionPreference = 'Stop'
+    $exitCode = 1
+    Write-GuiLog "[ERROR] $($_.Exception.Message)"
+    Write-GuiResult -State Failed -Message $_.Exception.Message
+}
+finally {
+    Remove-GuiBridge
+    if ($null -ne $logWriter) { $logWriter.Dispose() }
+}
+exit $exitCode

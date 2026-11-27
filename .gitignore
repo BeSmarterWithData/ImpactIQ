@@ -11,3 +11,7 @@ Model Backups/
 # Local diagnostics
 Config/errorlog.txt
 Config/Error Log.txt
+
+# Local test scripts and sample output
+Tests/
+Output/

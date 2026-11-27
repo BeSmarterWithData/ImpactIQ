@@ -5,13 +5,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if ([string]::IsNullOrWhiteSpace($LauncherRoot)) {
-    throw 'Use ImpactIQ GUI.bat to open the text-based GUI launcher.'
+    throw 'Start the Impact IQ GUI through ImpactIQ.bat, which opens it automatically.'
 }
 if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
     throw 'This GUI requires FullLanguage PowerShell. Ask IT for an approved deployment; the launcher does not bypass policy.'
 }
 if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') {
-    throw 'Start this GUI using the supplied batch launcher or powershell.exe -STA.'
+    throw 'Start this GUI in a single-threaded PowerShell: powershell.exe -STA.'
 }
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName System.Windows.Forms

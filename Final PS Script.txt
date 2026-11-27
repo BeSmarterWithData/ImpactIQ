@@ -7,16 +7,19 @@ $global:ConfigFolder   = Join-Path $global:BaseFolderPath "Config"
 $baseFolderPath = $global:BaseFolderPath
 $configFolder   = $global:ConfigFolder
 
-# The original one-click ImpactIQ.bat runs this file inline. When the Impact IQ GUI was installed with it, open the GUI and wait
-# for it to close instead of running the console flow. The GUI runs this same file as its worker (it sets the selection handler),
-# so this block is skipped there; set IMPACTIQ_NO_GUI=1 to force the console flow. If the GUI cannot start, the console flow runs.
+# The original one-click ImpactIQ.bat runs this file inline. When the Impact IQ GUI was installed with it, open the GUI instead of
+# running the console flow. The GUI runs this same file as its worker (it sets the selection handler), so this block is skipped
+# there; set IMPACTIQ_NO_GUI=1 to force the console flow. If the GUI cannot start, the console flow runs.
+# Once the GUI window is up, the batch file that started this script is closed (its console disappears and it no longer opens the
+# governance template, which the GUI offers itself). When this script was not started by a batch file, it waits for the GUI instead.
 $impactIQGuiPath = Join-Path $global:BaseFolderPath 'ImpactIQ GUI.txt'
 if (-not $global:ImpactIQSelectionHandler -and $env:IMPACTIQ_NO_GUI -ne '1' -and
     (Test-Path -LiteralPath $impactIQGuiPath -PathType Leaf) -and
     (Test-Path -LiteralPath (Join-Path $global:ConfigFolder 'Run ImpactIQ GUI.txt') -PathType Leaf)) {
     $impactIQGuiStarted = $false
+    $impactIQReadyFile = Join-Path ([IO.Path]::GetTempPath()) ('ImpactIQ-gui-ready-' + [guid]::NewGuid().ToString('N'))
     try {
-        Write-Host '[INFO] Opening the Impact IQ window. Close it to finish.'
+        Write-Host '[INFO] Opening the Impact IQ window...'
         $impactIQGuiCommand = 'try { & ([scriptblock]::Create([IO.File]::ReadAllText(''' + $impactIQGuiPath.Replace("'", "''") + '''))) -LauncherRoot ''' +
             $global:BaseFolderPath.Replace("'", "''") + ''' } catch { Add-Type -AssemblyName PresentationFramework; ' +
             '[void][System.Windows.MessageBox]::Show($_.Exception.Message, ''Impact IQ could not open'', ''OK'', ''Error''); exit 1 }'
@@ -25,11 +28,27 @@ if (-not $global:ImpactIQSelectionHandler -and $env:IMPACTIQ_NO_GUI -ne '1' -and
         $impactIQGuiStart.Arguments = '-NoProfile -STA -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($impactIQGuiCommand))
         $impactIQGuiStart.UseShellExecute = $false
         $impactIQGuiStart.CreateNoWindow = $true
+        $impactIQGuiStart.EnvironmentVariables['IMPACTIQ_GUI_READY_FILE'] = $impactIQReadyFile
         $impactIQGuiProcess = [Diagnostics.Process]::Start($impactIQGuiStart)
-        $impactIQGuiProcess.WaitForExit()
-        $impactIQGuiStarted = ($impactIQGuiProcess.ExitCode -eq 0)
+        while (-not $impactIQGuiProcess.HasExited -and -not (Test-Path -LiteralPath $impactIQReadyFile)) { Start-Sleep -Milliseconds 200 }
+        if (Test-Path -LiteralPath $impactIQReadyFile) {
+            $impactIQGuiStarted = $true
+            $impactIQBatchProcessId = $null
+            try {
+                $impactIQSelf = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
+                $impactIQParent = Get-CimInstance Win32_Process -Filter "ProcessId=$($impactIQSelf.ParentProcessId)"
+                if ($impactIQParent.Name -ieq 'cmd.exe' -and $impactIQParent.CommandLine -match '(?i)\\ImpactIQ[^\\"]*\.(bat|cmd)') {
+                    $impactIQBatchProcessId = $impactIQParent.ProcessId
+                }
+            }
+            catch { $impactIQBatchProcessId = $null }
+            if ($impactIQBatchProcessId) { Stop-Process -Id $impactIQBatchProcessId -Force }
+            else { $impactIQGuiProcess.WaitForExit() }
+        }
+        else { $impactIQGuiStarted = ($impactIQGuiProcess.ExitCode -eq 0) }
     }
     catch { Write-Host "[WARN] The Impact IQ window could not be started: $($_.Exception.Message)" }
+    finally { Remove-Item -LiteralPath $impactIQReadyFile -Force -ErrorAction SilentlyContinue }
     if ($impactIQGuiStarted) { return }
     Write-Host '[WARN] Continuing with the console version.'
 }

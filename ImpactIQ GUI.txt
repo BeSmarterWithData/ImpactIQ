@@ -659,4 +659,10 @@ $window.Add_Closing({
     if ($null -ne $state.Reader) { $state.Reader.Dispose() }
     if ($null -ne $state.Process) { $state.Process.Dispose() }
 })
+# When the one-click script starts this window, it waits for this signal before closing its own console.
+if ($env:IMPACTIQ_GUI_READY_FILE) {
+    $window.Add_ContentRendered({
+        try { Set-Content -LiteralPath $env:IMPACTIQ_GUI_READY_FILE -Value 'ready' -Encoding Ascii } catch { }
+    })
+}
 [void]$window.ShowDialog()

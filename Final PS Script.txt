@@ -11,7 +11,8 @@ $configFolder   = $global:ConfigFolder
 # running the console flow. The GUI runs this same file as its worker (it sets the selection handler), so this block is skipped
 # there; set IMPACTIQ_NO_GUI=1 to force the console flow. If the GUI cannot start, the console flow runs.
 # Once the GUI window is up, the batch file that started this script is closed (its console disappears and it no longer opens the
-# governance template, which the GUI offers itself). When this script was not started by a batch file, it waits for the GUI instead.
+# governance template, which the GUI offers itself). A plain PowerShell console (for example, the script pasted into it) is closed
+# too. Other hosts, such as the PowerShell ISE, wait for the GUI instead.
 $impactIQGuiPath = Join-Path $global:BaseFolderPath 'ImpactIQ GUI.txt'
 if (-not $global:ImpactIQSelectionHandler -and $env:IMPACTIQ_NO_GUI -ne '1' -and
     (Test-Path -LiteralPath $impactIQGuiPath -PathType Leaf) -and
@@ -43,6 +44,7 @@ if (-not $global:ImpactIQSelectionHandler -and $env:IMPACTIQ_NO_GUI -ne '1' -and
             }
             catch { $impactIQBatchProcessId = $null }
             if ($impactIQBatchProcessId) { Stop-Process -Id $impactIQBatchProcessId -Force }
+            elseif ($Host.Name -eq 'ConsoleHost') { exit }
             else { $impactIQGuiProcess.WaitForExit() }
         }
         else { $impactIQGuiStarted = ($impactIQGuiProcess.ExitCode -eq 0) }

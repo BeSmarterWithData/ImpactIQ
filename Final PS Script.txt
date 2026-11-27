@@ -7,6 +7,33 @@ $global:ConfigFolder   = Join-Path $global:BaseFolderPath "Config"
 $baseFolderPath = $global:BaseFolderPath
 $configFolder   = $global:ConfigFolder
 
+# The original one-click ImpactIQ.bat runs this file inline. When the Impact IQ GUI was installed with it, open the GUI and wait
+# for it to close instead of running the console flow. The GUI runs this same file as its worker (it sets the selection handler),
+# so this block is skipped there; set IMPACTIQ_NO_GUI=1 to force the console flow. If the GUI cannot start, the console flow runs.
+$impactIQGuiPath = Join-Path $global:BaseFolderPath 'ImpactIQ GUI.txt'
+if (-not $global:ImpactIQSelectionHandler -and $env:IMPACTIQ_NO_GUI -ne '1' -and
+    (Test-Path -LiteralPath $impactIQGuiPath -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $global:ConfigFolder 'Run ImpactIQ GUI.txt') -PathType Leaf)) {
+    $impactIQGuiStarted = $false
+    try {
+        Write-Host '[INFO] Opening the Impact IQ window. Close it to finish.'
+        $impactIQGuiCommand = 'try { & ([scriptblock]::Create([IO.File]::ReadAllText(''' + $impactIQGuiPath.Replace("'", "''") + '''))) -LauncherRoot ''' +
+            $global:BaseFolderPath.Replace("'", "''") + ''' } catch { Add-Type -AssemblyName PresentationFramework; ' +
+            '[void][System.Windows.MessageBox]::Show($_.Exception.Message, ''Impact IQ could not open'', ''OK'', ''Error''); exit 1 }'
+        $impactIQGuiStart = New-Object Diagnostics.ProcessStartInfo
+        $impactIQGuiStart.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $impactIQGuiStart.Arguments = '-NoProfile -STA -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($impactIQGuiCommand))
+        $impactIQGuiStart.UseShellExecute = $false
+        $impactIQGuiStart.CreateNoWindow = $true
+        $impactIQGuiProcess = [Diagnostics.Process]::Start($impactIQGuiStart)
+        $impactIQGuiProcess.WaitForExit()
+        $impactIQGuiStarted = ($impactIQGuiProcess.ExitCode -eq 0)
+    }
+    catch { Write-Host "[WARN] The Impact IQ window could not be started: $($_.Exception.Message)" }
+    if ($impactIQGuiStarted) { return }
+    Write-Host '[WARN] Continuing with the console version.'
+}
+
 $Script1Path = Join-Path $configFolder "Report Detail Extract Script-PBIR.csx"
 $Script2Path = Join-Path $configFolder "Report Detail Extract Script.csx"
 $Script3Path = Join-Path $configFolder "Model Detail Extract Script.csx"

@@ -5645,6 +5645,36 @@ function Export-EmptyDetailWorkbook {
     Write-Output "Empty detail workbook saved to $Path"
 }
 
+function Add-EmptyDetailWorksheets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Worksheets
+    )
+
+    # Adds header-only sheets for any that have no data, keeping the declared sheet order.
+    $ErrorActionPreference = 'Stop'
+    $package = if (Test-Path -LiteralPath $Path) { Open-ExcelPackage -Path $Path -ErrorAction Stop } else { Open-ExcelPackage -Path $Path -Create -ErrorAction Stop }
+    try {
+        foreach ($worksheetName in $Worksheets.Keys) {
+            if ($package.Workbook.Worksheets[$worksheetName]) { continue }
+            $sheet = $package.Workbook.Worksheets.Add($worksheetName)
+            $headers = $Worksheets[$worksheetName]
+            for ($column = 0; $column -lt $headers.Count; $column++) {
+                $sheet.Cells[1, ($column + 1)].Value = $headers[$column]
+            }
+        }
+        $names = @($Worksheets.Keys)
+        for ($index = $names.Count - 1; $index -ge 0; $index--) {
+            $package.Workbook.Worksheets.MoveToStart($names[$index])
+        }
+        $package.Save()
+    }
+    finally {
+        $package.Dispose()
+    }
+}
+
 function Invoke-ImpactIQModelDetailExtraction {
     [CmdletBinding()]
     param(
@@ -5704,12 +5734,22 @@ trap {
     continue
 }
 
+# Sheet/column contract for Report Detail.xlsx; used when no report was extracted.
+$reportDetailWorksheets = [ordered]@{
+    Bookmarks = @('ReportName', 'ReportID', 'ModelID', 'Name', 'Id', 'PageName', 'PageId', 'VisualId', 'VisualHiddenFlag', 'SuppressData', 'CurrentPageSelected', 'ApplyVisualDisplayState', 'ApplyToAllVisuals', 'ReportDate')
+    Connections = @('ReportName', 'ReportID', 'ModelID', 'ServerName', 'Type', 'ReportDate')
+    CustomVisuals = @('ReportName', 'ReportID', 'ModelID', 'Name', 'ReportDate')
+    PageFilters = @('ReportName', 'ReportID', 'ModelID', 'PageId', 'PageName', 'DisplayName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'ReportDate')
+    Pages = @('ReportName', 'ReportID', 'ModelID', 'Id', 'Name', 'Number', 'Width', 'Height', 'DisplayOption', 'HiddenFlag', 'VisualCount', 'DataVisualCount', 'VisibleVisualCount', 'PageFilterCount', 'BackgroundImage', 'WallpaperImage', 'Type', 'ReportDate')
+    ReportFilters = @('ReportName', 'ReportID', 'ModelID', 'DisplayName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'ReportDate')
+    ReportLevelMeasures = @('ReportName', 'ReportID', 'ModelID', 'TableName', 'ObjectName', 'ObjectType', 'Expression', 'DataType', 'HiddenFlag', 'FormatString', 'DataCategory', 'ReportDate')
+    VisualFilters = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'VisualId', 'VisualName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'DisplayName', 'ReportDate')
+    VisualInteractions = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'SourceVisualID', 'SourceVisualName', 'TargetVisualID', 'TargetVisualName', 'TypeID', 'Type', 'ReportDate')
+    VisualObjects = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'VisualId', 'VisualName', 'VisualType', 'AppliedFilterVersion', 'CustomVisualFlag', 'TableName', 'ObjectName', 'ObjectType', 'ImplicitMeasure', 'Sparkline', 'VisualCalc', 'Format', 'Source', 'DisplayName', 'ReportDate')
+    Visuals = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'Id', 'Name', 'Type', 'DisplayType', 'Title', 'SubTitle', 'AltText', 'CustomVisualFlag', 'HiddenFlag', 'X', 'Y', 'Z', 'Width', 'Height', 'TabOrder', 'ObjectCount', 'VisualFilterCount', 'DataLimit', 'ShowItemsNoDataFlag', 'Divider', 'SlicerType', 'RowSubTotals', 'ColumnSubTotals', 'DataVisual', 'HasSparkline', 'ParentGroup', 'ReportDate')
+}
+
 if ($global:RunMode -notin @('Agents', 'FabricApps')) {
-
-
-
-
-
 
 Write-Output "Report Backup Process Started"
 
@@ -6050,11 +6090,18 @@ function Export-ReportDefinitionAsPbix {
 		    }
 		
 		    try {
-		        # Extract into subst drive
-				Write-Host "If available, extracting Model from $cleanWorkspaceName ~ $cleanReportName"
-		        Invoke-ImpactIQNativeCommand -FilePath $pbiToolsPath -ArgumentList @('extract', $filepath, '-extractFolder', $driveLetter, '-modelSerialization', 'Raw') -DiscardOutput
-		
-		        Invoke-ImpactIQNativeCommand -FilePath $pbiToolsPath -ArgumentList @('generate-bim', $driveLetter, '-transforms', 'RemovePBIDataSourceVersion') -DiscardOutput
+		        # Only live-connected or failed exports lack a model, so there is nothing to extract for them.
+		        if ((Test-Path -LiteralPath $filepath) -and ((Get-Item -LiteralPath $filepath).Length -gt 0)) {
+		            Write-Host "If available, extracting Model from $cleanWorkspaceName ~ $cleanReportName"
+		            Invoke-ImpactIQNativeCommand -FilePath $pbiToolsPath -ArgumentList @('extract', $filepath, '-extractFolder', $driveLetter, '-modelSerialization', 'Raw') -DiscardOutput
+
+		            if (Test-Path -LiteralPath (Join-Path $extractFolder 'Model')) {
+		                Invoke-ImpactIQNativeCommand -FilePath $pbiToolsPath -ArgumentList @('generate-bim', $driveLetter, '-transforms', 'RemovePBIDataSourceVersion') -DiscardOutput
+		            }
+		            else {
+		                Write-Host "No model found in $cleanWorkspaceName ~ $cleanReportName; skipping model extraction."
+		            }
+		        }
 		
 		        $bimFilesGenerated = Get-ChildItem -Path $extractFolder -Filter *.bim
 		        foreach ($bimFile in $bimFilesGenerated) {
@@ -6106,9 +6153,9 @@ Model.Database.ID = "$fileName";
 # --- Cleanup Temporary Folders ---
 $tempDestinationRemovalPath = "$baseFolderPath\Config"
 
-Remove-Item -Path "$tempDestinationRemovalPath\Temp" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$tempDestinationRemovalPath\localhost" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$baseFolderPath\localhost" -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($leftoverPath in @("$tempDestinationRemovalPath\Temp", "$tempDestinationRemovalPath\localhost", "$baseFolderPath\localhost")) {
+    if (Test-Path -LiteralPath $leftoverPath) { Remove-Item -LiteralPath $leftoverPath -Recurse -Force -ErrorAction SilentlyContinue }
+}
 
 Write-Output "Report Backup Process Completed"
 
@@ -6128,11 +6175,16 @@ Write-Output "Report Backup Process Completed"
 
 Write-Output "Report Detail Extraction Process Started"
 
+if (@($reportsInfo).Count -gt 0) {
 # Start Tabular Editor process 1
 $p = Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script1Path`""
 
 # Start Tabular Editor process 2
 $p = Invoke-ImpactIQNativeProcess -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script2Path`""
+}
+else {
+    Write-Host "[INFO] No reports in scope; skipping report detail extraction."
+}
 
 # Define the output Excel file path in the parent folder
 $outputExcelFile = Join-Path -Path $baseFolderPath -ChildPath "Report Detail.xlsx"
@@ -6185,7 +6237,9 @@ foreach ($txtFile in (Get-ChildItem -Path $newDateFolder -Filter *.txt)) {
     }
 }
 
-
+if (-not $excelExists) {
+    Export-EmptyDetailWorkbook -Path $outputExcelFile -Worksheets $reportDetailWorksheets -ErrorAction Stop
+}
 
 Write-Host "TXT files appended to $outputExcelFile"
 
@@ -6213,19 +6267,6 @@ Write-Output "Report Detail Extraction Process Completed. Excel output saved to 
 }
 else {
     # Keep the Power Query sheet/column contract without extracting out-of-scope reports.
-    $reportDetailWorksheets = [ordered]@{
-        Bookmarks = @('ReportName', 'ReportID', 'ModelID', 'Name', 'Id', 'PageName', 'PageId', 'VisualId', 'VisualHiddenFlag', 'SuppressData', 'CurrentPageSelected', 'ApplyVisualDisplayState', 'ApplyToAllVisuals', 'ReportDate')
-        Connections = @('ReportName', 'ReportID', 'ModelID', 'ServerName', 'Type', 'ReportDate')
-        CustomVisuals = @('ReportName', 'ReportID', 'ModelID', 'Name', 'ReportDate')
-        PageFilters = @('ReportName', 'ReportID', 'ModelID', 'PageId', 'PageName', 'DisplayName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'ReportDate')
-        Pages = @('ReportName', 'ReportID', 'ModelID', 'Id', 'Name', 'Number', 'Width', 'Height', 'DisplayOption', 'HiddenFlag', 'VisualCount', 'DataVisualCount', 'VisibleVisualCount', 'PageFilterCount', 'BackgroundImage', 'WallpaperImage', 'Type', 'ReportDate')
-        ReportFilters = @('ReportName', 'ReportID', 'ModelID', 'DisplayName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'ReportDate')
-        ReportLevelMeasures = @('ReportName', 'ReportID', 'ModelID', 'TableName', 'ObjectName', 'ObjectType', 'Expression', 'DataType', 'HiddenFlag', 'FormatString', 'DataCategory', 'ReportDate')
-        VisualFilters = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'VisualId', 'VisualName', 'TableName', 'ObjectName', 'ObjectType', 'FilterType', 'HiddenFilter', 'LockedFilter', 'HowCreated', 'Used', 'AppliedFilterVersion', 'DisplayName', 'ReportDate')
-        VisualInteractions = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'SourceVisualID', 'SourceVisualName', 'TargetVisualID', 'TargetVisualName', 'TypeID', 'Type', 'ReportDate')
-        VisualObjects = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'VisualId', 'VisualName', 'VisualType', 'AppliedFilterVersion', 'CustomVisualFlag', 'TableName', 'ObjectName', 'ObjectType', 'ImplicitMeasure', 'Sparkline', 'VisualCalc', 'Format', 'Source', 'DisplayName', 'ReportDate')
-        Visuals = @('ReportName', 'ReportID', 'ModelID', 'PageName', 'PageId', 'Id', 'Name', 'Type', 'DisplayType', 'Title', 'SubTitle', 'AltText', 'CustomVisualFlag', 'HiddenFlag', 'X', 'Y', 'Z', 'Width', 'Height', 'TabOrder', 'ObjectCount', 'VisualFilterCount', 'DataLimit', 'ShowItemsNoDataFlag', 'Divider', 'SlicerType', 'RowSubTotals', 'ColumnSubTotals', 'DataVisual', 'HasSparkline', 'ParentGroup', 'ReportDate')
-    }
     Export-EmptyDetailWorkbook -Path (Join-Path $baseFolderPath 'Report Detail.xlsx') -Worksheets $reportDetailWorksheets -ErrorAction Stop
 }
 
@@ -6300,7 +6341,9 @@ foreach ($csvFile in (Get-ChildItem -Path $folderPath -Filter *.csv)) {
 }
 
 # Create a new Excel file with the data in the "Semantic Models" worksheet
-$semanticModelsCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Semantic Models" -AutoNameRange
+if (@($semanticModelsCsvData).Count -gt 0) {
+    $semanticModelsCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Semantic Models" -AutoNameRange
+}
 
 Write-Host "CSV files combined into the 'Semantic Models' worksheet in $outputExcelFile"
 Write-Output "Model Detail Extraction Process Completed"
@@ -6330,7 +6373,21 @@ foreach ($csvFile in (Get-ChildItem -Path $folderPath -Filter *.csv)) {
 }
 
 # Append data to the existing Excel file in the "Measure Dependencies" worksheet
-$measureDependenciesCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Measure Dependencies" -AutoNameRange -Append
+if (@($measureDependenciesCsvData).Count -gt 0) {
+    if (Test-Path -LiteralPath $outputExcelFile) {
+        $measureDependenciesCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Measure Dependencies" -AutoNameRange -Append
+    }
+    else {
+        $measureDependenciesCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Measure Dependencies" -AutoNameRange
+    }
+}
+
+# Keep both sheets (header-only when there is nothing to list) so downstream Power Query always finds them.
+$modelDetailWorksheets = [ordered]@{
+    'Semantic Models' = @('Type', 'Table', 'Name', 'FormatString', 'DisplayFolder', 'Description', 'IsHidden', 'TableStorageMode', 'Expression', 'ModelAsOfDate', 'ModelName', 'ModelID', 'RelationshipFromTable', 'RelationshipFromColumn', 'RelationshipToTable', 'RelationshipToColumn', 'RelationshipStatus', 'RelationshipFromCardinality', 'RelationshipToCardinality', 'RelationshipCrossFilteringBehavior')
+    'Measure Dependencies' = @('ObjectName', 'ObjectType', 'DependsOn', 'DependsOnType', 'ModelAsOfDate', 'ModelName', 'ModelID')
+}
+Add-EmptyDetailWorksheets -Path $outputExcelFile -Worksheets $modelDetailWorksheets -ErrorAction Stop
 
 Write-Host "CSV files combined into the 'Measure Dependencies' worksheet in $outputExcelFile"
 

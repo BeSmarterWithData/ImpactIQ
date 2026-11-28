@@ -162,7 +162,7 @@ public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint d
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <StackPanel x:Name="Header" Margin="0,0,0,24">
-      <TextBlock x:Name="Eyebrow" Text="IMPACT IQ" Foreground="#5EEAD4" FontSize="14" FontWeight="Bold"/>
+      <TextBlock x:Name="Eyebrow" Text="IMPACT IQ" Foreground="#087F75" FontSize="14" FontWeight="Bold"/>
       <DockPanel x:Name="Intro" Margin="0,8,0,0">
         <Border x:Name="LogoCard" DockPanel.Dock="Left" Width="256" Height="144" CornerRadius="12"
                 Margin="0,0,24,0" Visibility="Collapsed"/>

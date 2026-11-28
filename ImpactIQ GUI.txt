@@ -271,16 +271,14 @@ public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint d
                   FontWeight="SemiBold" FontSize="16" Padding="28,16" Margin="0,0,0,16"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
             <Button x:Name="DoneOpenFolder" Content="Open backups"/>
-            <Button x:Name="DoneRunAgain" Content="Run again"/>
-            <Button x:Name="DoneOpenErrors" Content="View error log" Margin="0" Visibility="Collapsed"/>
+            <Button x:Name="DoneRunAgain" Content="Run again" Margin="0"/>
           </StackPanel>
-          <TextBlock x:Name="DoneNote" Foreground="#A9B9CF" TextWrapping="Wrap" TextAlignment="Center"
-                     Margin="0,20,0,0" Visibility="Collapsed"/>
         </StackPanel>
       </Border>
     </Grid>
     <DockPanel Grid.Row="4" Margin="0,18,0,0">
-      <Button x:Name="OpenLog" DockPanel.Dock="Right" Content="View full detail" Margin="12,0,0,0" IsEnabled="False"/>
+      <Button x:Name="OpenLog" DockPanel.Dock="Right" Content="View run detail" Margin="12,0,0,0" IsEnabled="False"/>
+      <Button x:Name="DoneOpenErrors" DockPanel.Dock="Right" Content="View error log" Margin="12,0,0,0" Visibility="Collapsed"/>
       <TextBlock x:Name="Footer" Text="" Foreground="#6F819C" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap"/>
     </DockPanel>
   </Grid>
@@ -293,7 +291,7 @@ $controls = @{}
 foreach ($name in @('Browse', 'Folder', 'Run', 'OpenFolder', 'Status', 'Detail', 'Progress', 'Log', 'OpenLog',
     'Setup', 'SelectionPanel', 'SelectionTitle', 'SelectionDescription', 'Search', 'ChoiceList', 'CheckedList',
     'MultiActions', 'SelectAll', 'ClearAll', 'IncludeMy', 'SelectionCount', 'SelectionDeadline', 'Continue', 'Back', 'LogPanel', 'Header', 'Intro',
-    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneNote', 'DoneElapsed', 'Eyebrow', 'LogoCard',
+    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneElapsed', 'Eyebrow', 'LogoCard',
     'StopRun', 'DetailsToggle', 'ActivityCard', 'ActivityLine', 'LiveElapsed', 'StageStrip', 'DoneSummary', 'DoneOpenErrors', 'Footer')) {
     $controls[$name] = $window.FindName($name)
     if ($null -eq $controls[$name]) { throw "GUI control is missing: $name" }
@@ -723,7 +721,7 @@ function Open-GovernanceModel {
 }
 $controls.OpenLog.Add_Click({
     $fullText = if ($null -ne $state.FullLog) { $state.FullLog.ToString() } else { '' }
-    Show-GuiTextViewer -Title 'Full detail' -Subtitle 'Everything the PowerShell run printed, from the start of this session.' -Text $fullText -Empty 'Nothing has been recorded yet.'
+    Show-GuiTextViewer -Title 'Run detail' -Subtitle 'Everything the PowerShell run printed, from the start of this session.' -Text $fullText -Empty 'Nothing has been recorded yet.'
 })
 
 # Read-only window for the run's full output or the error log; nothing extra is saved to disk for it.
@@ -814,8 +812,6 @@ function Show-GuiFinished {
     $controls.DoneElapsed.Visibility = if ($Elapsed) { 'Visible' } else { 'Collapsed' }
     $controls.DoneSummary.Text = $Summary
     $controls.DoneSummary.Visibility = if ($Summary) { 'Visible' } else { 'Collapsed' }
-    $controls.DoneNote.Text = 'Some steps reported notes, which is normal for most environments. See "View error log" for details, or "View full detail" for the whole run.'
-    $controls.DoneNote.Visibility = if ($HadIssues) { 'Visible' } else { 'Collapsed' }
     $errorLogExists = $state.ErrorLogPath -and (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf)
     $controls.DoneOpenErrors.Visibility = if ($HadIssues -and $errorLogExists) { 'Visible' } else { 'Collapsed' }
     $controls.DonePanel.Visibility = 'Visible'
@@ -835,6 +831,7 @@ $controls.DoneOpenFolder.Add_Click({
     $controls.OpenFolder.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
 })
 $controls.DoneRunAgain.Add_Click({
+    $controls.DoneOpenErrors.Visibility = 'Collapsed'
     $controls.DonePanel.Visibility = 'Collapsed'
     $controls.Setup.Visibility = 'Visible'
     $controls.StatusPanel.Visibility = 'Visible'
@@ -903,6 +900,7 @@ $controls.Run.Add_Click({
         $controls.Browse.IsEnabled = $false
         $controls.Folder.IsEnabled = $false
         $controls.OpenLog.IsEnabled = $false
+        $controls.DoneOpenErrors.Visibility = 'Collapsed'
         $controls.Setup.Visibility = 'Collapsed'
         $controls.Intro.Visibility = 'Collapsed'
         $controls.Eyebrow.Visibility = 'Visible'
@@ -1038,11 +1036,11 @@ $timer.Add_Tick({
             }
             elseif ($state.Process.ExitCode -ne 0) {
                 $controls.Status.Text = 'Analysis failed'
-                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, 'View full detail', and 'Config\Error Log.txt' in your backup folder." + $elapsedSuffix
+                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, 'View run detail', and 'Config\Error Log.txt' in your backup folder." + $elapsedSuffix
             }
             else {
                 $controls.Status.Text = 'Analysis stopped before completion'
-                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and "View full detail"; no completion was confirmed.' + $elapsedSuffix
+                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and "View run detail"; no completion was confirmed.' + $elapsedSuffix
             }
             if (-not $endedWell) { Set-GuiDetails $true; Invoke-GuiAttention }
             if ($state.BridgePath -and (Test-Path -LiteralPath $state.BridgePath -PathType Container)) {

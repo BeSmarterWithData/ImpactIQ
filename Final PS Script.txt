@@ -164,6 +164,7 @@ function Invoke-ImpactIQLoggedRun {
             if ($script:ImpactIQDiagnostics -and $script:ImpactIQDiagnostics.Writer) {
                 $script:ImpactIQDiagnostics.Writer.Dispose()
             }
+            if ($StartSession) { $script:ImpactIQLogsStarted = @{} }
             $script:ImpactIQRunFailed = $false
             $script:ImpactIQLogUnavailable = $false
             $script:ImpactIQDiagnostics = @{
@@ -179,7 +180,11 @@ function Invoke-ImpactIQLoggedRun {
         }
         if (-not $script:ImpactIQDiagnostics.Writer) {
             $null = [IO.Directory]::CreateDirectory((Split-Path -Path $ImpactIQLogPath -Parent))
-            $script:ImpactIQDiagnostics.Writer = [IO.StreamWriter]::new($ImpactIQLogPath, $true, [Text.UTF8Encoding]::new($false))
+            # Start each run with a fresh log; later sections of the same run append to it.
+            if (-not $script:ImpactIQLogsStarted) { $script:ImpactIQLogsStarted = @{} }
+            $impactIQAppendLog = [bool]$script:ImpactIQLogsStarted[$ImpactIQLogPath]
+            $script:ImpactIQDiagnostics.Writer = [IO.StreamWriter]::new($ImpactIQLogPath, $impactIQAppendLog, [Text.UTF8Encoding]::new($false))
+            $script:ImpactIQLogsStarted[$ImpactIQLogPath] = $true
             $script:ImpactIQDiagnostics.Writer.AutoFlush = $true
             Write-ImpactIQDiagnostic -Level INFO -Message 'ImpactIQ run started.'
         }

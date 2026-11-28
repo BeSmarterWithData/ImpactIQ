@@ -272,7 +272,7 @@ public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint d
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
             <Button x:Name="DoneOpenFolder" Content="Open backups"/>
             <Button x:Name="DoneRunAgain" Content="Run again"/>
-            <Button x:Name="DoneOpenErrors" Content="Open error log" Margin="0" Visibility="Collapsed"/>
+            <Button x:Name="DoneOpenErrors" Content="View error log" Margin="0" Visibility="Collapsed"/>
           </StackPanel>
           <TextBlock x:Name="DoneNote" Foreground="#A9B9CF" TextWrapping="Wrap" TextAlignment="Center"
                      Margin="0,20,0,0" Visibility="Collapsed"/>
@@ -280,7 +280,7 @@ public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint d
       </Border>
     </Grid>
     <DockPanel Grid.Row="4" Margin="0,18,0,0">
-      <Button x:Name="OpenLog" DockPanel.Dock="Right" Content="Open full log" Margin="12,0,0,0" IsEnabled="False"/>
+      <Button x:Name="OpenLog" DockPanel.Dock="Right" Content="View full detail" Margin="12,0,0,0" IsEnabled="False"/>
       <TextBlock x:Name="Footer" Text="" Foreground="#6F819C" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap"/>
     </DockPanel>
   </Grid>
@@ -330,6 +330,8 @@ $state = @{
     Process = $null
     Reader = $null
     LogPath = $null
+    FullLog = $null
+    RunFolder = $null
     ResultPath = $null
     Folder = $null
     Issues = $false
@@ -720,9 +722,81 @@ function Open-GovernanceModel {
     catch { Show-LauncherError $_.Exception.Message }
 }
 $controls.OpenLog.Add_Click({
-    try { Start-Process -FilePath notepad.exe -ArgumentList ('"{0}"' -f $state.LogPath) }
-    catch { Show-LauncherError $_.Exception.Message }
+    $fullText = if ($null -ne $state.FullLog) { $state.FullLog.ToString() } else { '' }
+    Show-GuiTextViewer -Title 'Full detail' -Subtitle 'Everything the PowerShell run printed, from the start of this session.' -Text $fullText -Empty 'Nothing has been recorded yet.'
 })
+
+# Read-only window for the run's full output or the error log; nothing extra is saved to disk for it.
+function Show-GuiTextViewer {
+    param([string]$Title, [string]$Subtitle, [string]$Text, [string]$Empty)
+    try {
+        if ($script:GuiViewer) { try { $script:GuiViewer.Close() } catch { } }
+        $viewer = New-Object Windows.Window
+        $viewer.Title = "Impact IQ - $Title"
+        $viewer.Width = 900; $viewer.Height = 640; $viewer.MinWidth = 520; $viewer.MinHeight = 360
+        if ($window.IsVisible) { $viewer.Owner = $window; $viewer.WindowStartupLocation = 'CenterOwner' }
+        else { $viewer.WindowStartupLocation = 'CenterScreen' }
+        $viewer.Background = New-GuiBrush '#101827'
+        $viewer.Foreground = New-GuiBrush '#E7EEF8'
+        $viewer.FontFamily = New-Object Windows.Media.FontFamily 'Segoe UI'
+        if ($window.Icon) { $viewer.Icon = $window.Icon }
+        $viewer.Resources.MergedDictionaries.Add($window.Resources)
+
+        $layout = New-Object Windows.Controls.Grid
+        $layout.Margin = '20'
+        foreach ($height in 'Auto', '*', 'Auto') {
+            $row = New-Object Windows.Controls.RowDefinition
+            $row.Height = [Windows.GridLength]::Auto
+            if ($height -eq '*') { $row.Height = New-Object Windows.GridLength(1, [Windows.GridUnitType]::Star) }
+            $layout.RowDefinitions.Add($row)
+        }
+        $heading = New-Object Windows.Controls.StackPanel
+        $heading.Margin = '0,0,0,12'
+        $titleBlock = New-Object Windows.Controls.TextBlock
+        $titleBlock.Text = $Title; $titleBlock.FontSize = 20; $titleBlock.FontWeight = 'SemiBold'
+        $subtitleBlock = New-Object Windows.Controls.TextBlock
+        $subtitleBlock.Text = $Subtitle; $subtitleBlock.Foreground = New-GuiBrush '#A9B9CF'; $subtitleBlock.Margin = '0,4,0,0'
+        $subtitleBlock.TextWrapping = 'Wrap'
+        [void]$heading.Children.Add($titleBlock); [void]$heading.Children.Add($subtitleBlock)
+        [void]$layout.Children.Add($heading)
+
+        $box = New-Object Windows.Controls.TextBox
+        $box.IsReadOnly = $true; $box.AcceptsReturn = $true; $box.TextWrapping = 'NoWrap'
+        $box.VerticalScrollBarVisibility = 'Auto'; $box.HorizontalScrollBarVisibility = 'Auto'
+        $box.Background = New-GuiBrush '#0B1220'; $box.Foreground = New-GuiBrush '#CFDCEE'
+        $box.BorderThickness = '0'; $box.Padding = '14'
+        $box.FontFamily = New-Object Windows.Media.FontFamily 'Consolas'; $box.FontSize = 12
+        $box.Text = if ($Text) { $Text } else { $Empty }
+        [Windows.Controls.Grid]::SetRow($box, 1)
+        [void]$layout.Children.Add($box)
+
+        $buttons = New-Object Windows.Controls.StackPanel
+        $buttons.Orientation = 'Horizontal'; $buttons.HorizontalAlignment = 'Right'; $buttons.Margin = '0,14,0,0'
+        $copy = New-Object Windows.Controls.Button; $copy.Content = 'Copy all'
+        $close = New-Object Windows.Controls.Button; $close.Content = 'Close'; $close.Margin = '0'
+        [void]$buttons.Children.Add($copy); [void]$buttons.Children.Add($close)
+        [Windows.Controls.Grid]::SetRow($buttons, 2)
+        [void]$layout.Children.Add($buttons)
+        $viewer.Content = $layout
+
+        $copy.Add_Click({ try { [Windows.Clipboard]::SetText($box.Text) } catch { } }.GetNewClosure())
+        $close.Add_Click({ $viewer.Close() }.GetNewClosure())
+        $viewer.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $viewer.Close() } }.GetNewClosure())
+        $viewer.Add_SourceInitialized({
+            try {
+                $handle = (New-Object Windows.Interop.WindowInteropHelper $viewer).Handle
+                $dark = 1; [void][ImpactIQ.NativeWindows]::DwmSetWindowAttribute($handle, 20, [ref]$dark, 4)
+                $captionColor = 0x00271810; [void][ImpactIQ.NativeWindows]::DwmSetWindowAttribute($handle, 35, [ref]$captionColor, 4)
+                $captionText = 0x00F8EEE7; [void][ImpactIQ.NativeWindows]::DwmSetWindowAttribute($handle, 36, [ref]$captionText, 4)
+            }
+            catch { }
+        }.GetNewClosure())
+        $script:GuiViewer = $viewer
+        $viewer.Show()
+        $box.Focus() | Out-Null
+    }
+    catch { Show-LauncherError $_.Exception.Message }
+}
 
 function Format-Elapsed {
     param([TimeSpan]$Span)
@@ -740,7 +814,7 @@ function Show-GuiFinished {
     $controls.DoneElapsed.Visibility = if ($Elapsed) { 'Visible' } else { 'Collapsed' }
     $controls.DoneSummary.Text = $Summary
     $controls.DoneSummary.Visibility = if ($Summary) { 'Visible' } else { 'Collapsed' }
-    $controls.DoneNote.Text = 'Some steps reported notes, which is normal for most environments. Details are in the full log.'
+    $controls.DoneNote.Text = 'Some steps reported notes, which is normal for most environments. See "View error log" for details, or "View full detail" for the whole run.'
     $controls.DoneNote.Visibility = if ($HadIssues) { 'Visible' } else { 'Collapsed' }
     $errorLogExists = $state.ErrorLogPath -and (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf)
     $controls.DoneOpenErrors.Visibility = if ($HadIssues -and $errorLogExists) { 'Visible' } else { 'Collapsed' }
@@ -749,8 +823,13 @@ function Show-GuiFinished {
 }
 $controls.DoneOpenModel.Add_Click({ Open-GovernanceModel })
 $controls.DoneOpenErrors.Add_Click({
-    try { Start-Process -FilePath notepad.exe -ArgumentList ('"{0}"' -f $state.ErrorLogPath) }
-    catch { Show-LauncherError $_.Exception.Message }
+    $errorText = ''
+    try {
+        $errorStream = [IO.File]::Open($state.ErrorLogPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try { $errorText = (New-Object IO.StreamReader($errorStream, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $errorStream.Dispose() }
+    }
+    catch { $errorText = '' }
+    Show-GuiTextViewer -Title 'Error log' -Subtitle 'Warnings and errors from the latest run. This file is replaced each time you run an analysis.' -Text $errorText -Empty 'The error log is empty.'
 })
 $controls.DoneOpenFolder.Add_Click({
     $controls.OpenFolder.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
@@ -772,13 +851,18 @@ $controls.Run.Add_Click({
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required file is missing: $path" }
         }
         Save-GuiSettings -BackupFolder $state.Folder
-        $logFolder = Join-Path $state.Folder 'Logs'
-        New-Item -Path $logFolder -ItemType Directory -Force | Out-Null
+        # Run files are temporary: the log, result and selection bridge live in a per-run temp folder that is removed afterwards.
+        foreach ($oldRun in @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'ImpactIQ-run-*' -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $oldRun.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
         $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-        $state.LogPath = Join-Path $logFolder "ImpactIQ-$runId.log"
-        $state.ResultPath = Join-Path $logFolder "ImpactIQ-$runId.json"
-        $state.BridgePath = Join-Path $logFolder "ImpactIQ-$runId.selection"
+        $state.RunFolder = Join-Path $env:TEMP "ImpactIQ-run-$runId"
+        New-Item -Path $state.RunFolder -ItemType Directory -Force | Out-Null
+        $state.LogPath = Join-Path $state.RunFolder 'run.log'
+        $state.ResultPath = Join-Path $state.RunFolder 'result.json'
+        $state.BridgePath = Join-Path $state.RunFolder 'selection'
         New-Item -Path $state.BridgePath -ItemType Directory | Out-Null
+        $state.FullLog = New-Object Text.StringBuilder
         $state.Request = $null
         $state.LastRequestId = $null
         $command = '& ([scriptblock]::Create([IO.File]::ReadAllText({0}))) -ScriptPath {1} -BaseFolderPath {2} -LogPath {3} -ResultPath {4} -BridgePath {5} -GuiProcessId {6}' -f
@@ -842,6 +926,7 @@ $timer.Add_Tick({
             if ($text) {
                 if ($text -match '(?i)\[ERROR\]|\[WARN(?:ING)?\]|WARNING:') { $state.Issues = $true }
                 $controls.Log.AppendText($text)
+                [void]$state.FullLog.Append($text)
                 if ($controls.Log.Text.Length -gt 120000) {
                     $controls.Log.Text = $controls.Log.Text.Substring($controls.Log.Text.Length - 100000)
                 }
@@ -913,7 +998,7 @@ $timer.Add_Tick({
             $state.SignInWatch = $false
             if ($null -ne $state.Reader) {
                 $finalText = $state.Reader.ReadToEnd()
-                if ($finalText) { $controls.Log.AppendText($finalText); $controls.Log.ScrollToEnd() }
+                if ($finalText) { $controls.Log.AppendText($finalText); [void]$state.FullLog.Append($finalText); $controls.Log.ScrollToEnd() }
                 $state.Reader.Dispose(); $state.Reader = $null
             }
             $elapsedText = ''
@@ -953,11 +1038,11 @@ $timer.Add_Tick({
             }
             elseif ($state.Process.ExitCode -ne 0) {
                 $controls.Status.Text = 'Analysis failed'
-                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, the saved log, and 'Config\Error Log.txt' in your backup folder." + $elapsedSuffix
+                $controls.Detail.Text = "Sign-in or setup did not complete. Review the live activity, 'View full detail', and 'Config\Error Log.txt' in your backup folder." + $elapsedSuffix
             }
             else {
                 $controls.Status.Text = 'Analysis stopped before completion'
-                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and log; no completion was confirmed.' + $elapsedSuffix
+                $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and "View full detail"; no completion was confirmed.' + $elapsedSuffix
             }
             if (-not $endedWell) { Set-GuiDetails $true; Invoke-GuiAttention }
             if ($state.BridgePath -and (Test-Path -LiteralPath $state.BridgePath -PathType Container)) {
@@ -965,12 +1050,15 @@ $timer.Add_Tick({
             }
             $state.Process.Dispose()
             $state.Process = $null
+            if ($state.RunFolder -and (Test-Path -LiteralPath $state.RunFolder -PathType Container)) {
+                Remove-Item -LiteralPath $state.RunFolder -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     catch {
         $timer.Stop()
         if ($null -ne $state.Reader) { $state.Reader.Dispose(); $state.Reader = $null }
-        Show-LauncherError ("Live monitoring failed. The analysis may still be running in the background; its log is in the Logs folder. " + $_.Exception.Message)
+        Show-LauncherError ("Live monitoring failed. The analysis may still be running in the background. " + $_.Exception.Message)
     }
 })
 # Stop the running analysis (and the tools it started) after confirming.
@@ -1048,6 +1136,9 @@ $window.Add_Closing({
     $timer.Stop()
     if ($null -ne $state.Reader) { $state.Reader.Dispose() }
     if ($null -ne $state.Process) { $state.Process.Dispose() }
+    if ($state.RunFolder -and (Test-Path -LiteralPath $state.RunFolder -PathType Container)) {
+        Remove-Item -LiteralPath $state.RunFolder -Recurse -Force -ErrorAction SilentlyContinue
+    }
 })
 # A second copy would run against the same backup folder, so bring the open window forward and stop.
 if ($env:IMPACTIQ_ALLOW_MULTIPLE -ne '1' -and -not (Enter-GuiSingleInstance)) {

@@ -265,8 +265,9 @@ public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint d
           <TextBlock Text="FINISHED" Foreground="#5EEAD4" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center"/>
           <TextBlock Text="Open the Governance Report / Model to view your environment" FontSize="24" FontWeight="SemiBold"
                      TextWrapping="Wrap" TextAlignment="Center" Margin="0,10,0,8"/>
-          <TextBlock x:Name="DoneElapsed" Foreground="#A9B9CF" FontSize="14" TextAlignment="Center" Margin="0,0,0,4"/>
-          <TextBlock x:Name="DoneSummary" Foreground="#A9B9CF" FontSize="13" TextAlignment="Center" TextWrapping="Wrap" Margin="0,0,0,26"/>
+          <TextBlock x:Name="DoneElapsed" Foreground="#A9B9CF" FontSize="14" TextAlignment="Center" Margin="0,0,0,12"/>
+          <TextBlock x:Name="DoneSummary" Foreground="#A9B9CF" FontSize="13" TextAlignment="Center" TextWrapping="Wrap"
+                     LineStackingStrategy="BlockLineHeight" LineHeight="26" Margin="0,0,0,28"/>
           <Button x:Name="DoneOpenModel" Content="Open Governance Report / Model" Background="#087F75"
                   FontWeight="SemiBold" FontSize="16" Padding="28,16" Margin="0,0,0,16"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">

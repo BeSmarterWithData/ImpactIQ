@@ -27,16 +27,28 @@ public struct RECT { public int Left, Top, Right, Bottom; }
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int command);
 [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int attribute, out int value, int size);
+[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hWnd, int attribute, ref int value, int size);
+public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+[DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO info);
 '@
 }
 
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Impact IQ" Width="1000" Height="780" MinWidth="800" MinHeight="680"
+        Title="Impact IQ" Width="1000" Height="780" MinWidth="800" MinHeight="700"
         WindowStartupLocation="CenterScreen" Background="#101827" Foreground="#E7EEF8"
         FontFamily="Segoe UI">
   <Window.Resources>
+    <Style x:Key="FocusRing">
+      <Setter Property="Control.Template">
+        <Setter.Value>
+          <ControlTemplate>
+            <Rectangle Margin="-3" RadiusX="8" RadiusY="8" Stroke="#5EEAD4" StrokeThickness="2" SnapsToDevicePixels="True"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
     <Style TargetType="Button">
       <Setter Property="Background" Value="#26364D"/>
       <Setter Property="Foreground" Value="#FFFFFF"/>
@@ -44,11 +56,101 @@ public struct RECT { public int Left, Top, Right, Bottom; }
       <Setter Property="Margin" Value="0,0,10,0"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="Cursor" Value="Hand"/>
-      <Style.Triggers>
-        <Trigger Property="IsEnabled" Value="False">
-          <Setter Property="Opacity" Value="0.45"/>
-        </Trigger>
-      </Style.Triggers>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Grid>
+              <Border x:Name="Face" Background="{TemplateBinding Background}" CornerRadius="6"/>
+              <Border x:Name="Shade" Background="White" CornerRadius="6" Opacity="0"/>
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                Margin="{TemplateBinding Padding}" TextElement.Foreground="{TemplateBinding Foreground}"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Shade" Property="Opacity" Value="0.12"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="Shade" Property="Opacity" Value="0.22"/>
+              </Trigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Shade" Property="Opacity" Value="0.08"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="ChoiceItem" TargetType="ListBoxItem">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="Padding" Value="10,8"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Row" Background="Transparent" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="#26364D"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="#087F75"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="CheckItem" TargetType="ListBoxItem">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="Padding" Value="6,4"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Row" Background="Transparent" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="#26364D"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="CheckBox">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <DockPanel Background="Transparent">
+              <Border x:Name="Box" DockPanel.Dock="Left" Width="18" Height="18" CornerRadius="4" BorderThickness="1.5"
+                      BorderBrush="#5B6E8A" Background="#101827" Margin="0,2,10,0" VerticalAlignment="Top">
+                <Path x:Name="Tick" Data="M3.5,9 L7,12.5 L14.5,5" Stroke="#FFFFFF" StrokeThickness="2" Visibility="Collapsed"/>
+              </Border>
+              <ContentPresenter VerticalAlignment="Center" TextElement.Foreground="{TemplateBinding Foreground}"/>
+            </DockPanel>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Box" Property="BorderBrush" Value="#5EEAD4"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="Box" Property="Background" Value="#087F75"/>
+                <Setter TargetName="Box" Property="BorderBrush" Value="#5EEAD4"/>
+                <Setter TargetName="Tick" Property="Visibility" Value="Visible"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
   </Window.Resources>
   <Grid Margin="32">
@@ -78,18 +180,20 @@ public struct RECT { public int Left, Top, Right, Bottom; }
           <TextBox x:Name="Folder" Text="C:\Power BI Backups" Background="#101827" Foreground="#FFFFFF"
                    BorderBrush="#40516B" Padding="12,9" VerticalContentAlignment="Center"/>
         </DockPanel>
-        <TextBlock Text="Choose your cloud and analysis scope here. Microsoft sign-in may open separately."
+        <TextBlock Text="You'll sign in with Microsoft, then choose your cloud and what to analyse. Only content you can access is processed."
                    Foreground="#A9B9CF" TextWrapping="Wrap" Margin="0,12,0,16"/>
         <StackPanel Orientation="Horizontal">
           <Button x:Name="Run" Content="Start analysis" Background="#087F75" FontWeight="SemiBold"/>
           <Button x:Name="OpenFolder" Content="Open backups"/>
-          <Button x:Name="OpenModel" Content="Open governance template"/>
         </StackPanel>
       </StackPanel>
     </Border>
     <StackPanel x:Name="StatusPanel" Grid.Row="2" Margin="0,0,0,16">
-      <TextBlock x:Name="Status" Text="Ready when you are." FontSize="17" FontWeight="SemiBold"/>
-      <TextBlock x:Name="Detail" Text="No custom executable or installer. Organization policies still apply."
+      <DockPanel>
+        <Button x:Name="StopRun" DockPanel.Dock="Right" Content="Stop" Padding="16,6" Margin="12,0,0,0" Visibility="Collapsed"/>
+        <TextBlock x:Name="Status" Text="Ready when you are." FontSize="17" FontWeight="SemiBold" VerticalAlignment="Center"/>
+      </DockPanel>
+      <TextBlock x:Name="Detail" Text="Pick your backup location, then press Start analysis."
                  Foreground="#A9B9CF" TextWrapping="Wrap" Margin="0,6,0,10"/>
       <ProgressBar x:Name="Progress" Height="4" Minimum="0" Maximum="100" Value="0"
                    Foreground="#5EEAD4" Background="#26364D" BorderThickness="0"/>
@@ -118,10 +222,11 @@ public struct RECT { public int Left, Top, Right, Bottom; }
                    BorderBrush="#40516B" Padding="10,8" Margin="0,0,0,10"
                    ToolTip="Search by name, workspace or ID"/>
           <ListBox x:Name="ChoiceList" Grid.Row="2" Background="#101827" Foreground="#FFFFFF"
-                   BorderBrush="#40516B" DisplayMemberPath="Display" Padding="8"
+                   BorderBrush="#40516B" DisplayMemberPath="Display" Padding="8" ItemContainerStyle="{StaticResource ChoiceItem}"
                    ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
           <ListBox x:Name="CheckedList" Grid.Row="2" Background="#101827" Foreground="#FFFFFF"
-                   BorderBrush="#40516B" Padding="8" ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
+                   BorderBrush="#40516B" Padding="8" ItemContainerStyle="{StaticResource CheckItem}"
+                   ScrollViewer.HorizontalScrollBarVisibility="Disabled"/>
           <StackPanel x:Name="MultiActions" Grid.Row="3" Margin="0,10,0,0">
             <StackPanel Orientation="Horizontal">
               <Button x:Name="SelectAll" Content="Select All" Padding="12,7"/>
@@ -139,10 +244,18 @@ public struct RECT { public int Left, Top, Right, Bottom; }
           </StackPanel>
         </Grid>
       </Border>
-      <Border x:Name="LogPanel" Grid.ColumnSpan="2" Background="#0B1220" CornerRadius="12" Padding="16">
+      <Border x:Name="LogPanel" Grid.ColumnSpan="2" Background="#0B1220" CornerRadius="12" Padding="20" Visibility="Collapsed">
         <DockPanel>
-          <TextBlock DockPanel.Dock="Top" Text="LIVE ACTIVITY" Foreground="#A9B9CF" FontWeight="SemiBold" Margin="0,0,0,12"/>
-          <TextBox x:Name="Log" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
+          <DockPanel DockPanel.Dock="Top" Margin="0,0,0,14">
+            <Button x:Name="DetailsToggle" DockPanel.Dock="Right" Content="Show details" Padding="12,5" Margin="12,0,0,0"/>
+            <TextBlock Text="WHAT'S HAPPENING" Foreground="#A9B9CF" FontWeight="SemiBold" VerticalAlignment="Center"/>
+          </DockPanel>
+          <StackPanel x:Name="ActivityCard" DockPanel.Dock="Top">
+            <TextBlock x:Name="ActivityLine" Text="Getting ready..." FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+            <TextBlock x:Name="LiveElapsed" Foreground="#A9B9CF" Margin="0,6,0,16"/>
+            <WrapPanel x:Name="StageStrip"/>
+          </StackPanel>
+          <TextBox x:Name="Log" Visibility="Collapsed" Margin="0,18,0,0" IsReadOnly="True" AcceptsReturn="True" TextWrapping="Wrap"
                    VerticalScrollBarVisibility="Auto" Background="Transparent" Foreground="#CFDCEE"
                    BorderThickness="0" FontFamily="Consolas" FontSize="12"/>
         </DockPanel>
@@ -152,12 +265,14 @@ public struct RECT { public int Left, Top, Right, Bottom; }
           <TextBlock Text="FINISHED" Foreground="#5EEAD4" FontSize="14" FontWeight="Bold" HorizontalAlignment="Center"/>
           <TextBlock Text="Open the Governance Report / Model to view your environment" FontSize="24" FontWeight="SemiBold"
                      TextWrapping="Wrap" TextAlignment="Center" Margin="0,10,0,8"/>
-          <TextBlock x:Name="DoneElapsed" Foreground="#A9B9CF" FontSize="14" TextAlignment="Center" Margin="0,0,0,26"/>
+          <TextBlock x:Name="DoneElapsed" Foreground="#A9B9CF" FontSize="14" TextAlignment="Center" Margin="0,0,0,4"/>
+          <TextBlock x:Name="DoneSummary" Foreground="#A9B9CF" FontSize="13" TextAlignment="Center" TextWrapping="Wrap" Margin="0,0,0,26"/>
           <Button x:Name="DoneOpenModel" Content="Open Governance Report / Model" Background="#087F75"
                   FontWeight="SemiBold" FontSize="16" Padding="28,16" Margin="0,0,0,16"/>
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
             <Button x:Name="DoneOpenFolder" Content="Open backups"/>
-            <Button x:Name="DoneRunAgain" Content="Run again" Margin="0"/>
+            <Button x:Name="DoneRunAgain" Content="Run again"/>
+            <Button x:Name="DoneOpenErrors" Content="Open error log" Margin="0" Visibility="Collapsed"/>
           </StackPanel>
           <TextBlock x:Name="DoneNote" Foreground="#A9B9CF" TextWrapping="Wrap" TextAlignment="Center"
                      Margin="0,20,0,0" Visibility="Collapsed"/>
@@ -166,8 +281,7 @@ public struct RECT { public int Left, Top, Right, Bottom; }
     </Grid>
     <DockPanel Grid.Row="4" Margin="0,18,0,0">
       <Button x:Name="OpenLog" DockPanel.Dock="Right" Content="Open full log" Margin="12,0,0,0" IsEnabled="False"/>
-      <TextBlock Text=""
-                 Foreground="#A9B9CF" VerticalAlignment="Center" TextWrapping="Wrap"/>
+      <TextBlock x:Name="Footer" Text="" Foreground="#6F819C" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap"/>
     </DockPanel>
   </Grid>
 </Window>
@@ -176,10 +290,11 @@ $xmlReader = New-Object System.Xml.XmlNodeReader $xaml
 try { $window = [Windows.Markup.XamlReader]::Load($xmlReader) }
 finally { $xmlReader.Close() }
 $controls = @{}
-foreach ($name in @('Browse', 'Folder', 'Run', 'OpenFolder', 'OpenModel', 'Status', 'Detail', 'Progress', 'Log', 'OpenLog',
+foreach ($name in @('Browse', 'Folder', 'Run', 'OpenFolder', 'Status', 'Detail', 'Progress', 'Log', 'OpenLog',
     'Setup', 'SelectionPanel', 'SelectionTitle', 'SelectionDescription', 'Search', 'ChoiceList', 'CheckedList',
     'MultiActions', 'SelectAll', 'ClearAll', 'IncludeMy', 'SelectionCount', 'SelectionDeadline', 'Continue', 'Back', 'LogPanel', 'Header', 'Intro',
-    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneNote', 'DoneElapsed', 'Eyebrow', 'LogoCard')) {
+    'StatusPanel', 'DonePanel', 'DoneOpenModel', 'DoneOpenFolder', 'DoneRunAgain', 'DoneNote', 'DoneElapsed', 'Eyebrow', 'LogoCard',
+    'StopRun', 'DetailsToggle', 'ActivityCard', 'ActivityLine', 'LiveElapsed', 'StageStrip', 'DoneSummary', 'DoneOpenErrors', 'Footer')) {
     $controls[$name] = $window.FindName($name)
     if ($null -eq $controls[$name]) { throw "GUI control is missing: $name" }
 }
@@ -229,9 +344,161 @@ $state = @{
     SignInBaseline = @{}
     SignInRaised = @{}
     Stopwatch = $null
+    Stage = -1
+    WorkspacesDone = 0
+    StoppedByUser = $false
 }
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(500)
+
+# --- Remembered settings (the backup folder) ---
+function Get-GuiSettingsPath {
+    if ($env:IMPACTIQ_SETTINGS_PATH) { return $env:IMPACTIQ_SETTINGS_PATH }
+    return Join-Path $env:LOCALAPPDATA 'ImpactIQ\settings.json'
+}
+
+function Read-GuiSettings {
+    try {
+        $path = Get-GuiSettingsPath
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) }
+    }
+    catch { }
+    return $null
+}
+
+function Save-GuiSettings {
+    param([string]$BackupFolder)
+    try {
+        $path = Get-GuiSettingsPath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        @{ BackupFolder = $BackupFolder } | ConvertTo-Json | Set-Content -LiteralPath $path -Encoding UTF8
+    }
+    catch { }
+}
+
+# --- What is happening: friendly wording and stages taken from the script's own progress lines ---
+function Get-GuiActivity {
+    param([string]$Line)
+    $text = $Line.Trim()
+    if ($text -match '^\[STEP\] (?<step>.+)$') { return $Matches['step'] }
+    if ($text -match '^\*\*Exporting (?<model>.+)\*\*$') { return "Backing up model: $($Matches['model'])" }
+    if ($text -match '^Workspace \[(?<ws>.+?)\] (?<phase>.+?) extraction process started') { return "Reading $($Matches['phase']) - $($Matches['ws'])" }
+    switch -Regex ($text) {
+        '^Model Backup Process Started' { return 'Backing up models' }
+        '^Report Backup Process Started' { return 'Backing up reports' }
+        '^Report Detail Extraction Process Started' { return 'Analyzing report visuals' }
+        '^Model Detail Extraction Process Started' { return 'Analyzing models' }
+        '^Measure Dependency Detail Extraction Process Started' { return 'Analyzing measure dependencies' }
+        '^Dataflow Backup and Detail Extraction Process Started' { return 'Backing up dataflows' }
+        '^Data Agent Detail Extraction Process Started' { return 'Reading data agents' }
+        '\[INFO\] Fabric App query extraction started' { return 'Reading Fabric apps' }
+        '^Extraction processing finished' { return 'Wrapping up' }
+    }
+    return $null
+}
+
+function Get-GuiStages {
+    return @(
+        @{ Name = 'Set up'; Pattern = '\[STEP\] (Preparing PowerShell|Checking Tabular Editor|Waiting for selection: Choose your cloud)' },
+        @{ Name = 'Sign in'; Pattern = '\[STEP\] (Sign in to Microsoft|Waiting for selection: Choose your Fabric organization)' },
+        @{ Name = 'Choose scope'; Pattern = '\[STEP\] (Loading your workspaces|Waiting for selection: (?!Choose your cloud|Choose your Fabric))' },
+        @{ Name = 'Collect'; Pattern = '\[STEP\] Extracting Power BI and Fabric details' },
+        @{ Name = 'Back up'; Pattern = 'Model Backup Process Started|Report Backup Process Started' },
+        @{ Name = 'Analyze'; Pattern = 'Report Detail Extraction Process Started|Model Detail Extraction Process Started|Measure Dependency Detail Extraction Process Started|Dataflow Backup and Detail Extraction Process Started|Data Agent Detail Extraction Process Started|Fabric App query extraction started|Extraction processing finished' }
+    )
+}
+
+# Stages only move forward, so a later repeat of an earlier marker cannot send the tracker backwards.
+function Get-GuiStageIndex {
+    param([string]$Text, [int]$Current)
+    $stages = Get-GuiStages
+    $best = $Current
+    for ($i = $Current + 1; $i -lt $stages.Count; $i++) {
+        if ($Text -match $stages[$i].Pattern) { $best = $i }
+    }
+    return $best
+}
+
+function New-GuiBrush {
+    param([string]$Color)
+    return [Windows.Media.BrushConverter]::new().ConvertFromString($Color)
+}
+
+function Show-GuiStages {
+    $stages = Get-GuiStages
+    $controls.StageStrip.Children.Clear()
+    for ($i = 0; $i -lt $stages.Count; $i++) {
+        $chip = New-Object Windows.Controls.Border
+        $chip.CornerRadius = New-Object Windows.CornerRadius 12
+        $chip.Padding = New-Object Windows.Thickness 10, 4, 10, 4
+        $chip.Margin = New-Object Windows.Thickness 0, 0, 8, 8
+        $label = New-Object Windows.Controls.TextBlock
+        $label.FontSize = 12
+        if ($i -lt $state.Stage) {
+            $chip.Background = New-GuiBrush '#0F4D47'; $label.Foreground = New-GuiBrush '#9BE7DD'
+            $label.Text = ([string][char]0x2713) + ' ' + $stages[$i].Name
+        }
+        elseif ($i -eq $state.Stage) {
+            $chip.Background = New-GuiBrush '#087F75'; $label.Foreground = New-GuiBrush '#FFFFFF'
+            $label.FontWeight = [Windows.FontWeights]::SemiBold; $label.Text = $stages[$i].Name
+        }
+        else {
+            $chip.Background = New-GuiBrush '#1A2639'; $label.Foreground = New-GuiBrush '#6F819C'; $label.Text = $stages[$i].Name
+        }
+        $chip.Child = $label
+        [void]$controls.StageStrip.Children.Add($chip)
+    }
+}
+
+function Set-GuiDetails {
+    param([bool]$Show)
+    $controls.Log.Visibility = if ($Show) { 'Visible' } else { 'Collapsed' }
+    $controls.DetailsToggle.Content = if ($Show) { 'Hide details' } else { 'Show details' }
+    if ($Show) { $controls.Log.ScrollToEnd() }
+}
+
+# --- Finished summary: counts of what was backed up today ---
+function Get-GuiRunSummary {
+    param([string]$Folder, [int]$Workspaces = 0, [string]$Date = (Get-Date -Format 'yyyy-MM-dd'))
+    $parts = @()
+    if ($Workspaces -gt 0) { $parts += '{0} workspace{1}' -f $Workspaces, $(if ($Workspaces -eq 1) { '' } else { 's' }) }
+    $models = @(Get-ChildItem -LiteralPath (Join-Path $Folder "Model Backups\$Date") -Filter '*.bim' -File -ErrorAction SilentlyContinue).Count
+    $reports = @(Get-ChildItem -LiteralPath (Join-Path $Folder "Report Backups\$Date") -File -ErrorAction SilentlyContinue).Count
+    if ($models -gt 0) { $parts += '{0} model{1} backed up' -f $models, $(if ($models -eq 1) { '' } else { 's' }) }
+    if ($reports -gt 0) { $parts += '{0} report{1} backed up' -f $reports, $(if ($reports -eq 1) { '' } else { 's' }) }
+    $saved = "Saved to $Folder"
+    if ($parts.Count -eq 0) { return $saved }
+    return (($parts -join '  -  ') + "`n" + $saved)
+}
+
+# --- Attention: flash the taskbar when the window is in the background and the user is needed (or the run is done) ---
+function Invoke-GuiAttention {
+    param([switch]$Sound)
+    try {
+        if ($window.IsActive) { return }
+        $handle = (New-Object Windows.Interop.WindowInteropHelper $window).Handle
+        if ($handle -eq [IntPtr]::Zero) { return }
+        $info = New-Object ImpactIQ.NativeWindows+FLASHWINFO
+        $info.cbSize = [uint32][Runtime.InteropServices.Marshal]::SizeOf($info)
+        $info.hwnd = $handle
+        $info.dwFlags = 15
+        $info.uCount = 0
+        $info.dwTimeout = 0
+        [void][ImpactIQ.NativeWindows]::FlashWindowEx([ref]$info)
+        if ($Sound) { [Media.SystemSounds]::Asterisk.Play() }
+    }
+    catch { }
+}
+
+# --- One window at a time: a second copy would run against the same backup folder ---
+function Enter-GuiSingleInstance {
+    param([string]$Name = 'Local\ImpactIQ.Gui')
+    $created = $false
+    $mutex = New-Object Threading.Mutex($true, $Name, [ref]$created)
+    if (-not $created) { $mutex.Dispose(); return $false }
+    $script:GuiMutex = $mutex
+    return $true
+}
 
 function Show-LauncherError {
     param([string]$Message)
@@ -379,6 +646,8 @@ function Show-GuiSelection {
     $controls.Progress.IsIndeterminate = $false
     if ($window.WindowState -eq 'Minimized') { $window.WindowState = 'Normal' }
     [void]$window.Activate()
+    if ($choice) { [void]$controls.ChoiceList.Focus() } else { [void]$controls.Search.Focus() }
+    Invoke-GuiAttention
 }
 
 function Submit-GuiSelection {
@@ -438,14 +707,14 @@ $controls.OpenFolder.Add_Click({
     }
     catch { Show-LauncherError $_.Exception.Message }
 })
-$controls.OpenModel.Add_Click({
+function Open-GovernanceModel {
     try {
         $model = Join-Path (Get-BackupFolder) 'Power BI Governance Model.pbit'
         if (-not (Test-Path -LiteralPath $model -PathType Leaf)) { throw 'Run analysis first to copy the governance template into your backup folder.' }
         Start-Process -FilePath $model
     }
     catch { Show-LauncherError $_.Exception.Message }
-})
+}
 $controls.OpenLog.Add_Click({
     try { Start-Process -FilePath notepad.exe -ArgumentList ('"{0}"' -f $state.LogPath) }
     catch { Show-LauncherError $_.Exception.Message }
@@ -458,19 +727,26 @@ function Format-Elapsed {
 
 # Most environments produce notes and warnings, so a finished run replaces the log with the next step.
 function Show-GuiFinished {
-    param([bool]$HadIssues, [string]$Elapsed = '')
+    param([bool]$HadIssues, [string]$Elapsed = '', [string]$Summary = '')
     $controls.Log.Clear()
     $controls.LogPanel.Visibility = 'Collapsed'
     $controls.Setup.Visibility = 'Collapsed'
     $controls.StatusPanel.Visibility = 'Collapsed'
     $controls.DoneElapsed.Text = if ($Elapsed) { "Total elapsed time: $Elapsed" } else { '' }
     $controls.DoneElapsed.Visibility = if ($Elapsed) { 'Visible' } else { 'Collapsed' }
+    $controls.DoneSummary.Text = $Summary
+    $controls.DoneSummary.Visibility = if ($Summary) { 'Visible' } else { 'Collapsed' }
     $controls.DoneNote.Text = 'Some steps reported notes, which is normal for most environments. Details are in the full log.'
     $controls.DoneNote.Visibility = if ($HadIssues) { 'Visible' } else { 'Collapsed' }
+    $errorLogExists = $state.ErrorLogPath -and (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf)
+    $controls.DoneOpenErrors.Visibility = if ($HadIssues -and $errorLogExists) { 'Visible' } else { 'Collapsed' }
     $controls.DonePanel.Visibility = 'Visible'
+    Invoke-GuiAttention -Sound
 }
-$controls.DoneOpenModel.Add_Click({
-    $controls.OpenModel.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
+$controls.DoneOpenModel.Add_Click({ Open-GovernanceModel })
+$controls.DoneOpenErrors.Add_Click({
+    try { Start-Process -FilePath notepad.exe -ArgumentList ('"{0}"' -f $state.ErrorLogPath) }
+    catch { Show-LauncherError $_.Exception.Message }
 })
 $controls.DoneOpenFolder.Add_Click({
     $controls.OpenFolder.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
@@ -479,7 +755,7 @@ $controls.DoneRunAgain.Add_Click({
     $controls.DonePanel.Visibility = 'Collapsed'
     $controls.Setup.Visibility = 'Visible'
     $controls.StatusPanel.Visibility = 'Visible'
-    $controls.LogPanel.Visibility = 'Visible'
+    $controls.LogPanel.Visibility = 'Collapsed'
     $controls.Status.Text = 'Ready when you are.'
     $controls.Detail.Text = 'Choose your backup location and start another analysis.'
 })
@@ -491,6 +767,7 @@ $controls.Run.Add_Click({
         foreach ($path in @($scriptPath, $workerPath)) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required file is missing: $path" }
         }
+        Save-GuiSettings -BackupFolder $state.Folder
         $logFolder = Join-Path $state.Folder 'Logs'
         New-Item -Path $logFolder -ItemType Directory -Force | Out-Null
         $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -519,7 +796,17 @@ $controls.Run.Add_Click({
         $state.Stopwatch = [Diagnostics.Stopwatch]::StartNew()
         $state.ErrorLogPath = Join-Path $state.Folder 'Config\Error Log.txt'
         $state.ErrorLogOffset = if (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf) { (Get-Item -LiteralPath $state.ErrorLogPath).Length } else { 0 }
-        $controls.Log.Text = "Starting analysis. Everything is shown in this window.`r`n"
+        $state.Stage = -1
+        $state.WorkspacesDone = 0
+        $state.StoppedByUser = $false
+        $controls.Log.Text = ''
+        $controls.ActivityLine.Text = 'Getting ready...'
+        $controls.LiveElapsed.Text = 'Elapsed 0h 0m 0s'
+        Show-GuiStages
+        Set-GuiDetails $false
+        $controls.LogPanel.Visibility = 'Visible'
+        $controls.StopRun.IsEnabled = $true
+        $controls.StopRun.Visibility = 'Visible'
         $controls.Status.Text = 'Preparing analysis...'
         $controls.Detail.Text = 'Tool setup and checks run in the background. Selection steps will appear here.'
         $controls.Progress.IsIndeterminate = $true
@@ -537,6 +824,9 @@ $controls.Run.Add_Click({
 })
 $timer.Add_Tick({
     try {
+        if ($null -ne $state.Stopwatch -and $state.Stopwatch.IsRunning) {
+            $controls.LiveElapsed.Text = 'Elapsed ' + (Format-Elapsed $state.Stopwatch.Elapsed)
+        }
         if ($null -eq $state.Reader -and (Test-Path -LiteralPath $state.LogPath -PathType Leaf)) {
             $stream = [IO.File]::Open($state.LogPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
             $state.Reader = New-Object IO.StreamReader $stream
@@ -551,6 +841,15 @@ $timer.Add_Tick({
                     $controls.Log.Text = $controls.Log.Text.Substring($controls.Log.Text.Length - 100000)
                 }
                 $controls.Log.ScrollToEnd()
+                $latestActivity = $null
+                foreach ($line in ($text -split "`r?`n")) {
+                    $activity = Get-GuiActivity $line
+                    if ($activity) { $latestActivity = $activity }
+                }
+                if ($latestActivity) { $controls.ActivityLine.Text = $latestActivity }
+                $state.WorkspacesDone += [regex]::Matches($text, 'Report & Model metadata extraction process completed').Count
+                $newStage = Get-GuiStageIndex -Text $text -Current $state.Stage
+                if ($newStage -ne $state.Stage) { $state.Stage = $newStage; Show-GuiStages }
                 foreach ($step in [regex]::Matches($text, '\[STEP\] ([^\r\n]+)')) {
                     if ($step.Groups[1].Value -like 'Sign in to Microsoft*') {
                         Start-SignInWatch
@@ -625,10 +924,18 @@ $timer.Add_Tick({
             $state.Request = $null
             [Windows.Controls.Grid]::SetColumn($controls.LogPanel, 0)
             [Windows.Controls.Grid]::SetColumnSpan($controls.LogPanel, 2)
-            if (Test-Path -LiteralPath $state.ResultPath -PathType Leaf) {
+            $controls.StopRun.Visibility = 'Collapsed'
+            $endedWell = $false
+            if ($state.StoppedByUser) {
+                $controls.Status.Text = 'Analysis stopped'
+                $controls.Detail.Text = 'You stopped the analysis. Backups already written are kept.' + $elapsedSuffix
+            }
+            elseif (Test-Path -LiteralPath $state.ResultPath -PathType Leaf) {
                 $result = Get-Content -LiteralPath $state.ResultPath -Raw | ConvertFrom-Json
                 if ($result.State -in @('Finished', 'FinishedWithIssues') -and $state.Process.ExitCode -eq 0) {
-                    Show-GuiFinished -HadIssues ($result.State -eq 'FinishedWithIssues' -or $state.Issues) -Elapsed $elapsedText
+                    Show-GuiFinished -HadIssues ($result.State -eq 'FinishedWithIssues' -or $state.Issues) -Elapsed $elapsedText `
+                        -Summary (Get-GuiRunSummary -Folder $state.Folder -Workspaces $state.WorkspacesDone)
+                    $endedWell = $true
                 }
                 else {
                     $controls.Status.Text = if ($result.State -eq 'Failed' -or $state.Process.ExitCode -ne 0) { 'Analysis failed' }
@@ -645,6 +952,7 @@ $timer.Add_Tick({
                 $controls.Status.Text = 'Analysis stopped before completion'
                 $controls.Detail.Text = 'The run was cancelled, blocked, or exited early. Review the live activity and log; no completion was confirmed.' + $elapsedSuffix
             }
+            if (-not $endedWell) { Set-GuiDetails $true; Invoke-GuiAttention }
             if ($state.BridgePath -and (Test-Path -LiteralPath $state.BridgePath -PathType Container)) {
                 Remove-Item -LiteralPath $state.BridgePath -Recurse -Force -ErrorAction SilentlyContinue
             }
@@ -658,6 +966,68 @@ $timer.Add_Tick({
         Show-LauncherError ("Live monitoring failed. The analysis may still be running in the background; its log is in the Logs folder. " + $_.Exception.Message)
     }
 })
+# Stop the running analysis (and the tools it started) after confirming.
+function Stop-GuiRun {
+    param([switch]$Confirmed)
+    if ($null -eq $state.Process -or $state.Process.HasExited) { return }
+    if (-not $Confirmed) {
+        $answer = [Windows.MessageBox]::Show($window, 'Stop the analysis? Backups already written are kept.', 'Impact IQ', 'YesNo', 'Question', 'No')
+        if ($answer -ne 'Yes') { return }
+    }
+    $state.StoppedByUser = $true
+    $controls.StopRun.IsEnabled = $false
+    $controls.Status.Text = 'Stopping...'
+    & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $state.Process.Id /T /F 2>&1 | Out-Null
+}
+$controls.StopRun.Add_Click({ Stop-GuiRun })
+$controls.DetailsToggle.Add_Click({ Set-GuiDetails ($controls.Log.Visibility -ne 'Visible') })
+
+# Keyboard and mouse shortcuts on the selection screens: Enter continues, Esc goes back, double-click picks a choice.
+$window.Add_PreviewKeyDown({
+    param($sender, $keyArgs)
+    if ($null -eq $state.Request) { return }
+    if ($keyArgs.Key -eq 'Return' -and $controls.Continue.IsEnabled -and $keyArgs.OriginalSource -isnot [Windows.Controls.Button]) {
+        $keyArgs.Handled = $true
+        $controls.Continue.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
+    }
+    elseif ($keyArgs.Key -eq 'Escape') {
+        $keyArgs.Handled = $true
+        $controls.Back.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
+    }
+})
+$controls.ChoiceList.Add_PreviewMouseDoubleClick({
+    param($sender, $clickArgs)
+    $selected = $controls.ChoiceList.SelectedItem
+    $target = $clickArgs.OriginalSource
+    if ($target -is [Windows.FrameworkElement] -and $null -ne $selected -and $target.DataContext.Id -eq $selected.Id -and $controls.Continue.IsEnabled) {
+        $controls.Continue.RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent)))
+    }
+})
+
+# Match the window frame to the dark theme (Windows 10/11; ignored where unsupported).
+$window.Add_SourceInitialized({
+    try {
+        $handle = (New-Object Windows.Interop.WindowInteropHelper $window).Handle
+        $dark = 1
+        [void][ImpactIQ.NativeWindows]::DwmSetWindowAttribute($handle, 20, [ref]$dark, 4)
+        $captionColor = 0x00271810
+        [void][ImpactIQ.NativeWindows]::DwmSetWindowAttribute($handle, 35, [ref]$captionColor, 4)
+        $captionText = 0x00F8EEE7
+        [void][ImpactIQ.NativeWindows]::DwmSetWindowAttribute($handle, 36, [ref]$captionText, 4)
+    }
+    catch { }
+})
+
+# Remember the backup folder, and show how fresh the installed files are.
+$savedSettings = Read-GuiSettings
+if ($savedSettings -and $savedSettings.BackupFolder -and [IO.Path]::IsPathRooted([string]$savedSettings.BackupFolder)) {
+    $controls.Folder.Text = [string]$savedSettings.BackupFolder
+}
+$installedScript = Join-Path $LauncherRoot 'Final PS Script.txt'
+$controls.Footer.Text = if (Test-Path -LiteralPath $installedScript -PathType Leaf) {
+    'Impact IQ  -  files updated ' + (Get-Item -LiteralPath $installedScript).LastWriteTime.ToString('MMM d, yyyy')
+} else { 'Impact IQ' }
+
 $window.Add_Closing({
     param($sender, $eventArgs)
     if ($null -ne $state.Process -and -not $state.Process.HasExited) {
@@ -672,6 +1042,20 @@ $window.Add_Closing({
     if ($null -ne $state.Reader) { $state.Reader.Dispose() }
     if ($null -ne $state.Process) { $state.Process.Dispose() }
 })
+# A second copy would run against the same backup folder, so bring the open window forward and stop.
+if ($env:IMPACTIQ_ALLOW_MULTIPLE -ne '1' -and -not (Enter-GuiSingleInstance)) {
+    foreach ($other in [Diagnostics.Process]::GetProcessesByName('powershell')) {
+        try {
+            if ($other.Id -ne $PID -and $other.MainWindowTitle -eq 'Impact IQ' -and $other.MainWindowHandle -ne [IntPtr]::Zero) {
+                if ([ImpactIQ.NativeWindows]::IsIconic($other.MainWindowHandle)) { [void][ImpactIQ.NativeWindows]::ShowWindow($other.MainWindowHandle, 9) }
+                [void][ImpactIQ.NativeWindows]::SetForegroundWindow($other.MainWindowHandle)
+            }
+        }
+        catch { }
+    }
+    $window.Close()
+    return
+}
 # When the one-click script starts this window, it waits for this signal before closing its own console.
 if ($env:IMPACTIQ_GUI_READY_FILE) {
     $window.Add_ContentRendered({

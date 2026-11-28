@@ -346,6 +346,8 @@ $state = @{
     Stopwatch = $null
     Stage = -1
     WorkspacesDone = 0
+    AppsDone = 0
+    AgentsDone = 0
     StoppedByUser = $false
 }
 $timer = New-Object Windows.Threading.DispatcherTimer
@@ -459,14 +461,16 @@ function Set-GuiDetails {
 
 # --- Finished summary: counts of what was backed up today ---
 function Get-GuiRunSummary {
-    param([string]$Folder, [int]$Workspaces = 0, [string]$Date = (Get-Date -Format 'yyyy-MM-dd'))
+    param([string]$Folder, [int]$Workspaces = 0, [int]$Apps = 0, [int]$Agents = 0, [string]$Date = (Get-Date -Format 'yyyy-MM-dd'))
     $parts = @()
     if ($Workspaces -gt 0) { $parts += '{0} workspace{1}' -f $Workspaces, $(if ($Workspaces -eq 1) { '' } else { 's' }) }
     $models = @(Get-ChildItem -LiteralPath (Join-Path $Folder "Model Backups\$Date") -Filter '*.bim' -File -ErrorAction SilentlyContinue).Count
     $reports = @(Get-ChildItem -LiteralPath (Join-Path $Folder "Report Backups\$Date") -File -ErrorAction SilentlyContinue).Count
-    if ($models -gt 0) { $parts += '{0} model{1} backed up' -f $models, $(if ($models -eq 1) { '' } else { 's' }) }
-    if ($reports -gt 0) { $parts += '{0} report{1} backed up' -f $reports, $(if ($reports -eq 1) { '' } else { 's' }) }
-    $saved = "Saved to $Folder"
+    if ($models -gt 0) { $parts += '{0} model{1}' -f $models, $(if ($models -eq 1) { '' } else { 's' }) }
+    if ($reports -gt 0) { $parts += '{0} report{1}' -f $reports, $(if ($reports -eq 1) { '' } else { 's' }) }
+    if ($Apps -gt 0) { $parts += '{0} Fabric app{1}' -f $Apps, $(if ($Apps -eq 1) { '' } else { 's' }) }
+    if ($Agents -gt 0) { $parts += '{0} data agent{1}' -f $Agents, $(if ($Agents -eq 1) { '' } else { 's' }) }
+    $saved = "Backups saved to $Folder"
     if ($parts.Count -eq 0) { return $saved }
     return (($parts -join '  -  ') + "`n" + $saved)
 }
@@ -798,7 +802,8 @@ $controls.Run.Add_Click({
         $state.ErrorLogOffset = if (Test-Path -LiteralPath $state.ErrorLogPath -PathType Leaf) { (Get-Item -LiteralPath $state.ErrorLogPath).Length } else { 0 }
         $state.Stage = -1
         $state.WorkspacesDone = 0
-        $state.StoppedByUser = $false
+        $state.AppsDone = 0
+        $state.AgentsDone = 0
         $controls.Log.Text = ''
         $controls.ActivityLine.Text = 'Getting ready...'
         $controls.LiveElapsed.Text = 'Elapsed 0h 0m 0s'
@@ -848,6 +853,8 @@ $timer.Add_Tick({
                 }
                 if ($latestActivity) { $controls.ActivityLine.Text = $latestActivity }
                 $state.WorkspacesDone += [regex]::Matches($text, 'Report & Model metadata extraction process completed').Count
+                $state.AppsDone += [regex]::Matches($text, '\[INFO\] Fabric App backup saved:').Count
+                foreach ($agentMatch in [regex]::Matches($text, 'Data Agent extraction complete\. Agents found: (\d+)')) { $state.AgentsDone += [int]$agentMatch.Groups[1].Value }
                 $newStage = Get-GuiStageIndex -Text $text -Current $state.Stage
                 if ($newStage -ne $state.Stage) { $state.Stage = $newStage; Show-GuiStages }
                 foreach ($step in [regex]::Matches($text, '\[STEP\] ([^\r\n]+)')) {
@@ -934,7 +941,7 @@ $timer.Add_Tick({
                 $result = Get-Content -LiteralPath $state.ResultPath -Raw | ConvertFrom-Json
                 if ($result.State -in @('Finished', 'FinishedWithIssues') -and $state.Process.ExitCode -eq 0) {
                     Show-GuiFinished -HadIssues ($result.State -eq 'FinishedWithIssues' -or $state.Issues) -Elapsed $elapsedText `
-                        -Summary (Get-GuiRunSummary -Folder $state.Folder -Workspaces $state.WorkspacesDone)
+                        -Summary (Get-GuiRunSummary -Folder $state.Folder -Workspaces $state.WorkspacesDone -Apps $state.AppsDone -Agents $state.AgentsDone)
                     $endedWell = $true
                 }
                 else {

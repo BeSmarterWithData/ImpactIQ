@@ -168,7 +168,7 @@ public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint d
                 Margin="0,0,24,0" Visibility="Collapsed"/>
         <StackPanel VerticalAlignment="Center">
           <TextBlock Text="Be smarter with every change." FontSize="30" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6"/>
-          <TextBlock Text="Power BI + Fabric  /  Impact analysis, governance, and backups" Foreground="#A9B9CF" TextWrapping="Wrap"/>
+          <TextBlock Text="Power BI + Fabric impact analysis, governance, and lineage down to the visual." Foreground="#A9B9CF" TextWrapping="Wrap"/>
         </StackPanel>
       </DockPanel>
     </StackPanel>
